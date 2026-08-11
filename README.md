@@ -3,12 +3,28 @@
 Firmware for **InterBridge**, a bridge between a traditional analog
 intercom and a mobile app, intended to eventually run on an **ESP32-C3**.
 
-This repository currently contains the initial architectural foundation
-of the firmware — a clean, testable, extensible skeleton — and **not**
-the final intercom/audio/networking behavior. Several hardware and
-protocol decisions have not been made yet; see
-[`CONTEXT.md`](CONTEXT.md) for exactly what is implemented, what is a
-stub, and what is still open.
+This repository currently contains an architectural foundation and a
+first AWS IoT Core integration layer — clean, testable, extensible, but
+**not** a working end-to-end device yet. The control plane is designed
+around:
+
+- **MQTT 3.1.1 over TLS to AWS IoT Core**, with mutual TLS (a unique
+  X.509 certificate per device) — see `src/network/mqtt_transport.h`.
+- **BLE-based Wi-Fi provisioning** — see `src/provisioning/ble_provisioning.h`.
+- **OTA firmware updates via AWS IoT Jobs** (not a custom application
+  command) — see `src/ota/ota_manager.h` and `src/aws/jobs.h`.
+- **A physical configuration/reset button** (short press: nothing; ~3s
+  hold: enter provisioning; ~10s hold: factory reset) — see
+  `src/hardware/button.h`. The button's GPIO is not assigned yet.
+
+Several hardware, cloud, and protocol decisions have not been made yet,
+and several of the pieces above are real, tested coordinators sitting
+behind interfaces whose ESP32/AWS-side implementation is still a
+documented stub (no MQTT/TLS client, no NTP, no real NVS, no signing
+scheme). See [`CONTEXT.md`](CONTEXT.md) for exactly what is implemented,
+what is a stub, and what is still open — and
+[`docs/communication-protocol.md`](docs/communication-protocol.md) for
+the full device/cloud protocol specification.
 
 ## Target hardware
 
@@ -33,10 +49,11 @@ stub, and what is still open.
 ## Project layout
 
 ```text
-src/         Firmware source (core, hardware, intercom, audio, network).
+src/         Firmware source: core, hardware, intercom, audio, storage,
+             provisioning, network, protocol, aws, ota.
 include/     Reserved for shared public headers (unused so far).
-test/        Native unit tests (Unity), one PlatformIO test per directory.
-docs/        Architecture documentation.
+test/        Native unit tests (Unity), one PlatformIO test per directory (24 suites).
+docs/        Architecture documentation and the communication protocol spec.
 platformio.ini
 CONTEXT.md   Operational memory of the project — read this first.
 ```
@@ -63,12 +80,17 @@ pio device monitor -b 115200
 ## Running tests
 
 ```bash
-# Run all native unit tests (state machine, events, line detector, protocol, audio)
+# Run all native unit tests (24 suites: state machine, events, intercom,
+# MQTT topics, command parsing/handling/dedup, event outbox, reconnect
+# backoff, button, device identity, persistent storage, Device Shadow,
+# AWS IoT Jobs, OTA, health telemetry, provisioning, Fleet Provisioning,
+# factory reset, MQTT transport, ...)
 pio test -e native
 ```
 
-Tests only cover logic that does not require physical hardware. Anything
-that depends on the real intercom line, GPIO wiring, or a Wi-Fi network
+Tests only cover logic that does not require physical hardware, a real
+Wi-Fi/AWS IoT connection, or real cryptography. Anything that depends on
+the real intercom line, GPIO wiring, Wi-Fi, BLE, NTP, or AWS IoT Core
 still needs manual validation on real hardware — see
 `CONTEXT.md > Hardware Dependencies`.
 
@@ -80,3 +102,6 @@ still needs manual validation on real hardware — see
   keep it updated whenever you change something relevant.
 - **[`docs/architecture.md`](docs/architecture.md)** — module map, layering,
   and the reasoning behind the current boundaries.
+- **[`docs/communication-protocol.md`](docs/communication-protocol.md)** —
+  the authoritative device/cloud protocol specification (topics, message
+  shapes, command lifecycle, error codes, provisioning, OTA).

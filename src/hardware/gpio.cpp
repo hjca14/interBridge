@@ -14,11 +14,13 @@ bool Esp32GpioHardware::readLineState() {
     return false;
 }
 
-void Esp32GpioHardware::setDoorOutput(bool enabled) {
+bool Esp32GpioHardware::setDoorOutput(bool enabled) {
     (void)enabled;
     // TODO: not implemented. The door release circuit (relay/transistor,
-    // pulse duration, active level) has not been defined yet.
-    // See CONTEXT.md > Open Questions.
+    // pulse duration, active level) has not been defined yet, so nothing
+    // is actually actuated - always report failure rather than a fake
+    // success. See CONTEXT.md > Open Questions.
+    return false;
 }
 
 } // namespace interbridge

@@ -26,19 +26,23 @@ public:
 
     // Enables/disables the door release output. Actuation semantics
     // (momentary pulse vs. sustained, active-high vs. active-low) are not
-    // yet defined.
-    virtual void setDoorOutput(bool enabled) = 0;
+    // yet defined. Returns whether the output was genuinely driven -
+    // implementations must return false rather than pretending success
+    // when actuation isn't actually implemented (see Esp32GpioHardware).
+    virtual bool setDoorOutput(bool enabled) = 0;
 };
 
 // Concrete ESP32-C3 implementation. Currently a stub: every method has a
 // placeholder body because the GPIO mapping and electrical behavior have
-// not been decided yet. Do not treat this as functional hardware support.
+// not been decided yet. Do not treat this as functional hardware support -
+// setDoorOutput() always returns false because nothing is actually
+// actuated.
 class Esp32GpioHardware : public IHardwareIO {
 public:
     Esp32GpioHardware();
 
     bool readLineState() override;
-    void setDoorOutput(bool enabled) override;
+    bool setDoorOutput(bool enabled) override;
 };
 
 } // namespace interbridge

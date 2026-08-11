@@ -23,8 +23,11 @@ public:
     // Requests the door to be opened. The actuation mechanism (relay
     // type, pulse duration, latching behavior) is not defined yet; this
     // currently just drives the output on and leaves timing to the
-    // caller. See CONTEXT.md > Open Questions.
-    void requestDoorOpen();
+    // caller. Returns whether the hardware layer reports the output was
+    // genuinely actuated - callers (see protocol/command_handler.*) must
+    // not report a completed door open unless this is true. See
+    // CONTEXT.md > Open Questions.
+    bool requestDoorOpen();
 
 private:
     IHardwareIO& hardware_;
