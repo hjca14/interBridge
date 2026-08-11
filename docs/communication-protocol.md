@@ -1,11 +1,20 @@
 # InterBridge Communication Protocol
 
-**Status:** Draft v1.1 — AWS IoT Core architecture  
+**Status:** Draft v1.2 — AWS IoT Core architecture, firmware-alignment pass  
 **Protocol version:** `1`  
 **Target firmware:** InterBridge Firmware `0.1.x`  
 **Primary target:** ESP32-C3  
 **Cloud device plane:** AWS IoT Core  
 **Primary transport:** MQTT over TLS with mutual X.509 authentication
+
+**v1.2 note:** this revision reconciles this document with the firmware
+implementation (`src/protocol/messages.h`) - command timestamp format,
+the full error code set with per-code origin, the closed
+`intercom_state` vocabulary, and the QR claim-code URI format. No
+protocol semantics changed; this pass only removed ambiguity/format
+divergences between the two. It does **not** implement AWS IoT Core,
+real MQTT/TLS, NTP, BLE, real NVS, Lambda, API Gateway, or Cognito - see
+`CONTEXT.md` for exactly what remains stubbed ahead of Phase 1.
 
 ---
 
@@ -105,12 +114,44 @@ The identifier must be generated from at least 128 bits of cryptographically sec
 randomness. It is not a secret, but it must be globally unique and impractical to
 enumerate at fleet scale.
 
-The QR code contains at minimum:
+### 4.1 QR code format
+
+The QR code encodes a single URI in the canonical form:
 
 ```text
-device_id
-claim_code
+interbridge://claim?v=1&device_id=ib-<32 lowercase hex chars>&claim_code=<secret>
 ```
+
+Example:
+
+```text
+interbridge://claim?v=1&device_id=ib-0123456789abcdef0123456789abcdef&claim_code=9f2a7c1e4b3d
+```
+
+Validation rules the app (and any backend that parses a scanned code)
+must enforce:
+
+```text
+scheme                must be exactly "interbridge"
+host                  must be exactly "claim"
+v                     must be exactly "1"
+device_id             must match ^ib-[0-9a-f]{32}$
+claim_code             required, must not be empty
+duplicate query params  must be rejected (e.g. two "device_id" values)
+parameter values         must be percent-decoded before validation
+```
+
+`claim_code` is a secret: it must never appear in logs, crash reports, or
+analytics events, on either the app or backend side. It is a **product
+ownership claim** credential only - it authorizes claiming a physical
+unit in the app, and must never be confused with, derived into, or
+accepted in place of a permanent AWS IoT device certificate/private key
+(section 6).
+
+The firmware does not scan or parse this QR code - it only appears on
+the physical device/packaging for the app to read. No QR
+scanner/parser is implemented in this repository, and none is needed for
+Phase 1.
 
 It must never contain permanent private keys, permanent AWS IoT credentials, or backend administrative secrets.
 
@@ -423,12 +464,36 @@ timestamp
 uptime_ms
 ```
 
-Identifiers use 128-bit random values encoded as lowercase hexadecimal strings with
-semantic prefixes (`cmd-`, `evt-`). Custom JSON payloads must not exceed 8 KiB.
+Identifiers are 128-bit random values encoded as 32 lowercase hexadecimal
+characters. `device_id` and `event_id` (both firmware-generated) carry a
+semantic prefix - `ib-` and `evt-` respectively. **`command_id` is
+backend-generated and carries no prefix**: it is a bare
+`^[0-9a-f]{32}$` value, e.g. `0123456789abcdef0123456789abcdef` - see
+the example in section 18. This is a deliberate asymmetry, not an
+inconsistency: prefixes exist so a human/log reader can tell at a glance
+what generated an ID, and only the device generates `device_id`/
+`event_id`. Custom JSON payloads must not exceed 8 KiB.
 
 `device_id` inside JSON is diagnostic information only. Authorization comes from AWS IoT certificate/policy/Thing context.
 
-Use UTC ISO-8601 only if wall-clock time is valid. Otherwise do not invent a timestamp; monotonic uptime may still be included.
+### 14.1 Timestamp representations differ by message type
+
+This protocol uses **two different, non-interchangeable** timestamp
+representations - implementations must not treat them as equivalent or
+attempt to parse one as the other:
+
+```text
+DeviceEvent.timestamp                UTC ISO-8601 string, e.g. "2026-08-11T14:30:25Z"
+DeviceCommand.issued_at/expires_at   Unix epoch seconds, integer, e.g. 1786467600
+```
+
+Event `timestamp` is set by the device *if and only if* it has valid
+wall-clock time (section 24.1/NTP); otherwise the field is omitted -
+never invented. Command `issued_at`/`expires_at` are set by the backend
+and are always integers; the firmware never parses a string in those two
+fields as a timestamp (see section 18) - a string there is treated as if
+the field were entirely absent, which fails command time-safety
+validation (`INVALID_TIMESTAMP`).
 
 ---
 
@@ -461,7 +526,7 @@ Example:
 ```json
 {
   "protocol_version": 1,
-  "device_id": "ib-7f3a91c2",
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
   "event_id": "evt-12345",
   "event": "RING_DETECTED",
   "timestamp": "2026-08-11T17:30:25Z",
@@ -534,13 +599,21 @@ Base command:
 ```json
 {
   "protocol_version": 1,
-  "command_id": "cmd-12345",
+  "command_id": "0123456789abcdef0123456789abcdef",
   "command": "OPEN_DOOR",
-  "issued_at": "2026-08-11T17:30:25Z",
-  "expires_at": "2026-08-11T17:30:30Z",
+  "issued_at": 1786467600,
+  "expires_at": 1786467610,
   "payload": {}
 }
 ```
+
+`command_id` is exactly 32 lowercase hexadecimal characters, no prefix
+(section 14.1). `issued_at`/`expires_at` are Unix epoch seconds
+(integers), **not** ISO-8601 strings - see section 14.1 for why command
+timestamps and event timestamps use different representations. A command
+whose `issued_at`/`expires_at` are sent as strings is treated by the
+firmware as if those fields were absent, which fails time-safety
+validation (`INVALID_TIMESTAMP`) rather than being parsed.
 
 Initial commands:
 
@@ -554,7 +627,8 @@ are not remotely executable commands in protocol v1.
 
 All remote commands include `issued_at` and `expires_at`. The device must reject a
 command when its clock is not valid, the command is expired, the validity interval
-exceeds the allowed maximum, or its identifier has already been processed.
+exceeds the allowed maximum, either timestamp is missing/malformed, or its
+identifier has already been processed.
 
 Initial maximum validity:
 
@@ -600,8 +674,8 @@ Example:
 ```json
 {
   "protocol_version": 1,
-  "device_id": "ib-7f3a91c2",
-  "command_id": "cmd-12345",
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
+  "command_id": "0123456789abcdef0123456789abcdef",
   "command": "OPEN_DOOR",
   "status": "COMPLETED"
 }
@@ -612,8 +686,8 @@ Failure:
 ```json
 {
   "protocol_version": 1,
-  "device_id": "ib-7f3a91c2",
-  "command_id": "cmd-12345",
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
+  "command_id": "0123456789abcdef0123456789abcdef",
   "command": "OPEN_DOOR",
   "status": "FAILED",
   "error": {
@@ -660,21 +734,35 @@ in-memory implementation behind the same abstraction.
 
 ## 21. Error Codes
 
-```text
-INVALID_PAYLOAD
-UNSUPPORTED_PROTOCOL_VERSION
-UNKNOWN_COMMAND
-COMMAND_NOT_ALLOWED
-DEVICE_BUSY
-NOT_PROVISIONED
-WIFI_UNAVAILABLE
-CLOUD_UNAVAILABLE
-DOOR_OUTPUT_FAILURE
-OTA_DOWNLOAD_FAILED
-OTA_VALIDATION_FAILED
-OTA_INSTALL_FAILED
-INTERNAL_ERROR
-```
+Canonical protocol v1 error code set, with the party that originates
+each one. "Device" means the InterBridge firmware itself constructs a
+`ProtocolError` with this code today. "Backend"/"Application" means the
+code exists in the shared contract for the backend/app to use (e.g. in a
+response the backend synthesizes on the device's behalf, such as a
+timeout, or a rejection the backend makes before a message ever reaches
+the device) - **the firmware does not currently construct these**, and
+must not be made to fabricate them just to look more complete.
+
+| Code | Origin | Meaning |
+|---|---|---|
+| `INVALID_PAYLOAD` | Device | Malformed JSON or missing/wrong-type required field |
+| `PAYLOAD_TOO_LARGE` | Device | Payload exceeds the 8 KiB limit (section 14) |
+| `UNSUPPORTED_PROTOCOL_VERSION` | Device | `protocol_version` is missing or not `1` |
+| `UNKNOWN_COMMAND` | Device | `command` string is not a recognized command type |
+| `COMMAND_NOT_ALLOWED` | Device | Recognized command, but not remotely executable (`ENTER_PROVISIONING`, `FACTORY_RESET`, reserved call commands) or not valid in the current device state |
+| `COMMAND_EXPIRED` | Device | `now > expires_at` |
+| `CLOCK_NOT_TRUSTWORTHY` | Device | Device has no valid wall-clock time yet (NTP not implemented - section 24.1); no time-sensitive command can be accepted |
+| `INVALID_TIMESTAMP` | Device | `issued_at`/`expires_at` missing, not an integer (e.g. sent as an ISO-8601 string), `expires_at <= issued_at`, or the validity window exceeds the command's maximum (section 18) |
+| `DEVICE_BUSY` | Device | Reserved; not currently produced by the firmware |
+| `NOT_PROVISIONED` | Backend | Reserved for the backend to reject a command aimed at a device that hasn't completed provisioning; not produced by the firmware |
+| `WIFI_UNAVAILABLE` | Backend | Reserved for the backend to describe a device it knows to be offline at the Wi-Fi level; not produced by the firmware |
+| `CLOUD_UNAVAILABLE` | Backend/Application | Reserved for the backend/app to describe an AWS IoT Core outage; not produced by the firmware |
+| `DOOR_OUTPUT_FAILURE` | Device | `IHardwareIO::setDoorOutput()` reported failure (always true today - see CONTEXT.md, the hardware layer is a stub) |
+| `OTA_DOWNLOAD_FAILED` | Device | `IOtaPlatform::downloadAndHash()` failed |
+| `OTA_VALIDATION_FAILED` | Device | SHA-256 or signature check failed (signature always fails today - no signing scheme exists yet, see section 30) |
+| `OTA_INSTALL_FAILED` | Device | Install, reboot, or boot-confirmation step failed |
+| `PROVISIONING_FAILED` | Device | Reserved for a `ProvisioningManager` failure/timeout path - not implemented yet (it can currently get stuck in `ConnectingWifi` with no failure signal, see CONTEXT.md) |
+| `INTERNAL_ERROR` | Device | Catch-all for an unexpected firmware-side failure |
 
 Errors must not expose secrets.
 
@@ -714,6 +802,9 @@ Reported example:
 }
 ```
 
+`intercom_state` (here and in Health Telemetry, section 24) is limited to
+a closed, canonical set - see section 22.1.
+
 Desired example:
 
 ```json
@@ -725,6 +816,30 @@ Desired example:
   }
 }
 ```
+
+### 22.1 Canonical intercom_state values
+
+```text
+IDLE
+RINGING
+OFF_HOOK
+IN_CALL
+ERROR
+```
+
+Publishers must use exactly one of these five strings - never an
+arbitrary/internal state name (the firmware's internal state machine has
+a `BOOT` state used only for diagnostic logging; it is intentionally
+mapped to `IDLE` rather than ever appearing here, since a device
+publishing telemetry has always already finished booting).
+
+**`OFF_HOOK` is part of the canonical vocabulary but is not currently
+reachable.** The firmware's core state machine transitions directly from
+`RINGING` to a combined "in call" state on the off-hook signal - there is
+no distinct resting "picked up, not yet in a call" state to report
+honestly today. Do not publish `OFF_HOOK` by inferring it indirectly
+(e.g. from a transient event) - only publish it once the firmware
+genuinely has a state that means that. See `CONTEXT.md` > Decisions.
 
 Possible future desired config:
 
@@ -784,7 +899,7 @@ Example:
 ```json
 {
   "protocol_version": 1,
-  "device_id": "ib-7f3a91c2",
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
   "firmware_version": "0.1.0",
   "intercom_state": "IDLE",
   "uptime_ms": 18372000,

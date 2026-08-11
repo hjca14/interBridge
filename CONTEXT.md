@@ -127,8 +127,12 @@ module - see also the Tests section for exactly what was verified.)*
 - **Protocol messages**: `protocol/messages.h` - `DeviceEvent`,
   `HealthReport`, `CommandResponse`, `DeviceCommand`+`parseCommand()`
   (**implemented** via ArduinoJson: 8 KiB size limit, protocol_version
-  check, required-field validation, unknown-command tolerance, unknown-
-  JSON-field tolerance).
+  check, required-field validation, `command_id` format validation
+  (`isValidCommandId()`, 32 lowercase hex chars), unknown-command
+  tolerance, unknown-JSON-field tolerance). `ProtocolIntercomState`
+  (**implemented**: closed `IDLE`/`RINGING`/`OFF_HOOK`/`IN_CALL`/`ERROR`
+  vocabulary) added in the 2026-08-11 protocol reconciliation pass - see
+  Decisions.
 - **Command handling**: `protocol/command_handler.h` - `CommandHandler`
   (**implemented**: time-safety validation against `issued_at`/
   `expires_at`, dispatch for `OPEN_DOOR`/`RESTART`, structural rejection
@@ -214,9 +218,18 @@ require a real date/time parser for no benefit, since these fields are
 machine-consumed, not human-facing (unlike event `timestamp`, which stays
 ISO-8601 per the original design).
 Consequência: `protocol/messages.h`'s `parseCommand()` expects
-`issued_at`/`expires_at` as JSON integers. **This does not match
-`docs/communication-protocol.md` v1.1 section 18's example**, which shows
-them as ISO-8601 strings - see the reconciliation note below.
+`issued_at`/`expires_at` as JSON integers, and rejects a string in either
+field the same way it would reject a missing field (`hasIssuedAt`/
+`hasExpiresAt` stay `false`, which fails time-safety validation with
+`INVALID_TIMESTAMP` - see `test_command_parser`'s
+`test_iso8601_string_timestamp_is_not_accepted_as_a_command_timestamp`).
+**Resolved 2026-08-11 (protocol reconciliation pass):**
+`docs/communication-protocol.md` (now v1.2) was updated to match the
+code exactly - section 18's example and section 14.1's new "Timestamp
+representations differ by message type" note both now show Unix epoch
+seconds for `issued_at`/`expires_at`, explicitly distinct from
+`DeviceEvent.timestamp`'s ISO-8601 format. No code change was needed;
+only the doc was wrong.
 
 ### Decision: command handling is synchronous; no intermediate ACCEPTED response yet
 Motivo: `Intercom::requestDoorOpen()` and `ISystemControl::restart()` are
@@ -270,68 +283,94 @@ deliberately maps them to `std::nullopt` - they are never published as
 MQTT events. If a future requirement needs an explicit Wi-Fi connectivity
 event over MQTT, this is the one mapping to revisit.
 
-### Decision: `protocol/messages.h` error codes are a superset of, and not identical to, `docs/communication-protocol.md` v1.1
-Motivo/status: see the dedicated reconciliation entry directly below -
-this is the most consequential unresolved gap from this pass and is
-broken out on its own for visibility.
+### Decision: protocol reconciliation pass (2026-08-11) — error codes, command_id format, intercom_state, QR format
+**What happened:** a follow-up task explicitly asked to make the
+firmware and `docs/communication-protocol.md` (which the user had
+rewritten to v1.1 mid-implementation, as noted in the entry this one
+replaces) into one consistent source of truth for protocol v1, without
+touching AWS IoT Core/MQTT/NTP/BLE/NVS/Lambda/API Gateway/Cognito
+implementation. This is now **resolved** for the specific items listed
+below; broader backend/infrastructure topics (claim flow implementation,
+environment separation, Cognito/API Gateway/Lambda) remain intentionally
+out of scope for firmware - see Open Questions.
 
-### Decision: Protocol doc v1.1 reconciliation not yet complete {#decision-protocol-doc-v11-reconciliation-not-yet-complete}
-**What happened:** `docs/communication-protocol.md` was substantially
-rewritten (to "Draft v1.1 — AWS IoT Core architecture") directly by the
-user partway through this implementation pass, after the code below had
-already been built against an earlier, less detailed framing of the same
-AWS decision. The two were not reconciled line-by-line before this
-CONTEXT.md update, given the size of both.
-**What matches:** the core shape - AWS IoT Core, MQTT 3.1.1/TLS/mTLS,
-`ClientId == ThingName == device_id`, Basic Ingest for events/health/
-responses, normal broker topic for commands, named Device Shadow
-`interbridge`, AWS IoT Jobs for OTA (not a custom command), BLE
-provisioning with the same framework-limitation caveat, the physical
-button's 3s/10s thresholds, factory reset preserving device identity/
-credentials, reconnect backoff (1s-300s, exponential + full jitter),
-duplicate command protection, and the general "local operation must not
-depend on cloud connectivity" principle - all match.
-**What does NOT match / is missing from the implementation:**
-- `docs/communication-protocol.md` v1.1 introduces a **product ownership
-  claim flow** (`claim_code`, QR code containing `device_id + claim_code`,
-  Cognito-authenticated backend claim, ownership transfer/decommission
-  states) - **none of this exists in the firmware code.**
-  `DeviceIdentity` has no `claim_code` field.
-- v1.1's error code list (section 21) is `INVALID_PAYLOAD`,
-  `UNSUPPORTED_PROTOCOL_VERSION`, `UNKNOWN_COMMAND`, `COMMAND_NOT_ALLOWED`,
-  `DEVICE_BUSY`, `NOT_PROVISIONED`, `WIFI_UNAVAILABLE`, `CLOUD_UNAVAILABLE`,
-  `DOOR_OUTPUT_FAILURE`, `OTA_DOWNLOAD_FAILED`, `OTA_VALIDATION_FAILED`,
-  `OTA_INSTALL_FAILED`, `INTERNAL_ERROR`. The implemented
-  `ProtocolErrorCode` (`protocol/messages.h`) additionally has
-  `PAYLOAD_TOO_LARGE`, `COMMAND_EXPIRED`, `CLOCK_NOT_TRUSTWORTHY`,
-  `INVALID_TIMESTAMP`, `PROVISIONING_FAILED` (more granular time-safety
-  reporting than the doc specifies), and is **missing** `NOT_PROVISIONED`,
-  `WIFI_UNAVAILABLE`, `CLOUD_UNAVAILABLE` entirely (nothing currently
-  produces those conditions as errors).
-- v1.1 section 18 shows `issued_at`/`expires_at` as ISO-8601 strings; the
-  implementation uses Unix seconds integers - see the dedicated decision
-  above.
-- v1.1 sections 11 (environment separation, DEV/PROD), 27 (application
-  backend boundary: Cognito/API Gateway/Lambda), and 9.1 (ownership
-  transfer/decommissioning) describe backend/infrastructure concerns with
-  no corresponding firmware code yet - largely expected, since most of
-  that is backend work outside this repository, but `AwsIotConnectionConfig`
-  (`network/mqtt_transport.h`) has no environment (DEV/PROD) field, which
-  probably should exist.
-- v1.1's Basic Ingest rule names and Fleet Provisioning template name are
-  still configuration placeholders in `MqttTopicsConfig`
-  (`network/mqtt_topics.h`), consistent with the doc's own "Still Open"
-  section.
-**Recommended next step:** before writing more AWS-facing code, do a
-deliberate reconciliation pass: either update `ProtocolErrorCode` to
-match v1.1 exactly (folding the extra time-safety codes into the existing
-ones, or getting explicit sign-off to keep them as an intentional
-elaboration), switch `issued_at`/`expires_at` to ISO-8601, and decide
-whether `claim_code`/ownership-claim belongs in firmware
-(`DeviceIdentity`) now or stays backend-only until BLE provisioning
-carries it. This was not done in this pass due to the size of both the
-implementation and the doc rewrite happening concurrently - see Future
-Work.
+**Error codes — resolved, doc and code now match exactly.**
+`ProtocolErrorCode` (`protocol/messages.h`) gained `NotProvisioned`,
+`WifiUnavailable`, `CloudUnavailable` (`NOT_PROVISIONED`,
+`WIFI_UNAVAILABLE`, `CLOUD_UNAVAILABLE` on the wire) to match
+`docs/communication-protocol.md` section 21's canonical list, which now
+also documents the extra time-safety codes the firmware already had
+(`PAYLOAD_TOO_LARGE`, `COMMAND_EXPIRED`, `CLOCK_NOT_TRUSTWORTHY`,
+`INVALID_TIMESTAMP`, `PROVISIONING_FAILED`) rather than firmware losing
+them. Every code's *origin* (device/backend/application) is now
+documented in both places: a per-enumerator comment in `messages.h` and
+a table in section 21. `NOT_PROVISIONED`/`WIFI_UNAVAILABLE`/
+`CLOUD_UNAVAILABLE` are explicitly marked backend/application-origin -
+**nothing in the firmware constructs a `ProtocolError` with these three
+codes**, and that must stay true; they exist in the shared enum only so
+the wire contract is complete for consumers, not so the device can
+fabricate conditions it can't actually detect.
+
+### Decision: command_id must be exactly 32 lowercase hex characters, no prefix
+Motivo: the reconciliation task's canonical command JSON example uses a
+bare 32-hex `command_id` (`"0123456789abcdef0123456789abcdef"`), with no
+`cmd-` prefix - unlike `event_id` (`evt-` prefix) and `device_id` (`ib-`
+prefix), both of which are firmware-generated via `core/random_id.h`.
+`command_id` is always backend-generated, so this asymmetry is
+deliberate and now documented in `docs/communication-protocol.md`
+section 14.
+Consequência: added `isValidCommandId()` (`protocol/messages.h/.cpp`);
+`parseCommand()` now rejects (`INVALID_PAYLOAD`) any `command_id` that
+isn't exactly `^[0-9a-f]{32}$`, replacing the previous "just check it's
+non-empty" logic. **Only `test_command_parser` needed updating** - it's
+the only test file that calls `parseCommand()` with a JSON string;
+`test_command_handler` and `test_command_cache` construct `DeviceCommand`/
+dedup-cache entries directly and treat `commandId` as an opaque string,
+so they're unaffected by this stricter parse-time check.
+
+### Decision: `ProtocolIntercomState` — a closed, protocol-only enum separate from `core::State`
+Motivo: `HealthReport.intercomState`/`ShadowReportedState.intercomState`
+were previously populated via `core::State`'s `toString()`
+(`main.cpp:277`, prior to this pass), which can produce `"BOOT"` - not
+one of the reconciliation task's canonical values (`IDLE`, `RINGING`,
+`OFF_HOOK`, `IN_CALL`, `ERROR`). Reusing the internal diagnostic string
+as the wire contract was the root problem, the same class of issue the
+`ProtocolEventName`/`core::EventType` split already solved for events.
+Consequência: added `ProtocolIntercomState` + `toString()` to
+`protocol/messages.h/.cpp`, and `toProtocolIntercomState(core::State)` in
+`main.cpp` (same pattern/location as `toProtocolEvent()`).
+`State::Boot` maps defensively to `Idle` (documented as unreachable in
+practice, since `finishBoot()` always runs before `loop()` - and
+therefore before anything that publishes telemetry - ever executes).
+**`OFF_HOOK` is defined but not reachable**: `core::StateMachine`
+transitions `Ringing` → `InCall` directly on the `OffHook` event; there
+is no resting "off-hook but not yet in a call" state to map it from.
+This is documented in `messages.h`, `main.cpp`, and
+`docs/communication-protocol.md` section 22.1 as intentional - the
+alternative (inventing a state the firmware doesn't actually have) would
+violate "não simule transições de hardware."
+
+### Decision: product-ownership QR code format is now specified (doc only)
+Motivo: `docs/communication-protocol.md` previously said the QR "contains
+at minimum: device_id, claim_code" without a concrete, parseable format.
+Consequência: section 4.1 now specifies the canonical
+`interbridge://claim?v=1&device_id=ib-<32 hex>&claim_code=<secret>` URI
+with explicit validation rules (scheme/host/`v`/`device_id` regex/
+non-empty `claim_code`/duplicate-param rejection/percent-decoding/never
+logging `claim_code`). **This is documentation only** - no QR
+scanning/parsing code was added to the firmware, per the task's explicit
+instruction that the firmware doesn't need one yet. `DeviceIdentity`
+(`provisioning/device_identity.h`) still has no `claim_code` field -
+that remains open, see Open Questions.
+
+**Still genuinely open after this pass** (unchanged, backend/
+infrastructure work outside firmware scope for now): `claim_code`
+representation in `DeviceIdentity`/BLE provisioning payload; environment
+separation (DEV/PROD) in `AwsIotConnectionConfig`; Cognito/API Gateway/
+Lambda application backend; ownership transfer/decommissioning; AWS
+account/region/rule names/Fleet Provisioning template. None of these
+were in scope for this reconciliation pass (which was explicitly
+protocol-consistency-only, not infrastructure), and none were touched.
 
 ## Known Limitations
 
@@ -406,16 +445,18 @@ of this section going forward.)*
 - ESP32 OTA partition/library approach (`Update.h` vs. manual
   `esp_ota_*`) for `Esp32OtaPlatform`.
 - HTTPS client choice for OTA downloads.
-- **Full reconciliation between the implemented `ProtocolErrorCode` set
-  and `docs/communication-protocol.md` v1.1's error code list - see
-  Decisions.**
-- **Whether/how `claim_code` and product ownership claim (v1.1 sections
-  4, 6.1, 9.1) should be represented in `DeviceIdentity` and the BLE
-  provisioning payload.**
-- **Whether `issued_at`/`expires_at` should be switched from Unix seconds
-  to ISO-8601 to match v1.1's examples.**
+- **Whether/how `claim_code` and product ownership claim
+  (`docs/communication-protocol.md` sections 4, 4.1, 6.1, 9.1) should be
+  represented in `DeviceIdentity` and the BLE provisioning payload -
+  still open; the 2026-08-11 reconciliation pass specified the QR's wire
+  format but deliberately did not implement it in firmware.**
+- Environment separation (DEV/PROD) - `AwsIotConnectionConfig`
+  (`network/mqtt_transport.h`) has no environment field yet.
 - Watchdog/recovery strategy for the core `StateMachine`'s `Error` state
   (still a dead end, unchanged from the prior pass).
+
+*(Resolved 2026-08-11: `ProtocolErrorCode` vs. doc reconciliation, and
+`issued_at`/`expires_at` format - see Decisions.)*
 
 ## Technical Debt
 
@@ -492,7 +533,7 @@ module that doesn't require real hardware, AWS, or crypto:
 |---|---|
 | `test_state_machine`, `test_events`, `test_line_detector`, `test_protocol`, `test_audio` | Unchanged from the prior pass (`test_line_detector` updated for the new `setDoorOutput()` bool signature, plus 2 new `Intercom::requestDoorOpen()` tests) |
 | `test_mqtt_topics` | Every `MqttTopics` method, incl. the empty-string-when-unconfigured Fleet Provisioning case |
-| `test_command_parser` | Valid command, malformed JSON, missing command_id, missing/unsupported protocol_version, unknown command, oversized payload, payload object capture, reserved commands |
+| `test_command_parser` | Valid command with Unix timestamps, ISO-8601 string timestamp correctly NOT accepted, malformed JSON, missing/invalid-format/uppercase command_id, missing/unsupported protocol_version, unknown command, oversized payload, payload object capture, reserved commands, every `ProtocolErrorCode`'s string + default message, all 5 canonical `ProtocolIntercomState` values (added/expanded 2026-08-11 reconciliation pass) |
 | `test_command_handler` | OPEN_DOOR success/failure, clock-not-trustworthy/expired/oversized-window rejection, RESTART, duplicate OPEN_DOOR not re-actuating hardware, ENTER_PROVISIONING/FACTORY_RESET/reserved/unknown rejection |
 | `test_command_cache` | In-memory find/record/eviction, persistent round-trip across a simulated reboot |
 | `test_event_outbox` | Enqueue/pending/dequeue, capacity eviction, duplicate-ID upsert, persistent round-trip preserving `event_id` |
@@ -518,7 +559,11 @@ constraint as the prior pass):**
   **and executed** with MSVC (`cl.exe`, VS 2022 Build Tools) against the
   real ArduinoJson v7 source (fetched into a local scratch directory, not
   committed to the repo) and the same throwaway Unity-compatible shim
-  used in the prior pass. **All ~130 assertions passed, 0 failures.**
+  used in the prior pass. **137 tests, 0 failed**, re-confirmed after the
+  2026-08-11 protocol reconciliation pass (up from 130 after
+  `test_command_parser` gained 7 tests for command_id format, ISO-8601-
+  string timestamp rejection, error code strings/messages, and canonical
+  intercom states).
 - `main.cpp` and every Arduino-dependent `.cpp` file (`wifi.cpp`,
   `clock.cpp`, `system_control.cpp`, `random_id.cpp`, `gpio.cpp`,
   `button.cpp`, `ble_provisioning.cpp`) were additionally compiled under
@@ -633,3 +678,62 @@ Next steps:
   that rough priority order, since NTP gates all remote command handling
   and NVS gates every persistence guarantee this pass built the
   architecture for.
+
+**Third pass, same day — protocol reconciliation (no AWS/MQTT/NTP/BLE/NVS
+implementation; doc+firmware consistency only):**
+
+Implemented:
+- `docs/communication-protocol.md` bumped to v1.2 with a revision note
+  explaining scope.
+- Command `issued_at`/`expires_at` confirmed/documented as Unix epoch
+  seconds everywhere (doc examples fixed; code already matched - no code
+  change needed here). New section 14.1 explicitly distinguishes command
+  timestamps (Unix seconds) from event timestamps (ISO-8601).
+- `ProtocolErrorCode` (`protocol/messages.h/.cpp`) gained `NotProvisioned`,
+  `WifiUnavailable`, `CloudUnavailable` to match the doc's canonical list
+  exactly; every code now has an origin (device/backend/application)
+  documented in both the header and a new table in doc section 21.
+- `command_id` format validation: `isValidCommandId()` added
+  (`protocol/messages.h/.cpp`), enforcing exactly 32 lowercase hex
+  characters, no prefix; `parseCommand()` now rejects malformed IDs.
+- `ProtocolIntercomState` enum + `toString()` added
+  (`protocol/messages.h/.cpp`): `IDLE`/`RINGING`/`OFF_HOOK`/`IN_CALL`/
+  `ERROR`, a closed vocabulary separate from `core::State`.
+  `main.cpp` gained `toProtocolIntercomState()` and now uses it for
+  `HealthReport.intercomState`/`ShadowReportedState.intercomState`
+  instead of `core::State`'s diagnostic `toString()` (which could
+  previously have leaked `"BOOT"` onto the wire).
+- `docs/communication-protocol.md` section 4.1 (new): canonical QR code
+  URI format (`interbridge://claim?v=1&device_id=ib-<32hex>&claim_code=<secret>`)
+  with explicit validation rules. **Documentation only** - no QR
+  scanning/parsing code added to firmware, per the task's instruction.
+- All JSON example command_id/device_id values across the doc corrected
+  to valid formats (`0123456789abcdef0123456789abcdef` /
+  `ib-0123456789abcdef0123456789abcdef`); all 9 JSON code blocks in the
+  doc verified to be syntactically valid JSON (`python -m json.loads`
+  over every fenced block).
+- `test_command_parser` grew from 9 to 16 tests: Unix-timestamp success,
+  ISO-8601-string timestamp correctly rejected (treated as absent),
+  invalid/uppercase `command_id` rejection, `isValidCommandId()` unit
+  tests, every `ProtocolErrorCode` string + non-empty default message,
+  all 5 canonical `ProtocolIntercomState` strings.
+- Full suite re-run: **137 tests, 0 failed** (up from 130), same MSVC +
+  real-ArduinoJson-source method as the prior two passes (`pio test`/
+  `pio run` still unavailable in this environment - see Tests).
+
+Explicitly NOT done in this pass (by instruction): no AWS IoT Core, MQTT/
+TLS, NTP, BLE, real NVS, Lambda, API Gateway, or Cognito implementation.
+Those remain exactly as stubbed as before - see Known Limitations and
+Hardware Dependencies, both still accurate.
+
+Still needed because of this change:
+- `claim_code`/product-ownership-claim representation in `DeviceIdentity`
+  and the BLE provisioning payload (doc now specifies the wire format;
+  firmware still doesn't carry it).
+- Environment (DEV/PROD) separation in `AwsIotConnectionConfig`.
+- Everything else already listed under Open Questions/Technical Debt/
+  Future Work (unchanged by this pass - it was protocol-consistency-only).
+
+Next steps: Phase 1 AWS infrastructure work (MQTT/TLS client, NTP, real
+NVS, BLE) can now proceed against a protocol document and firmware that
+agree with each other on the wire-level details reconciled here.

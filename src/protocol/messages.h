@@ -38,6 +38,20 @@ enum class ProtocolEventName {
 };
 const char* toString(ProtocolEventName event);
 
+// ---- Intercom state vocabulary ----
+// Canonical publishable values for "intercom_state" in HealthReport and
+// the Device Shadow "reported" object - see
+// docs/communication-protocol.md > Intercom State. This is a small,
+// closed set specifically so nothing ever serializes an arbitrary
+// string (e.g. core::State's diagnostic "BOOT", which has no protocol
+// equivalent). OffHook is part of the canonical vocabulary but is NOT
+// currently reachable: the firmware's core state machine transitions
+// directly from Ringing to InCall on the OffHook event and has no
+// resting "picked up but not yet in a call" state to report honestly -
+// see main.cpp's toProtocolIntercomState() and CONTEXT.md > Decisions.
+enum class ProtocolIntercomState { Idle, Ringing, OffHook, InCall, Error };
+const char* toString(ProtocolIntercomState state);
+
 // ---- Commands ----
 // Protocol v1 remotely supports only OpenDoor and Restart (see
 // docs/communication-protocol.md > Remote Commands).
@@ -57,25 +71,45 @@ enum class CommandType {
 };
 CommandType commandTypeFromString(const std::string& value);
 
+// command_id is backend-generated (never by this firmware) and, per
+// docs/communication-protocol.md > Common Message Fields, must be
+// exactly 32 lowercase hexadecimal characters - a bare 128-bit
+// identifier with NO semantic prefix (unlike event_id's "evt-" prefix
+// or device_id's "ib-" prefix, both of which are firmware-generated via
+// core/random_id.h and keep their prefixes).
+bool isValidCommandId(const std::string& commandId);
+
 enum class CommandStatus { Accepted, Completed, Failed, Rejected };
 const char* toString(CommandStatus status);
 
+// Canonical protocol v1 error codes - see
+// docs/communication-protocol.md > Error Codes for the authoritative
+// list, including which party (device/backend/application) originates
+// each one. A code that doesn't make sense for the firmware to emit
+// (e.g. NOT_PROVISIONED, WIFI_UNAVAILABLE, CLOUD_UNAVAILABLE) still lives
+// in this shared enum so the wire contract is complete, but nothing in
+// this codebase currently constructs a ProtocolError with it - see
+// CONTEXT.md > Decisions before wiring one of those up, so it isn't used
+// to fabricate device-side behavior it doesn't actually have.
 enum class ProtocolErrorCode {
-    InvalidPayload,
-    PayloadTooLarge,
-    UnsupportedProtocolVersion,
-    UnknownCommand,
-    CommandNotAllowed,
-    CommandExpired,
-    ClockNotTrustworthy,
-    InvalidTimestamp,
-    DeviceBusy,
-    DoorOutputFailure,
-    OtaDownloadFailed,
-    OtaValidationFailed,
-    OtaInstallFailed,
-    ProvisioningFailed,
-    InternalError,
+    InvalidPayload,              // device: malformed/missing-field payload
+    PayloadTooLarge,             // device: payload exceeds kMaxJsonPayloadBytes
+    UnsupportedProtocolVersion,  // device: protocol_version mismatch
+    UnknownCommand,               // device: command string not recognized
+    CommandNotAllowed,            // device: recognized but not remotely executable / not allowed in current state
+    CommandExpired,                // device: now > expires_at
+    ClockNotTrustworthy,           // device: no valid wall-clock time yet (NTP not implemented)
+    InvalidTimestamp,              // device: issued_at/expires_at missing, malformed, or window too large
+    DeviceBusy,                     // device: reserved, not currently produced
+    NotProvisioned,                  // backend: reserved, not produced by firmware
+    WifiUnavailable,                  // backend: reserved, not produced by firmware
+    CloudUnavailable,                  // backend/application: reserved, not produced by firmware
+    DoorOutputFailure,                  // device: hardware reported door actuation failure
+    OtaDownloadFailed,                   // device: OTA download step failed
+    OtaValidationFailed,                  // device: OTA hash/signature validation failed
+    OtaInstallFailed,                      // device: OTA install/reboot step failed
+    ProvisioningFailed,                     // device: reserved for a ProvisioningManager failure path (not implemented yet)
+    InternalError,                           // device: catch-all
 };
 const char* toString(ProtocolErrorCode code);
 
@@ -128,12 +162,16 @@ struct CommandResponse {
 struct DeviceCommand {
     CommandType type;
     std::string rawCommand; // original "command" string as received
-    std::string commandId;
+    std::string commandId;  // 32 lowercase hex chars, validated by parseCommand() via isValidCommandId()
     std::string rawPayload; // raw JSON text of the "payload" field, "" if absent
 
     // Command time-safety fields (see docs > Command Time Safety).
-    // Unix epoch seconds. hasIssuedAt/hasExpiresAt false if the field was
-    // absent or not a valid integer.
+    // Unix epoch seconds (NOT ISO-8601 - see docs > Common Message
+    // Fields for why command timestamps and event timestamps use
+    // different representations). hasIssuedAt/hasExpiresAt are false if
+    // the field was absent or not a JSON integer (including if it was
+    // given as an ISO-8601 string - that is treated as absent, not
+    // parsed).
     int64_t issuedAtUnixSeconds = 0;
     bool hasIssuedAt = false;
     int64_t expiresAtUnixSeconds = 0;

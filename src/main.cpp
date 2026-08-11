@@ -118,6 +118,27 @@ std::optional<ProtocolEventName> toProtocolEvent(EventType type) {
     return std::nullopt;
 }
 
+// Maps the core state machine's internal State to the protocol's closed
+// intercom_state vocabulary (see protocol/messages.h ::ProtocolIntercomState).
+// State::Boot has no protocol equivalent; it is mapped defensively to
+// Idle rather than left unhandled, but this branch should be unreachable
+// in practice since finishBoot() always runs (in initializeStateMachine())
+// before loop() - and therefore before anything that publishes
+// intercom_state - ever executes. State::InCall always maps to IN_CALL:
+// the state machine transitions directly from Ringing to InCall on the
+// OffHook event, so there is no distinct resting "off-hook" state to map
+// ProtocolIntercomState::OffHook from - see messages.h and CONTEXT.md.
+ProtocolIntercomState toProtocolIntercomState(State state) {
+    switch (state) {
+        case State::Boot: return ProtocolIntercomState::Idle;
+        case State::Idle: return ProtocolIntercomState::Idle;
+        case State::Ringing: return ProtocolIntercomState::Ringing;
+        case State::InCall: return ProtocolIntercomState::InCall;
+        case State::Error: return ProtocolIntercomState::Error;
+    }
+    return ProtocolIntercomState::Error;
+}
+
 void publishProtocolEvent(ProtocolEventName eventName) {
     DeviceEvent event;
     event.deviceId = deviceIdentity.deviceId;
@@ -274,7 +295,7 @@ void updateNetwork() {
         HealthReport health;
         health.deviceId = deviceIdentity.deviceId;
         health.firmwareVersion = FIRMWARE_VERSION;
-        health.intercomState = toString(stateMachine.getState());
+        health.intercomState = toString(toProtocolIntercomState(stateMachine.getState()));
         health.uptimeMs = clock.monotonicMs();
         health.wifiRssi = 0;      // TODO: RSSI not wired up yet, see CONTEXT.md
         health.freeHeapBytes = 0; // TODO: not wired up yet, see CONTEXT.md

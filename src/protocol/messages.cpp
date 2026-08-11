@@ -26,6 +26,30 @@ const char* toString(ProtocolEventName event) {
     return "UNKNOWN_EVENT";
 }
 
+const char* toString(ProtocolIntercomState state) {
+    switch (state) {
+        case ProtocolIntercomState::Idle: return "IDLE";
+        case ProtocolIntercomState::Ringing: return "RINGING";
+        case ProtocolIntercomState::OffHook: return "OFF_HOOK";
+        case ProtocolIntercomState::InCall: return "IN_CALL";
+        case ProtocolIntercomState::Error: return "ERROR";
+    }
+    return "UNKNOWN_STATE";
+}
+
+bool isValidCommandId(const std::string& commandId) {
+    if (commandId.size() != 32) {
+        return false;
+    }
+    for (char c : commandId) {
+        bool isLowercaseHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!isLowercaseHex) {
+            return false;
+        }
+    }
+    return true;
+}
+
 CommandType commandTypeFromString(const std::string& value) {
     if (value == "OPEN_DOOR") return CommandType::OpenDoor;
     if (value == "RESTART") return CommandType::Restart;
@@ -58,6 +82,9 @@ const char* toString(ProtocolErrorCode code) {
         case ProtocolErrorCode::ClockNotTrustworthy: return "CLOCK_NOT_TRUSTWORTHY";
         case ProtocolErrorCode::InvalidTimestamp: return "INVALID_TIMESTAMP";
         case ProtocolErrorCode::DeviceBusy: return "DEVICE_BUSY";
+        case ProtocolErrorCode::NotProvisioned: return "NOT_PROVISIONED";
+        case ProtocolErrorCode::WifiUnavailable: return "WIFI_UNAVAILABLE";
+        case ProtocolErrorCode::CloudUnavailable: return "CLOUD_UNAVAILABLE";
         case ProtocolErrorCode::DoorOutputFailure: return "DOOR_OUTPUT_FAILURE";
         case ProtocolErrorCode::OtaDownloadFailed: return "OTA_DOWNLOAD_FAILED";
         case ProtocolErrorCode::OtaValidationFailed: return "OTA_VALIDATION_FAILED";
@@ -79,6 +106,9 @@ std::string defaultErrorMessage(ProtocolErrorCode code) {
         case ProtocolErrorCode::ClockNotTrustworthy: return "Device clock is not yet synchronized; time-sensitive commands are refused";
         case ProtocolErrorCode::InvalidTimestamp: return "Command issued_at/expires_at is invalid or exceeds the allowed validity window";
         case ProtocolErrorCode::DeviceBusy: return "Device is busy and cannot execute the command right now";
+        case ProtocolErrorCode::NotProvisioned: return "Device is not provisioned";
+        case ProtocolErrorCode::WifiUnavailable: return "Wi-Fi is unavailable";
+        case ProtocolErrorCode::CloudUnavailable: return "Cloud connection is unavailable";
         case ProtocolErrorCode::DoorOutputFailure: return "Door output could not be activated";
         case ProtocolErrorCode::OtaDownloadFailed: return "Firmware download failed";
         case ProtocolErrorCode::OtaValidationFailed: return "Firmware validation failed";
@@ -166,7 +196,7 @@ CommandParseResult parseCommand(const std::string& json) {
         return result;
     }
     std::string commandId = doc["command_id"].as<std::string>();
-    if (commandId.empty()) {
+    if (!isValidCommandId(commandId)) {
         result.status = CommandParseStatus::InvalidPayload;
         return result;
     }
