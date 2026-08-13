@@ -35,6 +35,26 @@ void test_consecutive_ids_from_same_source_differ() {
     TEST_ASSERT_TRUE(first != second);
 }
 
+void test_numeric_code_has_expected_length_and_digits_only() {
+    FakeRandomSource random(1);
+    std::string code = generateNumericCode(random, 12);
+
+    TEST_ASSERT_EQUAL(12, static_cast<int>(code.size()));
+    for (char c : code) {
+        TEST_ASSERT_TRUE(c >= '0' && c <= '9');
+    }
+}
+
+void test_numeric_code_format_display_groups_in_fours() {
+    TEST_ASSERT_EQUAL_STRING("4827 1936 2051", formatNumericCodeForDisplay("482719362051").c_str());
+}
+
+void test_numeric_code_same_seed_produces_same_code() {
+    FakeRandomSource randomA(7);
+    FakeRandomSource randomB(7);
+    TEST_ASSERT_EQUAL_STRING(generateNumericCode(randomA, 12).c_str(), generateNumericCode(randomB, 12).c_str());
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -42,5 +62,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_generated_id_has_expected_format);
     RUN_TEST(test_same_seed_produces_same_id);
     RUN_TEST(test_consecutive_ids_from_same_source_differ);
+    RUN_TEST(test_numeric_code_has_expected_length_and_digits_only);
+    RUN_TEST(test_numeric_code_format_display_groups_in_fours);
+    RUN_TEST(test_numeric_code_same_seed_produces_same_code);
     return UNITY_END();
 }

@@ -26,6 +26,7 @@ void test_factory_reset_clears_wifi_credentials() {
 void test_factory_reset_preserves_device_identity_and_credentials() {
     MemoryStore store;
     store.set("device_id", "ib-0123456789abcdef0123456789abcdef");
+    store.set("setup_code", "482719362051");
     store.set("aws_certificate_pem", "-----BEGIN CERTIFICATE-----...");
     store.set("aws_private_key_pem", "-----BEGIN PRIVATE KEY-----...");
     store.set("wifi_ssid", "MyNetwork");
@@ -34,6 +35,7 @@ void test_factory_reset_preserves_device_identity_and_credentials() {
     coordinator.execute();
 
     TEST_ASSERT_TRUE(store.has("device_id"));
+    TEST_ASSERT_EQUAL_STRING("482719362051", store.get("setup_code")->c_str());
     TEST_ASSERT_TRUE(store.has("aws_certificate_pem"));
     TEST_ASSERT_TRUE(store.has("aws_private_key_pem"));
 }

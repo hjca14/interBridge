@@ -12,35 +12,56 @@ ring/off-hook/on-hook on the physical intercom line, coordinates audio
 between the intercom and the app (not yet designed), and communicates
 with **AWS IoT Core** over MQTT/TLS (mutual X.509 authentication) to
 allow remote command handling (door open, restart), telemetry (health,
-Device Shadow), OTA updates (AWS IoT Jobs), and BLE-based Wi-Fi
-provisioning.
+Device Shadow), OTA updates (AWS IoT Jobs), and **BLE-first onboarding**:
+nearby BLE discovery is the primary way a user sets up a device; QR
+scanning and typing a 12-digit `setup_code` are fallback ways to resolve
+the same physical device, not separate provisioning flows - see
+`docs/communication-protocol.md` section 7.
 
 ## Current Status
 
-**Architectural foundation + a first, honestly-scoped AWS IoT Core
-integration layer.** Two implementation passes have happened:
+**Architectural foundation + an AWS IoT Core integration layer + a
+BLE-first onboarding architecture.** Four implementation passes have
+happened:
 
 1. The initial skeleton (state machine, events, logger, hardware/
    intercom/audio abstractions) — hardware-independent, unit tested.
-2. This pass: device identity, persistent storage, MQTT topic building,
-   protocol message models, command handling (time-safety + duplicate
-   protection), event outbox, health telemetry, Device Shadow, AWS IoT
-   Jobs/OTA, BLE provisioning, AWS IoT Fleet Provisioning (CSR flow), the
-   physical config/reset button, and factory reset — all built against
-   interfaces, with real logic where it doesn't require unavailable
-   hardware/AWS/crypto, and clearly-labeled stubs where it does.
+2. AWS IoT Core integration layer: device identity, persistent storage,
+   MQTT topic building, protocol message models, command handling
+   (time-safety + duplicate protection), event outbox, health telemetry,
+   Device Shadow, AWS IoT Jobs/OTA, an initial BLE provisioning stub, AWS
+   IoT Fleet Provisioning (CSR flow, not yet invoked), the physical
+   config/reset button, and factory reset.
+3. Protocol reconciliation pass: aligned `docs/communication-protocol.md`
+   and the firmware on command timestamp format, the full error code set
+   with per-code origin, the closed `intercom_state` vocabulary, and a
+   QR claim-code URI format (superseded by pass 4's `setup_code` rename).
+4. **This pass — BLE-first onboarding rework**: nearby BLE discovery
+   promoted to the primary onboarding UX (QR/manual `setup_code` demoted
+   to fallback identity-resolution only); `claim_code` renamed to
+   `setup_code` throughout (12-digit human code, distinct from the
+   temporary application claim session and the AWS Fleet Provisioning
+   temporary claim); a dedicated 9-state `ProvisioningManager` state
+   machine with a 5-minute provisioning window and in-window retry;
+   `FleetProvisioningCoordinator` **now genuinely invoked** (resolves the
+   prior pass's biggest Technical Debt item); a BLE advertisement model
+   (`BleAdvertisementInfo`); a `BleSecurityMode` enum with no plaintext
+   option; and a semantic LED status-indication interface.
+
+All built against interfaces, with real logic where it doesn't require
+unavailable hardware/AWS/crypto, and clearly-labeled stubs where it does.
 
 **Nothing in this codebase can complete a real AWS IoT connection, a real
 BLE provisioning session, or a real signed OTA update yet.** See
 Hardware Dependencies and Open Questions.
 
-**Important:** `docs/communication-protocol.md` was substantially rewritten
-by the user (to v1.1) partway through this pass, after the code below had
-already been implemented against an earlier reading of the AWS
-architecture. The two are **not** fully reconciled — see
-[Decisions > Protocol doc v1.1 reconciliation](#decision-protocol-doc-v11-reconciliation-not-yet-complete)
-below for exactly what matches, what's missing, and what should be
-revisited before relying on this code against that document.
+**Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
+(now v1.3) and the firmware agree on the onboarding architecture,
+terminology (`setup_code`), and state vocabulary described in this file.
+Backend/infrastructure-only topics (Cognito, API Gateway, environment
+separation, the temporary application claim session's actual
+implementation) remain out of scope for this repository - see Open
+Questions.
 
 ## Architecture
 
@@ -51,7 +72,8 @@ map. Summary of what exists now, by directory:
   128-bit ID generation). No Arduino dependency.
 - `hardware/` — `gpio.h` (intercom line/door output), `clock.h`
   (monotonic + wall-clock time abstraction), `button.h` (config/reset
-  button, debounced), `system_control.h` (restart).
+  button, debounced), `status_indicator.h` (semantic LED feedback, no
+  GPIO chosen), `system_control.h` (restart).
 - `intercom/` — line detection, `Intercom` facade (door output now
   reports real success/failure, see Decisions).
 - `audio/` — unchanged stub (`NullAudioIO`).
@@ -67,10 +89,14 @@ map. Summary of what exists now, by directory:
 - `storage/` (new) — `persistent_store.h` (`IPersistentStore`),
   `memory_store.h` (native), `nvs_store.h` (ESP32, **stub**),
   `credential_store.h` (isolates certificate/private-key access).
-- `provisioning/` (new) — `device_identity.h`, `ble_provisioning.h`
-  (**stub** - framework limitation, see Decisions), `provisioning_manager.h`
-  (converges triggers), `fleet_provisioning.h` (CSR flow),
-  `factory_reset_coordinator.h`.
+- `provisioning/` — `device_identity.h` (`device_id` **and**
+  `setup_code`, both load-or-generate-once), `ble_provisioning.h`
+  (advertisement model **implemented**; real BLE stack **stub** -
+  framework limitation, see Decisions), `provisioning_manager.h` (a
+  dedicated 9-state onboarding coordinator, **implemented**),
+  `fleet_provisioning.h` (CSR flow, **implemented** and now genuinely
+  invoked by `provisioning_manager.h`), `factory_reset_coordinator.h`
+  (preserves `device_id`/`setup_code`/credentials).
 - `aws/` (new) — `device_shadow.h` (reported/desired), `jobs.h`
   (`IJobsClient`, `JobsCoordinator`).
 - `ota/` (new) — `firmware_validation.h` (`IFirmwareVerifier` - signature
@@ -158,24 +184,55 @@ module - see also the Tests section for exactly what was verified.)*
   `IOtaPlatform`/`IFirmwareVerifier`; `Esp32OtaPlatform` is a **stub**,
   `DefaultFirmwareVerifier::verifySignature()` **always returns false -
   fails closed by design**, since no signing scheme exists).
+- **Device identity + setup_code**: `provisioning/device_identity.h` -
+  `DeviceIdentityProvider` now loads-or-generates **both** `device_id`
+  (`ib-<32hex>`) and `setup_code` (12 decimal digits, via
+  `core/random_id.h`'s new `generateNumericCode()`), neither ever
+  regenerated once stored. `isValidSetupCode()` added alongside
+  `isValidDeviceId()`. **Implemented** and unit tested (format
+  validation, first-boot generation, stability across reload).
 - **BLE provisioning**: `provisioning/ble_provisioning.h` -
-  `Esp32BleProvisioning` is a **stub**, and deliberately documented as
-  such: the real design intent is ESP-IDF Unified Provisioning, which
-  isn't exposed by the `framework = arduino` this project currently
-  targets. `FakeBleProvisioning` is fully implemented for tests.
+  `BleAdvertisementInfo`/`buildBleAdvertisementInfo()` (**implemented**
+  and unit tested: builds the non-secret `InterBridge-XXXX` advertisement
+  from `device_id`'s last 4 hex chars) and `BleSecurityMode`
+  (`Security1`/`Security2`, **no plaintext value exists in the enum by
+  construction**). `Esp32BleProvisioning` (the real BLE
+  advertise/session/credential-transfer implementation) is still a
+  **stub**, and deliberately documented as such: the real design intent
+  is ESP-IDF Unified Provisioning, which isn't exposed by the
+  `framework = arduino` this project currently targets.
+  `FakeBleProvisioning` (now with `isSessionActive()`/
+  `setSessionActive()`) is fully implemented for tests.
+- **Status indication**: `hardware/status_indicator.h` -
+  `IStatusIndicator`/`ProvisioningIndication` (**implemented**: a closed
+  set of semantic indications - `ProvisioningAvailable`, `AppConnected`,
+  `ProvisioningSuccess`, `ProvisioningFailure`, `FactoryResetWarning` -
+  with no GPIO/blink-pattern decision baked in). `Esp32StatusIndicator`
+  is a **stub** (no LED GPIO chosen yet); `FakeStatusIndicator` is fully
+  implemented for tests.
 - **Provisioning orchestration**: `provisioning/provisioning_manager.h` -
-  `ProvisioningManager` (**implemented** and unit tested: converges
-  "missing Wi-Fi at boot" and "physical button" triggers, drives BLE
-  advertise → credentials received → Wi-Fi connect → completed).
+  `ProvisioningManager` **reworked this pass** into a dedicated 9-state
+  machine (`ProvisioningState`: `Idle`, `ProvisioningAvailable`,
+  `BleSessionActive`, `ConnectingWifi`, `FleetProvisioning`,
+  `CloudConnecting`, `Provisioned`, `ProvisioningFailed`,
+  `NotProvisioned`) - **implemented** and unit tested (12 tests): boot-time
+  entry, BLE session start/end, credential receipt → Wi-Fi connect →
+  Fleet Provisioning (or skipped if a certificate already exists) →
+  completion, in-window retry after a Fleet Provisioning failure, the
+  5-minute provisioning window (`kProvisioningWindowMs`) expiring back to
+  `Idle`/`NotProvisioned` depending on prior state, and the button
+  re-opening provisioning on an already-configured device. Drives
+  `IStatusIndicator` at each transition.
 - **Fleet Provisioning (CSR flow)**: `provisioning/fleet_provisioning.h` -
   `FleetProvisioningCoordinator` (**implemented** and unit tested against
   fakes). `Esp32KeyPairGenerator`/`Esp32FleetProvisioningTransport` are
-  **stubs** (no crypto library, no AWS account/template). **Not yet
-  invoked from `main.cpp`'s loop** - see Technical Debt.
+  **stubs** (no crypto library, no AWS account/template). **Now genuinely
+  invoked** by `ProvisioningManager::advanceAfterWifiConnected()` - the
+  prior pass's biggest Technical Debt item is resolved.
 - **Factory reset**: `provisioning/factory_reset_coordinator.h` -
   `FactoryResetCoordinator` (**implemented** and unit tested: clears
-  Wi-Fi credentials + provisioned flag, preserves device_id and AWS
-  credentials).
+  Wi-Fi credentials + provisioned flag, preserves `device_id`,
+  `setup_code`, and AWS credentials).
 - **`main.cpp`**: rewired to wire all of the above together; still no
   business logic in `setup()`/`loop()` themselves (delegated to small
   `updateX()` helper functions that call into coordinators).
@@ -364,13 +421,103 @@ instruction that the firmware doesn't need one yet. `DeviceIdentity`
 that remains open, see Open Questions.
 
 **Still genuinely open after this pass** (unchanged, backend/
-infrastructure work outside firmware scope for now): `claim_code`
-representation in `DeviceIdentity`/BLE provisioning payload; environment
+infrastructure work outside firmware scope for now): environment
 separation (DEV/PROD) in `AwsIotConnectionConfig`; Cognito/API Gateway/
-Lambda application backend; ownership transfer/decommissioning; AWS
-account/region/rule names/Fleet Provisioning template. None of these
-were in scope for this reconciliation pass (which was explicitly
+Lambda application backend; ownership transfer/decommissioning backend
+logic; AWS account/region/rule names/Fleet Provisioning template. None of
+these were in scope for this reconciliation pass (which was explicitly
 protocol-consistency-only, not infrastructure), and none were touched.
+
+*(Update, BLE-first onboarding pass: `claim_code` → `DeviceIdentity` was
+resolved in the very next pass - see the decisions immediately below.
+The QR URI's `claim_code` parameter was also renamed to `setup_code` -
+`docs/communication-protocol.md` section 4.3 reflects the current,
+correct name; treat any remaining mention of `claim_code` above as
+historical record of what pass 3 actually did, not current guidance.)*
+
+### Decision: onboarding is BLE-first; `claim_code` renamed to `setup_code`
+Motivo: explicit architecture change requested - nearby BLE discovery
+becomes the primary onboarding UX (matching how the app can already
+address the physical device once it's advertising), with QR/manual entry
+demoted to fallback identity-resolution methods that converge on the
+same BLE session. The rename addresses a real terminology problem the
+prior pass's `claim_code` had: `docs/communication-protocol.md` v1.1
+described it as requiring "128 bits of cryptographically secure
+randomness" and being "single-use," but a 128-bit value isn't something
+a human types or a small QR-adjacent code conveys well, and "single-use"
+doesn't fit a value printed once on a physical unit.
+Consequência: `setup_code` is now explicitly a **low-stakes, permanent,
+12-decimal-digit** identifier (`DeviceIdentity.setupCode`,
+`core/random_id.h`'s `generateNumericCode()`) - its job is physical-unit
+disambiguation, not authentication. The actual security boundary for
+onboarding moved to where it always should have been: the BLE session
+(Protocomm security mode + PoP) and a backend-authenticated temporary
+claim session, both already conceptually present before but now named
+and separated explicitly (see `docs/communication-protocol.md` section
+4's terminology note). This resolves the "Still genuinely open" item
+directly above from the prior pass.
+
+### Decision: `ProvisioningManager` reworked into a dedicated 9-state machine, now invoking Fleet Provisioning
+Motivo: the prior 5-state `ProvisioningManager` (`Idle`/
+`AwaitingCredentials`/`ConnectingWifi`/`Completed`/`Failed`) didn't model
+BLE session lifecycle separately from advertising, didn't have a
+recoverable failure/retry path, had no timeout, and - most importantly -
+never actually called `FleetProvisioningCoordinator` (constructed in
+`main.cpp` but unused, flagged as the top Technical Debt item in the
+prior pass).
+Consequência: the new state set
+(`Idle`/`ProvisioningAvailable`/`BleSessionActive`/`ConnectingWifi`/
+`FleetProvisioning`/`CloudConnecting`/`Provisioned`/`ProvisioningFailed`/
+`NotProvisioned`) makes each of these a first-class, testable transition.
+`ProvisioningManager` now takes `DeviceCredentialStore&` (to check
+whether a certificate already exists, skipping Fleet Provisioning on
+Wi-Fi-only re-provisioning) and `FleetProvisioningCoordinator&` as
+constructor dependencies. `update()`/`checkAtBoot()`/`requestProvisioning()`
+now take an explicit `nowMs` parameter (not an `IClock&` member) purely
+because every timing decision in this class only needs "the current
+time," not the full clock interface - the same pattern as
+`HealthReporter`/`ButtonController`/`ReconnectManager`.
+
+### Decision: `CloudConnecting` is a hand-off state, not a verified connection
+Motivo: gating `ProvisioningManager`'s success on an actual
+`IDeviceTransport.connect()` call would mean provisioning can never
+succeed on real hardware today, since `Esp32AwsIotTransport::connect()`
+always returns `false` (no MQTT/TLS client exists yet) - and it would
+duplicate `main.cpp`'s existing `ReconnectManager`-based connect/backoff
+loop.
+Consequência: `ProvisioningManager` considers itself done
+(`Provisioned`) once Wi-Fi is connected and an AWS IoT certificate is in
+place (either pre-existing or freshly obtained via Fleet Provisioning).
+The actual first MQTT connection remains `main.cpp`'s
+`updateNetwork()`'s job, run independently on every loop iteration
+regardless of provisioning state. This is documented as a deliberate
+scope boundary, not an oversight - see
+`docs/communication-protocol.md` section 7.5.
+
+### Decision: `BleSecurityMode` has no plaintext/"None" value
+Motivo: explicit instruction to never silently downgrade to insecure
+provisioning, even by omission (e.g. an unhandled `default:` case
+defaulting to something insecure).
+Consequência: the enum only has `Security1`/`Security2` - there is
+structurally no value a future implementation could select (accidentally
+or otherwise) that means "no security." `Esp32BleProvisioning` defaults
+to requesting `Security2` (constructor parameter), documented as
+needing on-hardware/mobile validation for whether the pinned ESP-IDF
+version supports it cleanly (`Security1` is the documented fallback).
+
+### Decision: LED feedback is a semantic interface (`IStatusIndicator`), not a GPIO abstraction
+Motivo: the LED GPIO and blink/color design are explicitly not defined
+yet (hardware not finalized), but callers (`ProvisioningManager`,
+`main.cpp`'s button handler) already know *what they want to communicate*
+(`ProvisioningAvailable`, `AppConnected`, `ProvisioningSuccess`,
+`ProvisioningFailure`, `FactoryResetWarning`) independent of how it's
+ultimately rendered.
+Consequência: `hardware/status_indicator.h`'s `IStatusIndicator` takes a
+`ProvisioningIndication` enum value, never a GPIO/color/timing
+parameter. `Esp32StatusIndicator` is a stub (does nothing) until the LED
+hardware is chosen; `FakeStatusIndicator` records the latest indication
+for tests. This mirrors the existing `IHardwareIO`/`IClock` pattern of
+modeling intent, not mechanism.
 
 ## Known Limitations
 
@@ -400,16 +547,23 @@ gcc. New from this pass:)*
   unreachable end-to-end until NTP exists.
 - `Esp32BleProvisioning` is a stub for a structural reason, not a missed
   task: ESP-IDF Unified Provisioning (the intended design) isn't exposed
-  by `framework = arduino`. See Decisions in the prior pass's CONTEXT
-  entry and `docs/communication-protocol.md` section 7/20.
+  by `framework = arduino`. See Decisions and
+  `docs/communication-protocol.md` section 7.2. This means the entire
+  BLE-first onboarding flow, however well-tested against fakes, cannot
+  run end-to-end on real hardware yet - nearby discovery, the security
+  session, and credential transfer are all unimplemented at the
+  ESP32/BLE-stack level.
 - `DefaultFirmwareVerifier::verifySignature()` always returns `false` -
   no signing scheme/public key chosen. Real OTA cannot complete
   end-to-end even once download/transport exist, until this changes.
 - `Esp32KeyPairGenerator`/`Esp32FleetProvisioningTransport` are stubs -
   no on-device crypto library for keypair/CSR generation, no AWS account/
-  template. `FleetProvisioningCoordinator` itself is fully implemented
-  and tested against fakes, but isn't invoked anywhere in `main.cpp`'s
-  loop yet (see Technical Debt).
+  template. `FleetProvisioningCoordinator` itself is fully implemented,
+  tested against fakes, and **is now genuinely invoked** by
+  `ProvisioningManager` - but on real hardware it will always fail at the
+  `Esp32KeyPairGenerator`/`Esp32FleetProvisioningTransport` stub, meaning
+  `ProvisioningManager` will always end in `ProvisioningFailed` (which is
+  the honest outcome given these stubs, not a bug).
 - `network/health_reporter.h`'s cadence logic is solid, but the actual
   `HealthReport` built in `main.cpp` hardcodes `wifiRssi = 0` and
   `freeHeapBytes = 0` - not wired to real readings.
@@ -419,12 +573,11 @@ gcc. New from this pass:)*
 
 ## Open Questions
 
-*(Superset of the initial pass's list - board/GPIOs/intercom electrical
-interface/audio hardware/audio codec/OTA artifact hosting remain exactly
-as open as before. New/updated from this pass - see also
-`docs/communication-protocol.md` v1.1 section 37 for the user's own,
-more complete "Still Open" list, which is the more authoritative version
-of this section going forward.)*
+*(Board/GPIOs/intercom electrical interface/audio hardware/audio codec/
+OTA artifact hosting remain exactly as open as in the initial pass - see
+`docs/communication-protocol.md` section 37 for the user's own, more
+complete "Still Open" list, which is the more authoritative version of
+this section going forward.)*
 
 - MQTT 3.1.1/TLS client library choice for ESP32 (needed for
   `Esp32AwsIotTransport`).
@@ -437,48 +590,47 @@ of this section going forward.)*
 - AWS account/region, Fleet Provisioning template name, Basic Ingest rule
   names (`ingestRuleName`/`responseRuleName` in `MqttTopicsConfig`
   currently default to development placeholders).
-- Real BLE service/characteristic UUIDs, and whether to switch
-  `platformio.ini`'s `esp32-c3` environment to `framework = espidf` (or a
-  mixed framework) to get ESP-IDF Unified Provisioning for real.
+- **Whether Protocomm Security 2 is cleanly supported by the pinned
+  ESP-IDF version** (`Security1` is the documented fallback -
+  `BleSecurityMode`, `docs/communication-protocol.md` section 7.2), and
+  whether to switch `platformio.ini`'s `esp32-c3` environment to
+  `framework = espidf` (or a mixed framework) to get ESP-IDF Unified
+  Provisioning for real at all.
+- Real BLE service/characteristic UUIDs.
 - Proof-of-Possession generation/persistence strategy (currently
   regenerated every boot in `main.cpp`, not stored).
+- Temporary application claim session design (issuance, expiry,
+  validation) - a backend/app concern; firmware only ever receives
+  whatever Fleet Provisioning claim material arrives over the already-
+  established BLE session, and doesn't model the claim session itself.
 - ESP32 OTA partition/library approach (`Update.h` vs. manual
   `esp_ota_*`) for `Esp32OtaPlatform`.
 - HTTPS client choice for OTA downloads.
-- **Whether/how `claim_code` and product ownership claim
-  (`docs/communication-protocol.md` sections 4, 4.1, 6.1, 9.1) should be
-  represented in `DeviceIdentity` and the BLE provisioning payload -
-  still open; the 2026-08-11 reconciliation pass specified the QR's wire
-  format but deliberately did not implement it in firmware.**
 - Environment separation (DEV/PROD) - `AwsIotConnectionConfig`
   (`network/mqtt_transport.h`) has no environment field yet.
 - Watchdog/recovery strategy for the core `StateMachine`'s `Error` state
-  (still a dead end, unchanged from the prior pass).
+  (still a dead end, unchanged from the initial pass).
 
-*(Resolved 2026-08-11: `ProtocolErrorCode` vs. doc reconciliation, and
-`issued_at`/`expires_at` format - see Decisions.)*
+*(Resolved across passes 3-4: `ProtocolErrorCode` vs. doc reconciliation;
+`issued_at`/`expires_at` format; `claim_code` → `setup_code` rename and
+`DeviceIdentity` representation; `FleetProvisioningCoordinator` wiring;
+`ProvisioningManager` timeout/retry - see Decisions.)*
 
 ## Technical Debt
 
-*(Prior-pass items - `main.cpp` never actually connects Wi-Fi with real
-credentials (now partially addressed: `ProvisioningManager` does call
-`wifi.begin()` once credentials arrive via BLE/button flow, but nothing
-provisions real BLE credentials yet since `Esp32BleProvisioning` is a
-stub); `Intercom::requestDoorOpen()` has no pulse timing;
-`updateStateMachine()` is a no-op placeholder - all still true. New from
+*(Prior-pass items still true: `Intercom::requestDoorOpen()` has no pulse
+timing; `updateStateMachine()` is a no-op placeholder. New/updated from
 this pass:)*
 
 - `CommandHandler`'s synchronous single-response model (see Decisions)
   should become a real two-phase `ACCEPTED` → terminal-response lifecycle
   once door actuation can be genuinely asynchronous.
-- `FleetProvisioningCoordinator` is constructed in `main.cpp` but never
-  invoked - the "Wi-Fi connected, no certificate stored yet → run Fleet
-  Provisioning before attempting MQTT" orchestration doesn't exist. This
-  is arguably the single biggest gap between "the pieces exist" and "the
-  device can actually provision itself."
-  its ConnectingWifi phase - if Wi-Fi never connects after credentials
-  are received, it stays there indefinitely. No `ProvisioningFailed`
-  path exists yet despite the event being defined.
+- `ConnectingWifi` still has no dedicated Wi-Fi-specific failure/timeout
+  detection (`IWifiConnection` only reports connected/not-connected, not
+  "failed to connect") - it's now caught eventually by the overall
+  5-minute provisioning window (`kProvisioningWindowMs`) rather than
+  hanging forever, which is a real improvement over the prior pass, but a
+  shorter, dedicated Wi-Fi timeout would give faster user feedback.
 - `DOOR_OPENED`/`DOOR_OPEN_FAILED` protocol events are defined but never
   published - `main.cpp` doesn't currently translate a command handler's
   door-actuation result into one of these events (only `OTA_COMPLETED`/
@@ -486,107 +638,111 @@ this pass:)*
   event publishing today).
 - `JobsCoordinator`/OTA flow doesn't publish `OTA_STARTED` before running
   a job - only the terminal `OTA_COMPLETED`/`OTA_FAILED`.
-- See the Decisions > "Protocol doc v1.1 reconciliation" entry - the
-  `ProtocolErrorCode` set, `issued_at`/`expires_at` format, and
-  `claim_code` concept all need a deliberate reconciliation pass against
-  the now-authoritative doc.
 - `docs/architecture.md` and this file must be kept manually in sync with
   the code; no automated drift check exists.
 
 ## Future Work
 
 *(Prior-pass items - characterize the intercom circuit, implement ring
-detection, choose a communication protocol/audio codec - are now
-partially superseded/refined by this pass's decisions; the concrete next
-steps are the Open Questions and Technical Debt items above, plus:)*
+detection, choose an audio codec - remain exactly as open. The concrete
+next steps are the Open Questions and Technical Debt items above, plus:)*
 
-- Reconcile the implementation against `docs/communication-protocol.md`
-  v1.1 (error codes, `issued_at`/`expires_at` format, `claim_code`).
-- Wire `FleetProvisioningCoordinator` into `main.cpp`'s connection flow.
 - Choose and implement a real MQTT 3.1.1/TLS client for
   `Esp32AwsIotTransport`.
 - Implement NTP/time sync so `Esp32Clock::hasValidTime()` can become
   real, unblocking remote command handling end-to-end.
 - Implement `NvsStore` for real so the dedup cache, event outbox, device
-  identity, and credentials genuinely survive reboot.
+  identity/setup_code, and credentials genuinely survive reboot.
 - Choose a firmware signing scheme; implement real SHA-256 (mbedtls,
   available on-device) and signature verification in
   `DefaultFirmwareVerifier`.
 - Implement `Esp32OtaPlatform` (HTTPS download + ESP32 OTA partitions).
 - Decide the BLE provisioning framework question (ESP-IDF vs. hand-rolled
-  Arduino BLE) and implement `Esp32BleProvisioning` for real.
+  Arduino BLE) and implement `Esp32BleProvisioning` for real, including
+  real advertising (`BleAdvertisementInfo`), a real Protocomm session,
+  and real `isSessionActive()`/credential delivery.
+- Choose/implement the on-device keypair+CSR crypto for
+  `Esp32KeyPairGenerator`, and the AWS Fleet Provisioning MQTT wiring for
+  `Esp32FleetProvisioningTransport`.
 - Wire `wifi_rssi`/`free_heap` into `HealthReport`/Device Shadow for
   real.
-- Add a `ProvisioningFailed` path/timeout to `ProvisioningManager`.
+- Implement `Esp32StatusIndicator` once LED hardware is chosen.
 - Publish `DOOR_OPENED`/`DOOR_OPEN_FAILED`/`OTA_STARTED` events from
   `main.cpp`.
+- Add a dedicated, shorter Wi-Fi-connect timeout inside `ConnectingWifi`
+  (currently only caught by the overall provisioning window).
 - Once real PlatformIO/toolchain access is available, run
   `pio run -e esp32-c3` and `pio test -e native` as the authoritative
   build/test verification (see Tests for what substituted for this).
 
 ## Tests
 
-24 native test suites now exist under `test/` (up from 5), covering every
-module that doesn't require real hardware, AWS, or crypto:
+26 native test suites now exist under `test/` (up from 5 initially),
+covering every module that doesn't require real hardware, AWS, or
+crypto:
 
 | Test dir | Covers |
 |---|---|
-| `test_state_machine`, `test_events`, `test_line_detector`, `test_protocol`, `test_audio` | Unchanged from the prior pass (`test_line_detector` updated for the new `setDoorOutput()` bool signature, plus 2 new `Intercom::requestDoorOpen()` tests) |
+| `test_state_machine`, `test_events`, `test_line_detector`, `test_protocol`, `test_audio` | Unchanged since the initial pass |
 | `test_mqtt_topics` | Every `MqttTopics` method, incl. the empty-string-when-unconfigured Fleet Provisioning case |
-| `test_command_parser` | Valid command with Unix timestamps, ISO-8601 string timestamp correctly NOT accepted, malformed JSON, missing/invalid-format/uppercase command_id, missing/unsupported protocol_version, unknown command, oversized payload, payload object capture, reserved commands, every `ProtocolErrorCode`'s string + default message, all 5 canonical `ProtocolIntercomState` values (added/expanded 2026-08-11 reconciliation pass) |
+| `test_command_parser` | Valid command with Unix timestamps, ISO-8601 string timestamp correctly NOT accepted, malformed JSON, missing/invalid-format/uppercase command_id, missing/unsupported protocol_version, unknown command, oversized payload, payload object capture, reserved commands, every `ProtocolErrorCode`'s string + default message, all 5 canonical `ProtocolIntercomState` values |
 | `test_command_handler` | OPEN_DOOR success/failure, clock-not-trustworthy/expired/oversized-window rejection, RESTART, duplicate OPEN_DOOR not re-actuating hardware, ENTER_PROVISIONING/FACTORY_RESET/reserved/unknown rejection |
 | `test_command_cache` | In-memory find/record/eviction, persistent round-trip across a simulated reboot |
 | `test_event_outbox` | Enqueue/pending/dequeue, capacity eviction, duplicate-ID upsert, persistent round-trip preserving `event_id` |
 | `test_reconnect_manager` | Backoff bounds/growth/clamp-to-max, reset, attempt counter |
 | `test_button` | Debounce/bounce rejection, short press, 3s/10s one-shot thresholds, no repeat while held, re-fire after release |
-| `test_device_identity` | Format validation, first-boot generation, stability across reload, provisioned-flag persistence |
+| `test_device_identity` | `device_id`/`setup_code` format validation, first-boot generation of both, stability across reload, provisioned-flag persistence |
 | `test_persistent_store` | `MemoryStore` get/set/remove/overwrite, `DeviceCredentialStore` isolation + safe logging |
 | `test_clock` | `FakeClock` monotonic/wall-time behavior |
-| `test_random_id` | ID format, determinism from a seed, uniqueness across calls |
+| `test_random_id` | Hex ID format/determinism/uniqueness, plus numeric-code (`setup_code`) length/digits-only/determinism/display-grouping |
 | `test_device_shadow` | Reported field serialization, delta parsing, unknown-field tolerance, malformed-payload safety |
 | `test_jobs` | No-job case, success path (status update sequence), failure path with reason |
 | `test_ota` | Version comparison, success path, and every individual failure mode (version/download/hash/signature/install/boot), plus `DefaultFirmwareVerifier`'s fail-closed signature check |
 | `test_health_reporter` | First-call-due, cadence, `forceNextPublish()` |
-| `test_provisioning` | Boot-time entry (missing vs. present credentials), credential receipt → Wi-Fi connect → completion, re-trigger no-op while in progress |
+| `test_provisioning` **(reworked this pass)** | Boot-time entry, BLE session active/dropped transitions, credential receipt → Wi-Fi connect → Fleet Provisioning (success/skip-if-cert-exists/failure-with-retry) → completion, 5-minute provisioning window expiry (both `NotProvisioned` and `Idle` outcomes), re-trigger no-op while in progress, button re-opening an already-provisioned device |
 | `test_fleet_provisioning` | Full success path, and each individual failure mode (keygen/cert-request/register-thing) |
-| `test_factory_reset` | Wi-Fi/provisioned-flag cleared, identity/credentials preserved |
+| `test_factory_reset` | Wi-Fi/provisioned-flag cleared, identity/credentials/**setup_code** preserved |
 | `test_mqtt_transport` | `FakeDeviceTransport` connect/publish/subscribe/deliver, armed connect failures |
+| `test_ble_provisioning` **(new)** | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes |
+| `test_status_indicator` **(new)** | `FakeStatusIndicator` show/clear/count behavior |
 
 **How this was validated (no PlatformIO/gcc in this environment - same
-constraint as the prior pass):**
-- All 24 test suites, plus the ~33 native-safe `.cpp` files under `src/`
+constraint as every prior pass):**
+- All 26 test suites, plus the 34 native-safe `.cpp` files under `src/`
   (everything except `main.cpp` and `network/wifi.cpp`), were compiled
   **and executed** with MSVC (`cl.exe`, VS 2022 Build Tools) against the
   real ArduinoJson v7 source (fetched into a local scratch directory, not
   committed to the repo) and the same throwaway Unity-compatible shim
-  used in the prior pass. **137 tests, 0 failed**, re-confirmed after the
-  2026-08-11 protocol reconciliation pass (up from 130 after
-  `test_command_parser` gained 7 tests for command_id format, ISO-8601-
-  string timestamp rejection, error code strings/messages, and canonical
-  intercom states).
-- `main.cpp` and every Arduino-dependent `.cpp` file (`wifi.cpp`,
-  `clock.cpp`, `system_control.cpp`, `random_id.cpp`, `gpio.cpp`,
-  `button.cpp`, `ble_provisioning.cpp`) were additionally compiled under
-  a `-DARDUINO=100` flag against extended `Arduino.h`/`WiFi.h`/
-  `esp_system.h` shims (also scratch-only) - all compiled cleanly.
-- Four files that combine `ARDUINO` **and** ArduinoJson
-  (`device_shadow.cpp`, `messages.cpp`, `command_cache.cpp`,
-  `event_outbox.cpp`) could not be validated under the `-DARDUINO=100`
-  flag: ArduinoJson's PROGMEM polyfill expects real AVR/ESP `pgm_read_byte`-
-  style macros that only exist in the actual arduino-esp32 framework, not
-  in a hand-written shim, and reproducing them was judged not worth the
-  effort. **This is a sandbox/shim limitation, not a known code defect** -
-  the exact same ArduinoJson API calls in those files were fully compiled
-  and executed (with passing tests) in the native, non-`ARDUINO` build.
-- **Not verified, same as the prior pass:** an actual `pio run -e esp32-c3`
-  against the real `espressif32` platform/toolchain, or `pio test -e native`
-  via PlatformIO+Unity+gcc specifically. Do this before relying on the
-  `esp32-c3` environment or the new `lib_deps` entry
-  (`bblanchon/ArduinoJson@^7.0.0`) actually resolving correctly.
+  used throughout. **160 tests, 0 failed**, re-confirmed after this
+  pass's BLE-first onboarding rework (up from 137 after the protocol
+  reconciliation pass - the increase comes from `test_provisioning`
+  growing from 5 to 12 tests and the two new suites above).
+- `main.cpp` and every Arduino-dependent `.cpp` file were additionally
+  compiled under a `-DARDUINO=100` flag against extended
+  `Arduino.h`/`WiFi.h`/`esp_system.h` shims (also scratch-only) - all
+  compiled cleanly. (`ble_provisioning.cpp`/`status_indicator.cpp` have
+  no Arduino-specific code at all currently - pure stubs - so this check
+  is trivially satisfied for them, same as the native run.)
+- Files that combine `ARDUINO` **and** ArduinoJson (`device_shadow.cpp`,
+  `messages.cpp`, `command_cache.cpp`, `event_outbox.cpp`) still can't be
+  validated under `-DARDUINO=100`: ArduinoJson's PROGMEM polyfill expects
+  real AVR/ESP `pgm_read_byte`-style macros only present in the actual
+  arduino-esp32 framework, not a hand-written shim. **This is a
+  sandbox/shim limitation, not a known code defect** - the exact same
+  API calls in those files were fully compiled and executed (with
+  passing tests) in the native, non-`ARDUINO` build.
+- **Not verified, same as every prior pass:** an actual
+  `pio run -e esp32-c3` against the real `espressif32` platform/
+  toolchain, or `pio test -e native` via PlatformIO+Unity+gcc
+  specifically - `pio`/`gcc` were re-confirmed absent from this
+  environment at the start of this pass. Do this before relying on the
+  `esp32-c3` environment.
 - **Hardware/AWS/crypto-dependent, not testable at all yet:** anything
   exercising `Esp32GpioHardware`, `Esp32AwsIotTransport`,
-  `Esp32BleProvisioning`, `Esp32OtaPlatform`, `Esp32KeyPairGenerator`,
-  `Esp32FleetProvisioningTransport`, `NvsStore`, or real Wi-Fi/NTP.
+  `Esp32BleProvisioning` (nearby discovery, real Protocomm session, real
+  credential transfer), `Esp32StatusIndicator`, `Esp32OtaPlatform`,
+  `Esp32KeyPairGenerator`, `Esp32FleetProvisioningTransport`,
+  `NvsStore`, or real Wi-Fi/NTP.
 
 ## Hardware Dependencies
 
@@ -603,7 +759,10 @@ this pass:)*
 - `Esp32Clock` — needs NTP integration and on-hardware time-sync
   validation.
 - `Esp32ButtonInput`, `Esp32SystemControl` (`ESP.restart()`),
-  `Esp32BleProvisioning`, `Esp32OtaPlatform`, `Esp32KeyPairGenerator`,
+  `Esp32BleProvisioning` (now covering nearby discovery, advertisement,
+  a real Protocomm session, and credential transfer - the scope grew
+  this pass even though the stub itself didn't change behavior),
+  `Esp32StatusIndicator`, `Esp32OtaPlatform`, `Esp32KeyPairGenerator`,
   `Esp32FleetProvisioningTransport` — all stubs needing real hardware/
   library integration before any validation is possible.
 
@@ -737,3 +896,84 @@ Still needed because of this change:
 Next steps: Phase 1 AWS infrastructure work (MQTT/TLS client, NTP, real
 NVS, BLE) can now proceed against a protocol document and firmware that
 agree with each other on the wire-level details reconciled here.
+
+**Fourth pass, same day — BLE-first onboarding update:**
+
+Implemented:
+- `core/random_id.h/.cpp`: `generateNumericCode()` + `formatNumericCodeForDisplay()`
+  (12-digit `setup_code` generation/display).
+- `provisioning/device_identity.h/.cpp`: `DeviceIdentity.setupCode` +
+  `isValidSetupCode()`; `DeviceIdentityProvider::load()` now loads-or-
+  generates `setup_code` alongside `device_id`, resolving the prior
+  pass's open "how should claim_code be represented in DeviceIdentity"
+  question.
+- `provisioning/ble_provisioning.h/.cpp`: `BleSecurityMode`
+  (`Security1`/`Security2`, no plaintext value), `BleAdvertisementInfo` +
+  `buildBleAdvertisementInfo()`, `IBleProvisioning::isSessionActive()`/
+  `securityMode()`, `startAdvertising()` signature now takes the
+  advertisement info. `FakeBleProvisioning` gained
+  `setSessionActive()`/`lastAdvertisementInfo()`.
+- `hardware/status_indicator.h/.cpp` (new): `IStatusIndicator`/
+  `ProvisioningIndication`/`Esp32StatusIndicator` (stub)/
+  `FakeStatusIndicator`.
+- `provisioning/provisioning_manager.h/.cpp`: reworked from a 5-state to
+  a 9-state machine (`Idle`/`ProvisioningAvailable`/`BleSessionActive`/
+  `ConnectingWifi`/`FleetProvisioning`/`CloudConnecting`/`Provisioned`/
+  `ProvisioningFailed`/`NotProvisioned`); added
+  `kProvisioningWindowMs` (5 minutes); **now genuinely invokes
+  `FleetProvisioningCoordinator`**; added in-window failure retry;
+  `update()`/`checkAtBoot()`/`requestProvisioning()` now take `nowMs`.
+  New constructor dependencies: `DeviceCredentialStore&`,
+  `FleetProvisioningCoordinator&`, `IStatusIndicator&`,
+  `BleAdvertisementInfo`.
+- `main.cpp`: added `Esp32StatusIndicator`; reordered
+  `fleetProvisioningCoordinator` construction before `provisioningManager`
+  (the latter now holds a reference to the former); wired
+  `buildBleAdvertisementInfo()`; all provisioning entry points now pass
+  `clock.monotonicMs()`; button handler shows `FactoryResetWarning`
+  before executing a factory reset.
+- Doc renames/additions across `docs/communication-protocol.md` (now
+  v1.3): `claim_code` → `setup_code` everywhere it meant the human-facing
+  product code (14 of 16 occurrences changed; the terminology-note
+  mention of the old name is intentional); QR URI parameter renamed to
+  `setup_code`; new sections 7.1-7.7 (nearby discovery primary flow,
+  security mode, QR/manual fallback, advertisement model, provisioning
+  state machine, window/recovery, LED indication); section 6.1 rewritten
+  so BLE discovery (not QR scanning) is the described trigger; section
+  9.1's ownership-transfer text corrected (setup_code is permanent, so
+  transfer reissues a claim *session*, not a new code); "Still Open"
+  gained a BLE/mobile-validation subsection.
+- `test_provisioning` fully rewritten (5 → 12 tests): BLE session
+  active/inactive transitions, credential receipt, full flow through
+  Fleet Provisioning, existing-certificate skip path, Fleet Provisioning
+  failure + in-window retry, provisioning window expiry (both outcomes),
+  request-while-in-progress no-op, button re-opening a configured
+  device.
+- `test_device_identity`, `test_random_id`, `test_factory_reset` extended
+  for `setup_code` (format validation, generation, display grouping,
+  survival through factory reset).
+- Two new suites: `test_ble_provisioning` (6 tests), `test_status_indicator`
+  (4 tests).
+- Full suite re-run: **160 tests, 0 failed** (up from 137), same MSVC +
+  real-ArduinoJson-source method as every prior pass (`pio`/`gcc`
+  re-confirmed unavailable in this environment).
+
+Explicitly NOT done in this pass (by instruction): no AWS IoT Core, real
+MQTT/TLS, NTP, BLE stack, real NVS, Lambda, API Gateway, or Cognito
+implementation.
+
+Still needed because of this change:
+- Everything under Open Questions/Technical Debt/Future Work above -
+  most notably the BLE stack itself (`Esp32BleProvisioning`), which now
+  has a considerably more detailed contract to implement against
+  (advertisement, session tracking, security mode) but is still 100%
+  stub.
+- A dedicated, shorter Wi-Fi-connect timeout (currently only the overall
+  5-minute window catches a stuck `ConnectingWifi`).
+
+Next steps: with the onboarding architecture and terminology now stable
+and doc/firmware-consistent, the highest-leverage next steps are (in
+order) NTP (unblocks all remote commands), a real MQTT/TLS client
+(unblocks everything network-facing), and the ESP-IDF Unified
+Provisioning integration (unblocks the entire onboarding flow this pass
+just designed).

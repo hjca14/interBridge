@@ -14,6 +14,7 @@
 #include "hardware/button.h"
 #include "hardware/clock.h"
 #include "hardware/gpio.h"
+#include "hardware/status_indicator.h"
 #include "hardware/system_control.h"
 #include "intercom/intercom.h"
 #include "network/health_reporter.h"
@@ -52,6 +53,7 @@ Esp32RandomSource randomSource;
 Esp32SystemControl systemControl;
 Esp32ButtonInput buttonInputHardware;
 ButtonController buttonController(buttonInputHardware);
+Esp32StatusIndicator statusIndicator;
 
 // ---- Storage / identity ----
 NvsStore persistentStore; // STUB - see CONTEXT.md, nothing survives reboot yet.
@@ -75,16 +77,17 @@ PersistentEventOutbox eventOutbox(persistentStore);
 std::optional<CommandHandler> commandHandler;
 
 // ---- Provisioning ----
-Esp32BleProvisioning bleProvisioning;
-std::optional<ProvisioningManager> provisioningManager;
+Esp32BleProvisioning bleProvisioning; // default Security2-requested, see ble_provisioning.h
 FactoryResetCoordinator factoryResetCoordinator(persistentStore);
 Esp32KeyPairGenerator keyPairGenerator;
 Esp32FleetProvisioningTransport fleetProvisioningTransport;
-// Constructed in initializeIdentity() but not yet invoked anywhere in the
-// main loop - the "connect Wi-Fi, and if no certificate is stored yet,
-// run Fleet Provisioning before attempting MQTT" orchestration has not
-// been implemented. See CONTEXT.md > Future Work.
+// Constructed (emplaced) in initializeIdentity(), before provisioningManager
+// since ProvisioningManager holds a reference to it - now genuinely
+// invoked as part of the onboarding flow (ProvisioningManager::
+// advanceAfterWifiConnected()), unlike the prior pass where this existed
+// but nothing called it.
 std::optional<FleetProvisioningCoordinator> fleetProvisioningCoordinator;
+std::optional<ProvisioningManager> provisioningManager;
 
 // ---- OTA / AWS IoT Jobs ----
 DefaultFirmwareVerifier firmwareVerifier;
@@ -181,6 +184,9 @@ void initializeLogging() {
 void initializeIdentity() {
     deviceIdentity = identityProvider.load();
     Logger::info(("Device ID: " + deviceIdentity.deviceId).c_str());
+    // setup_code is human-facing (QR/manual fallback) and low-stakes
+    // compared to device_id/credentials - still avoided in routine logs
+    // as a matter of habit, not because it's cryptographically sensitive.
 
     MqttTopicsConfig topicsConfig;
     topicsConfig.deviceId = deviceIdentity.deviceId;
@@ -190,15 +196,18 @@ void initializeIdentity() {
 
     commandHandler.emplace(deviceIdentity.deviceId, clock, dedupCache, intercom, systemControl);
 
+    fleetProvisioningCoordinator.emplace(keyPairGenerator, fleetProvisioningTransport, credentialStore,
+                                          topicsConfig.fleetProvisioningTemplateName);
+
     // Provisional Proof-of-Possession: regenerated every boot rather than
     // persisted, since the production PoP strategy is not decided yet.
     // See CONTEXT.md > Open Questions.
     std::string proofOfPossession = generateHexId(randomSource, "pop");
-    provisioningManager.emplace(persistentStore, wifiManager, bleProvisioning, proofOfPossession);
-    provisioningManager->checkAtBoot();
-
-    fleetProvisioningCoordinator.emplace(keyPairGenerator, fleetProvisioningTransport, credentialStore,
-                                          topicsConfig.fleetProvisioningTemplateName);
+    BleAdvertisementInfo advertisementInfo = buildBleAdvertisementInfo(deviceIdentity.deviceId);
+    provisioningManager.emplace(persistentStore, wifiManager, bleProvisioning, credentialStore,
+                                 *fleetProvisioningCoordinator, statusIndicator, deviceIdentity.deviceId,
+                                 proofOfPossession, advertisementInfo);
+    provisioningManager->checkAtBoot(clock.monotonicMs());
 }
 
 void initializeHardware() {
@@ -221,10 +230,12 @@ void initializeStateMachine() {
 }
 
 void updateButton() {
-    ButtonAction action = buttonController.update(clock.monotonicMs());
+    uint32_t nowMs = clock.monotonicMs();
+    ButtonAction action = buttonController.update(nowMs);
     if (action == ButtonAction::ProvisioningRequested) {
-        provisioningManager->requestProvisioning();
+        provisioningManager->requestProvisioning(nowMs);
     } else if (action == ButtonAction::FactoryResetRequested) {
+        statusIndicator.show(ProvisioningIndication::FactoryResetWarning);
         factoryResetCoordinator.execute();
         publishProtocolEvent(ProtocolEventName::FactoryResetRequested);
         systemControl.restart();
@@ -232,7 +243,7 @@ void updateButton() {
 }
 
 void updateProvisioning() {
-    provisioningManager->update();
+    provisioningManager->update(clock.monotonicMs());
     auto event = provisioningManager->pollEvent();
     if (event.has_value()) {
         publishProtocolEvent(*event);

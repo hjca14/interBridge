@@ -54,4 +54,28 @@ std::string generateHexId(IRandomSource& random, const char* prefix) {
     return id;
 }
 
+std::string generateNumericCode(IRandomSource& random, int digitCount) {
+    std::string code;
+    code.reserve(static_cast<size_t>(digitCount));
+
+    uint8_t byte;
+    for (int i = 0; i < digitCount; i++) {
+        random.fill(&byte, 1);
+        code += static_cast<char>('0' + (byte % 10));
+    }
+    return code;
+}
+
+std::string formatNumericCodeForDisplay(const std::string& code) {
+    std::string formatted;
+    formatted.reserve(code.size() + code.size() / 4);
+    for (size_t i = 0; i < code.size(); i++) {
+        if (i > 0 && i % 4 == 0) {
+            formatted += ' ';
+        }
+        formatted += code[i];
+    }
+    return formatted;
+}
+
 } // namespace interbridge

@@ -10,12 +10,17 @@ around:
 
 - **MQTT 3.1.1 over TLS to AWS IoT Core**, with mutual TLS (a unique
   X.509 certificate per device) — see `src/network/mqtt_transport.h`.
-- **BLE-based Wi-Fi provisioning** — see `src/provisioning/ble_provisioning.h`.
+- **BLE-first onboarding**: nearby BLE discovery is the primary way a
+  user sets up a device; QR scanning and typing the 12-digit `setup_code`
+  are fallback ways to find the *same* physical device, not separate
+  flows — see `src/provisioning/provisioning_manager.h` and
+  `docs/communication-protocol.md` section 7.
 - **OTA firmware updates via AWS IoT Jobs** (not a custom application
   command) — see `src/ota/ota_manager.h` and `src/aws/jobs.h`.
 - **A physical configuration/reset button** (short press: nothing; ~3s
-  hold: enter provisioning; ~10s hold: factory reset) — see
-  `src/hardware/button.h`. The button's GPIO is not assigned yet.
+  hold: (re)opens the 5-minute provisioning window; ~10s hold: factory
+  reset) — see `src/hardware/button.h`. The button's GPIO is not
+  assigned yet.
 
 Several hardware, cloud, and protocol decisions have not been made yet,
 and several of the pieces above are real, tested coordinators sitting
@@ -52,7 +57,7 @@ the full device/cloud protocol specification.
 src/         Firmware source: core, hardware, intercom, audio, storage,
              provisioning, network, protocol, aws, ota.
 include/     Reserved for shared public headers (unused so far).
-test/        Native unit tests (Unity), one PlatformIO test per directory (24 suites).
+test/        Native unit tests (Unity), one PlatformIO test per directory (26 suites).
 docs/        Architecture documentation and the communication protocol spec.
 platformio.ini
 CONTEXT.md   Operational memory of the project — read this first.
@@ -80,11 +85,12 @@ pio device monitor -b 115200
 ## Running tests
 
 ```bash
-# Run all native unit tests (24 suites: state machine, events, intercom,
+# Run all native unit tests (26 suites: state machine, events, intercom,
 # MQTT topics, command parsing/handling/dedup, event outbox, reconnect
 # backoff, button, device identity, persistent storage, Device Shadow,
-# AWS IoT Jobs, OTA, health telemetry, provisioning, Fleet Provisioning,
-# factory reset, MQTT transport, ...)
+# AWS IoT Jobs, OTA, health telemetry, provisioning (BLE-first onboarding
+# state machine), BLE advertisement/security mode, status indicator,
+# Fleet Provisioning, factory reset, MQTT transport, ...)
 pio test -e native
 ```
 

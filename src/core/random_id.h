@@ -41,4 +41,18 @@ private:
 // chars>", e.g. generateHexId(rng, "evt") -> "evt-3f2a1c...".
 std::string generateHexId(IRandomSource& random, const char* prefix);
 
+// Generates a human-typeable decimal numeric code of `digitCount` digits
+// (each '0'-'9'), e.g. for the 12-digit setup_code (see
+// provisioning/device_identity.h). This is NOT a cryptographic
+// identifier - see generateHexId() for those. A small per-digit modulo
+// bias is acceptable here: the code only needs to be humanly memorable/
+// typeable and correlated with a specific device by the backend, not to
+// carry cryptographic security on its own (that comes from the BLE
+// session security mode - see provisioning/ble_provisioning.h).
+std::string generateNumericCode(IRandomSource& random, int digitCount);
+
+// Formats a numeric code for human display, grouped in 4s:
+// "482719362051" -> "4827 1936 2051".
+std::string formatNumericCodeForDisplay(const std::string& code);
+
 } // namespace interbridge

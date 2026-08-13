@@ -35,6 +35,7 @@ src/
 │   ├── gpio.h/.cpp           IHardwareIO (intercom line/door) + stub.
 │   ├── clock.h/.cpp          IClock (monotonic + wall-clock time) + stub/fake.
 │   ├── button.h/.cpp         Config/reset button: debounce + hold thresholds.
+│   ├── status_indicator.h/.cpp  Semantic LED feedback (no GPIO chosen) + stub/fake.
 │   └── system_control.h/.cpp ISystemControl (restart).
 │
 ├── intercom/           Intercom business logic (electrically agnostic).
@@ -50,12 +51,12 @@ src/
 │   ├── nvs_store.h/.cpp      ESP32 NVS implementation (stub).
 │   └── credential_store.h/.cpp  Isolates certificate/private-key access.
 │
-├── provisioning/       Device identity, Wi-Fi/cloud provisioning, factory reset.
-│   ├── device_identity.h/.cpp        Stable device_id load-or-generate.
-│   ├── ble_provisioning.h/.cpp       BLE Wi-Fi provisioning (stub - see below).
-│   ├── provisioning_manager.h/.cpp   Converges every provisioning trigger.
-│   ├── fleet_provisioning.h/.cpp     AWS IoT Fleet Provisioning (CSR flow).
-│   └── factory_reset_coordinator.h/.cpp  Clears user config, preserves identity.
+├── provisioning/       Device identity, BLE-first onboarding, factory reset.
+│   ├── device_identity.h/.cpp        Stable device_id + setup_code load-or-generate.
+│   ├── ble_provisioning.h/.cpp       BLE advertisement model + Wi-Fi credential transfer (real BLE stack stubbed - see below).
+│   ├── provisioning_manager.h/.cpp   Dedicated onboarding state machine (9 states); converges every trigger.
+│   ├── fleet_provisioning.h/.cpp     AWS IoT Fleet Provisioning (CSR flow) - now invoked by ProvisioningManager.
+│   └── factory_reset_coordinator.h/.cpp  Clears user config, preserves identity + setup_code.
 │
 ├── network/            Wi-Fi + MQTT transport + protocol plumbing.
 │   ├── wifi.h/.cpp            IWifiConnection + WifiManager (Arduino) + fake.
@@ -81,7 +82,7 @@ src/
     └── ota_manager.h/.cpp          OtaCoordinator: version→download→verify→install→confirm.
 ```
 
-`include/` is still unused (see `include/README.md`). `test/` holds 24
+`include/` is still unused (see `include/README.md`). `test/` holds 26
 native unit test suites, one per PlatformIO test directory - see Testing
 strategy below.
 
@@ -206,37 +207,67 @@ Provisioning and OTA have their own, separate lifecycle states
 `ota_manager.h`) instead of being folded into the core call-flow state
 machine - see CONTEXT.md > Decisions for why.
 
-## Provisioning lifecycle
+## Provisioning lifecycle (BLE-first onboarding)
+
+`ProvisioningManager` is a dedicated onboarding coordinator with its own
+9-state machine (`ProvisioningState`), separate from `core::StateMachine`
+(the intercom call-flow machine) - see
+`docs/communication-protocol.md` section 7.5 for the full rationale and
+diagram. Summary:
 
 ```text
-                 No Wi-Fi credentials stored (checkAtBoot)
-                          or physical button held ~3s
+   Trigger: no Wi-Fi credentials at boot (checkAtBoot),
+   or physical button held ~3s on an already-provisioned device (requestProvisioning)
                                     │
                                     ▼
-                          ProvisioningManager:
-                        AwaitingCredentials
-                     (IBleProvisioning advertises)
+                        ProvisioningAvailable
+                (IBleProvisioning advertises: BleAdvertisementInfo)
                                     │
-                     credentials received over BLE
-                                    │
+                        BLE central connects
                                     ▼
-                          ConnectingWifi
-                    (IWifiConnection.begin())
+                          BleSessionActive
+                       (advertising stops)
+                                    │
+                  Wi-Fi credentials received over BLE
+                                    ▼
+                            ConnectingWifi
+                       (IWifiConnection.begin())
                                     │
                         Wi-Fi reports connected
-                                    │
                                     ▼
-                            Completed
-                (PROVISIONING_COMPLETED event queued)
+                    has a certificate already? ──yes──▶ CloudConnecting
+                                    │no
+                                    ▼
+                           FleetProvisioning
+              (FleetProvisioningCoordinator.provision(deviceId))
+                                    │
+                        success │       │ failure
+                                 ▼       ▼
+                       CloudConnecting   ProvisioningFailed
+                                 │       (PROVISIONING_FAILED event;
+                                 ▼        resumes ProvisioningAvailable
+                             Provisioned  if still within the 5-minute
+                (PROVISIONING_COMPLETED  window - see CONTEXT.md)
+                       event queued)
 ```
 
 `ENTER_PROVISIONING` is deliberately **not** one of the triggers above -
 it is not remotely executable in protocol v1 (see
-`docs/communication-protocol.md`). AWS IoT Fleet Provisioning (the CSR
-flow that turns a Wi-Fi connection into a permanent X.509 certificate) is
-a separate, fully-implemented-and-tested coordinator
-(`FleetProvisioningCoordinator`) that isn't invoked from this flow yet -
-see CONTEXT.md > Technical Debt.
+`docs/communication-protocol.md`). AWS IoT Fleet Provisioning is now
+genuinely invoked as part of this flow (a change from the prior pass,
+where `FleetProvisioningCoordinator` existed but nothing called it - see
+CONTEXT.md > Change Log). `CloudConnecting` is a hand-off point, not a
+verified MQTT connection: `ProvisioningManager` does not itself call
+`IDeviceTransport.connect()` - `main.cpp`'s ordinary `updateNetwork()`
+loop (with `ReconnectManager`) owns that, so connection/backoff logic
+isn't duplicated between the two.
+
+QR scanning and manual `setup_code` entry (`docs/communication-protocol.md`
+section 7.3) are handled entirely by the app/backend to resolve *which*
+physical device to open a BLE session with - by the time
+`ProvisioningManager` sees anything, a BLE session already exists, so
+there is exactly one code path here regardless of how the app found the
+device.
 
 ## OTA lifecycle
 
@@ -274,8 +305,8 @@ Two PlatformIO environments exist:
 
 - `esp32-c3` — the real firmware, `framework = arduino`, with
   `lib_deps = bblanchon/ArduinoJson@^7.0.0`.
-- `native` — compiles the hardware-independent subset of `src/` (33 of
-  35 `.cpp` files) together with Unity tests under `test/` (24 suites),
+- `native` — compiles the hardware-independent subset of `src/` (34 of
+  36 `.cpp` files) together with Unity tests under `test/` (26 suites),
   using the host's own C++ compiler.
 
 `main.cpp` and `network/wifi.cpp` are excluded from the `native` build
@@ -325,3 +356,24 @@ plus new ones from this pass:)*
   Provisioning's CSR flow) has a genuinely different shape - forcing them
   through one interface would have made every fake's test double
   simulate operations it doesn't actually have.
+- **`setup_code` lives in `DeviceIdentity`/`DeviceIdentityProvider`, not
+  a separate module**, because it's generated and persisted exactly like
+  `device_id` (load-or-generate-once, never regenerated) - introducing a
+  parallel "setup code provider" class would have duplicated that logic
+  for no benefit. It stays a distinct *field*, not folded into
+  `device_id` itself, because the two have different formats, different
+  audiences (machine vs. human), and different lifecycles in principle
+  (see `docs/communication-protocol.md` section 4's terminology note on
+  why the three onboarding-adjacent identifiers must never be conflated).
+- **`BleAdvertisementInfo` is a plain data struct built by a pure
+  function** (`buildBleAdvertisementInfo(deviceId)`), not a method on
+  `IBleProvisioning`, so the "what do we advertise" question is testable
+  in isolation from "how do we actually advertise it" (still a stub).
+- **`BleSecurityMode` has no plaintext/"None" enumerator** - a structural
+  choice, not just a documented rule, so a future real implementation
+  cannot silently default to an insecure session merely by omitting a
+  case in a switch statement.
+- **`ProvisioningManager` does not verify the first MQTT connection
+  itself** (`CloudConnecting` is a hand-off, not a blocking wait) to
+  avoid duplicating `main.cpp`'s existing `ReconnectManager`-based
+  connect/backoff loop - see the Provisioning lifecycle section above.

@@ -8,9 +8,19 @@
 namespace interbridge {
 
 struct DeviceIdentity {
-    std::string deviceId;
+    std::string deviceId;    // technical identity: AWS ThingName, MQTT ClientId. Never typed by the user.
     std::string hardwareVersion;
     std::string firmwareVersion;
+    // Human-facing onboarding identifier (12 decimal digits, e.g.
+    // "482719362051"). Used ONLY as a fallback identity-resolution
+    // method (QR/manual entry) so the app/backend can find this
+    // physical unit when nearby BLE discovery isn't used - see
+    // docs/communication-protocol.md > Onboarding. It is explicitly NOT
+    // a private key, AWS credential, MQTT identity, or permanent
+    // authorization token, and carries no cryptographic weight of its
+    // own - see formatNumericCodeForDisplay() in core/random_id.h for
+    // the human-readable "4827 1936 2051" grouping.
+    std::string setupCode;
     bool provisioned = false;
 };
 
@@ -19,11 +29,18 @@ struct DeviceIdentity {
 // docs/communication-protocol.md > Device Identity.
 bool isValidDeviceId(const std::string& deviceId);
 
-// Loads a stable device_id from persistent storage, generating and
-// persisting a new one only on first use (i.e. manufacturing/provisioning
-// time - this is NOT a real manufacturing provisioning station, just the
-// firmware-side "load or generate" logic). Never regenerates an
-// already-stored id: device_id must stay stable across normal reboots.
+// Validates the setup_code format: exactly 12 decimal digits.
+bool isValidSetupCode(const std::string& setupCode);
+
+// Loads a stable device_id and setup_code from persistent storage,
+// generating and persisting them only on first use (i.e. manufacturing/
+// onboarding time - this is NOT a real manufacturing provisioning
+// station, just the firmware-side "load or generate" logic). Neither
+// value is ever regenerated once stored: both must stay stable across
+// normal reboots, and setup_code must stay stable across re-provisioning
+// (only a factory reset's manufacturing-identity boundary could change
+// it, and factory reset explicitly preserves it - see
+// factory_reset_coordinator.h).
 class DeviceIdentityProvider {
 public:
     DeviceIdentityProvider(IPersistentStore& store, IRandomSource& random,
