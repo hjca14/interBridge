@@ -21,8 +21,10 @@ void test_dev_contract_topics_and_client_id() {
     TEST_ASSERT_EQUAL_STRING("$aws/rules/interbridge_dev_ingest_rule/interbridge/ib-dev-test-placeholder/health", topics.healthIngest().c_str());
     TEST_ASSERT_EQUAL_STRING("$aws/rules/interbridge_dev_response_rule/interbridge/ib-dev-test-placeholder/responses", topics.responsesIngest().c_str());
     TEST_ASSERT_FALSE(topics.commands() == "interbridge/another-device/commands");
-    TEST_ASSERT_EQUAL(1, kDevSmokePublishQos);
-    TEST_ASSERT_EQUAL(1, kDevSmokeSubscribeQos);
+    TEST_ASSERT_EQUAL(1, kDevSmokeCommandSubscribeQos);
+    TEST_ASSERT_EQUAL(0, kDevSmokeHealthPublishQos);
+    TEST_ASSERT_EQUAL(1, kDevSmokeEventPublishQos);
+    TEST_ASSERT_EQUAL(1, kDevSmokeResponsePublishQos);
     TEST_ASSERT_FALSE(kDevSmokeRetain);
 }
 

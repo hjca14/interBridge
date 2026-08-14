@@ -4,8 +4,10 @@
 #include "../protocol/messages.h"
 
 namespace interbridge {
-constexpr int kDevSmokePublishQos = 1;
-constexpr int kDevSmokeSubscribeQos = 1;
+constexpr int kDevSmokeCommandSubscribeQos = 1;
+constexpr int kDevSmokeHealthPublishQos = 0;
+constexpr int kDevSmokeEventPublishQos = 1;
+constexpr int kDevSmokeResponsePublishQos = 1;
 constexpr bool kDevSmokeRetain = false;
 // Deliberately has no hardware, provisioning, reset, or system-control
 // dependency, so this path cannot actuate physical behavior.

@@ -994,3 +994,12 @@ stubs. The smoke path's ignored local certificate/private key injection is only
 for controlled bench validation and does not supersede production on-device key
 creation + CSR. Backend Phase 1E Basic Ingest persistence, real AWS validation,
 and ESP32 flashing remain pending.
+
+Firmware CI now runs on pull requests and pushes to `main`, using Python 3.12
+and PlatformIO 6.1.18. It performs a tracked-file credential scan, native tests,
+the ordinary ESP32-C3 build, and a compile-only DEV smoke build. CI copies the
+placeholder-only example to the ignored local secret-header path; it never
+executes firmware, connects to Wi-Fi/AWS, uses GitHub secrets, or flashes
+hardware. The corrected smoke contract is command subscribe QoS 1, health
+publish QoS 0, event publish QoS 1, response publish QoS 1, and `retain=false`
+for every publication. Hardware and AWS runtime validation remain pending.

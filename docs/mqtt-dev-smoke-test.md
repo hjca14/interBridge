@@ -23,14 +23,16 @@ DEV uses only these explicit rule names:
 - `interbridge_dev_response_rule`
 
 For local `device_id`, the harness subscribes only to
-`interbridge/{device_id}/commands` at QoS 1. It publishes non-retained health (and any optional safe diagnostic event) to `$aws/rules/interbridge_dev_ingest_rule/interbridge/{device_id}/...`
+`interbridge/{device_id}/commands` at QoS 1. It publishes non-retained health at
+QoS 0 (and any optional safe diagnostic event at QoS 1) to
+`$aws/rules/interbridge_dev_ingest_rule/interbridge/{device_id}/...`
 and non-retained responses to
-`$aws/rules/interbridge_dev_response_rule/interbridge/{device_id}/responses`,
-at QoS 1. ClientId is exactly `device_id`. No mirror or diagnostic topic exists.
+`$aws/rules/interbridge_dev_response_rule/interbridge/{device_id}/responses`.
+Command responses use QoS 1. ClientId is exactly `device_id`. No mirror or diagnostic topic exists.
 The harness does not access Shadow or Jobs.
 
 The maintained `256dpi/MQTT` client is used because it integrates with
-`WiFiClientSecure`, supports MQTT 3.1.1, QoS 0/1 publish and QoS 1 subscribe,
+`WiFiClientSecure`, supports MQTT 3.1.1, QoS 0 and QoS 1 publication and QoS 1 subscribe,
 retained-message selection, clean sessions, and configurable keepalive/buffer.
 The harness uses a buffer above the protocol's 8 KiB ceiling, keepalive 300,
 clean session, no Last Will, and `retain=false` for every publish.
@@ -58,3 +60,13 @@ at preprocessing with a clear error. The default `esp32-c3` environment neither
 includes nor requires it. Never reuse this manual injection path for production:
 production remains on-device key generation, CSR, Fleet Provisioning by Trusted
 User, and a permanent private key that never leaves the device.
+
+## Continuous integration
+
+GitHub Actions runs repository credential safety checks, all native tests, the
+ordinary `esp32-c3` build, and a compile-only `esp32-c3-dev-mqtt` build using
+PlatformIO 6.1.18 on Python 3.12. CI copies the committed example header to the
+ignored local-header path immediately before the smoke build. Those values stay
+obvious placeholders: firmware is compiled but never executed, no Wi-Fi or AWS
+connection is attempted, no hardware is flashed, and no GitHub secrets are
+used. Real AWS IoT and ESP32 runtime validation remains a manual pending step.

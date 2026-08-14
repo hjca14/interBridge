@@ -42,13 +42,16 @@ void safeStatus(const char* operation, bool ok) {
 void onMessage(String& topic, String& payload) {
     if (topic != topics.commands().c_str()) return;
     const CommandResponse response = handler.handle(std::string(payload.c_str(), payload.length()));
-    safeStatus("response publish", mqtt.publish(topics.responsesIngest().c_str(), response.toJson().c_str(), kDevSmokeRetain, kDevSmokePublishQos));
+    safeStatus("response publish", mqtt.publish(topics.responsesIngest().c_str(), response.toJson().c_str(),
+                                                kDevSmokeRetain, kDevSmokeResponsePublishQos));
 }
 
 void onConnected() {
-    safeStatus("command QoS1 subscription", mqtt.subscribe(topics.commands().c_str(), kDevSmokeSubscribeQos));
+    safeStatus("command QoS1 subscription",
+               mqtt.subscribe(topics.commands().c_str(), kDevSmokeCommandSubscribeQos));
     HealthReport health{INTERBRIDGE_DEV_DEVICE_ID, "dev-mqtt-smoke", "IDLE", millis(), WiFi.RSSI(), ESP.getFreeHeap()};
-    safeStatus("health QoS1 publish", mqtt.publish(topics.healthIngest().c_str(), health.toJson().c_str(), kDevSmokeRetain, kDevSmokePublishQos));
+    safeStatus("health QoS0 publish", mqtt.publish(topics.healthIngest().c_str(), health.toJson().c_str(),
+                                                   kDevSmokeRetain, kDevSmokeHealthPublishQos));
 }
 
 void connectMqtt() {
