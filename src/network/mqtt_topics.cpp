@@ -2,6 +2,14 @@
 
 namespace interbridge {
 
+MqttTopicsConfig devMqttTopicsConfig(const std::string& deviceId) {
+    MqttTopicsConfig config;
+    config.deviceId = deviceId;
+    config.ingestRuleName = kDevIngestRuleName;
+    config.responseRuleName = kDevResponseRuleName;
+    return config;
+}
+
 MqttTopics::MqttTopics(MqttTopicsConfig config) : config_(std::move(config)) {}
 
 std::string MqttTopics::clientId(const std::string& deviceId) {

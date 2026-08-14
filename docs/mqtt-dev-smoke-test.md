@@ -1,0 +1,72 @@
+# DEV MQTT/mTLS smoke test
+
+## Scope and safety
+
+`esp32-c3-dev-mqtt` is a separate, guarded bench firmware for DEV AWS IoT
+Core validation. It is **not production provisioning**. It connects Wi-Fi,
+synchronizes UTC with NTP, opens MQTT 3.1.1/mTLS on port 8883, and reconnects
+with capped exponential delay. It never constructs `CommandHandler`, GPIO,
+system reset, BLE, Fleet Provisioning, Shadow, or Jobs objects. Every parsed
+command is rejected; no physical action is possible through this entry point.
+
+Production `Esp32AwsIotTransport`, BLE provisioning, NVS credential persistence,
+on-device private-key/CSR generation and Fleet Provisioning transports remain
+stubs. Basic Ingest rules arrive in backend Phase 1E, so successful QoS
+acknowledgment does not imply persistence. Real AWS and ESP32 validation is
+pending access to the PC and hardware.
+
+## Backend contract
+
+DEV uses only these explicit rule names:
+
+- `interbridge_dev_ingest_rule`
+- `interbridge_dev_response_rule`
+
+For local `device_id`, the harness subscribes only to
+`interbridge/{device_id}/commands` at QoS 1. It publishes non-retained health at
+QoS 0 (and any optional safe diagnostic event at QoS 1) to
+`$aws/rules/interbridge_dev_ingest_rule/interbridge/{device_id}/...`
+and non-retained responses to
+`$aws/rules/interbridge_dev_response_rule/interbridge/{device_id}/responses`.
+Command responses use QoS 1. ClientId is exactly `device_id`. No mirror or diagnostic topic exists.
+The harness does not access Shadow or Jobs.
+
+The maintained `256dpi/MQTT` client is used because it integrates with
+`WiFiClientSecure`, supports MQTT 3.1.1, QoS 0 and QoS 1 publication and QoS 1 subscribe,
+retained-message selection, clean sessions, and configurable keepalive/buffer.
+The harness uses a buffer above the protocol's 8 KiB ceiling, keepalive 300,
+clean session, no Last Will, and `retain=false` for every publish.
+
+## Local credentials and build
+
+1. Copy `include/interbridge_dev_secrets.example.h` to
+   `include/interbridge_dev_secrets.h`.
+2. Replace every placeholder locally with the Wi-Fi SSID/password, AWS IoT ATS
+   endpoint, unique DEV `device_id`, Amazon Root CA, unique DEV device
+   certificate, and unique DEV private key.
+3. Run `pio run -e esp32-c3-dev-mqtt` and flash that environment explicitly.
+4. Attach the serial monitor. Logs contain operation status and credential
+   presence only, never secret values or command payloads.
+5. Send a protocol-v1 command on that exact device's commands topic and verify a
+   protocol-v1 `REJECTED` response. Before NTP is trustworthy it returns
+   `CLOCK_NOT_TRUSTWORTHY`; malformed, oversized, version, and timestamp errors
+   use their canonical errors; an otherwise valid command returns
+   `COMMAND_NOT_ALLOWED`.
+6. Interrupt Wi-Fi/broker connectivity and confirm capped reconnect behavior and
+   resubscription/health publish after connection returns.
+
+The local header is ignored by Git. Selecting this environment without it fails
+at preprocessing with a clear error. The default `esp32-c3` environment neither
+includes nor requires it. Never reuse this manual injection path for production:
+production remains on-device key generation, CSR, Fleet Provisioning by Trusted
+User, and a permanent private key that never leaves the device.
+
+## Continuous integration
+
+GitHub Actions runs repository credential safety checks, all native tests, the
+ordinary `esp32-c3` build, and a compile-only `esp32-c3-dev-mqtt` build using
+PlatformIO 6.1.18 on Python 3.12. CI copies the committed example header to the
+ignored local-header path immediately before the smoke build. Those values stay
+obvious placeholders: firmware is compiled but never executed, no Wi-Fi or AWS
+connection is attempted, no hardware is flashed, and no GitHub secrets are
+used. Real AWS IoT and ESP32 runtime validation remains a manual pending step.

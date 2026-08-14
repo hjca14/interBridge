@@ -977,3 +977,29 @@ order) NTP (unblocks all remote commands), a real MQTT/TLS client
 (unblocks everything network-facing), and the ESP-IDF Unified
 Provisioning integration (unblocks the entire onboarding flow this pass
 just designed).
+
+## Phase 1D.1 — controlled DEV MQTT smoke path (2026-08-14)
+
+A separate `esp32-c3-dev-mqtt` environment and guarded
+`src/dev/mqtt_smoke_main.cpp` now implement a manual DEV-only Wi-Fi + AWS IoT
+MQTT/mTLS smoke path using `256dpi/MQTT` and `WiFiClientSecure`. DEV rule names
+are explicit (`interbridge_dev_ingest_rule` and
+`interbridge_dev_response_rule`); shared topic configuration has no provisional
+rule defaults. The pure `DevMqttSmokeHandler` parses protocol v1 and always
+fails closed without any physical/system/provisioning dependencies.
+
+This does not change the production composition root: `Esp32AwsIotTransport`,
+BLE, NVS, Fleet Provisioning platform pieces, and production time sync remain
+stubs. The smoke path's ignored local certificate/private key injection is only
+for controlled bench validation and does not supersede production on-device key
+creation + CSR. Backend Phase 1E Basic Ingest persistence, real AWS validation,
+and ESP32 flashing remain pending.
+
+Firmware CI now runs on pull requests and pushes to `main`, using Python 3.12
+and PlatformIO 6.1.18. It performs a tracked-file credential scan, native tests,
+the ordinary ESP32-C3 build, and a compile-only DEV smoke build. CI copies the
+placeholder-only example to the ignored local secret-header path; it never
+executes firmware, connects to Wi-Fi/AWS, uses GitHub secrets, or flashes
+hardware. The corrected smoke contract is command subscribe QoS 1, health
+publish QoS 0, event publish QoS 1, response publish QoS 1, and `retain=false`
+for every publication. Hardware and AWS runtime validation remain pending.
