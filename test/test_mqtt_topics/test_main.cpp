@@ -31,6 +31,12 @@ void test_basic_ingest_topics_use_configured_rule_names() {
                               topics.responsesIngest().c_str());
 }
 
+void test_dev_rule_names_match_backend_contract() {
+    auto config = devMqttTopicsConfig("ib-abc123");
+    TEST_ASSERT_EQUAL_STRING("interbridge_dev_ingest_rule", config.ingestRuleName.c_str());
+    TEST_ASSERT_EQUAL_STRING("interbridge_dev_response_rule", config.responseRuleName.c_str());
+}
+
 void test_shadow_topics_use_shadow_name() {
     MqttTopicsConfig config;
     config.deviceId = "ib-abc123";
@@ -95,6 +101,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_client_id_equals_device_id);
     RUN_TEST(test_commands_topic);
     RUN_TEST(test_basic_ingest_topics_use_configured_rule_names);
+    RUN_TEST(test_dev_rule_names_match_backend_contract);
     RUN_TEST(test_shadow_topics_use_shadow_name);
     RUN_TEST(test_jobs_topics);
     RUN_TEST(test_fleet_provisioning_topics);

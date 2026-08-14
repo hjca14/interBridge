@@ -190,8 +190,8 @@ void initializeIdentity() {
 
     MqttTopicsConfig topicsConfig;
     topicsConfig.deviceId = deviceIdentity.deviceId;
-    // ingestRuleName/responseRuleName default to development placeholders,
-    // fleetProvisioningTemplateName defaults to empty - see CONTEXT.md.
+    // Production rule names remain intentionally unconfigured. The separate
+    // DEV smoke entry point supplies its backend-matched names explicitly.
     mqttTopics.emplace(topicsConfig);
 
     commandHandler.emplace(deviceIdentity.deviceId, clock, dedupCache, intercom, systemControl);

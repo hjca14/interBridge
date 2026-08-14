@@ -377,3 +377,12 @@ plus new ones from this pass:)*
   itself** (`CloudConnecting` is a hand-off, not a blocking wait) to
   avoid duplicating `main.cpp`'s existing `ReconnectManager`-based
   connect/backoff loop - see the Provisioning lifecycle section above.
+
+## DEV MQTT smoke isolation
+
+`src/dev/mqtt_smoke_main.cpp` is compiled only by `esp32-c3-dev-mqtt`; the normal
+firmware excludes it. Its dependency boundary ends at Wi-Fi/TLS/MQTT, the shared
+`MqttTopics` builder, protocol serialization/parser, and a non-actuating
+`DevMqttSmokeHandler`. It intentionally cannot reach intercom GPIO, restart,
+factory reset, BLE/Fleet Provisioning, Shadow, or Jobs. Manual ignored DEV
+credentials are an integration-test exception, not production architecture.

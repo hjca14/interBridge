@@ -111,3 +111,12 @@ still needs manual validation on real hardware — see
 - **[`docs/communication-protocol.md`](docs/communication-protocol.md)** —
   the authoritative device/cloud protocol specification (topics, message
   shapes, command lifecycle, error codes, provisioning, OTA).
+
+## Controlled DEV MQTT smoke firmware
+
+A separate `esp32-c3-dev-mqtt` PlatformIO environment now provides a guarded,
+non-actuating MQTT/mTLS bench harness. It does not replace production transport
+or provisioning. See [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)
+for scope, local placeholder configuration, safety constraints, and PC/ESP32
+steps. The ordinary `esp32-c3` entry point remains `src/main.cpp` and requires no
+DEV secrets header.

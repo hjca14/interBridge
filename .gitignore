@@ -9,3 +9,6 @@
 *.obj
 *.exe
 *.pdb
+
+# Local-only credentials for the guarded DEV MQTT smoke firmware.
+include/interbridge_dev_secrets.h

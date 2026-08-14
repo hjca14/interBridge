@@ -4,17 +4,20 @@
 
 namespace interbridge {
 
-// AWS IoT infrastructure names that are not yet decided (rule names,
-// Fleet Provisioning template). Placeholders here are development
-// defaults only - see CONTEXT.md > Open Questions before using this
-// against a real AWS account.
+constexpr const char* kDevIngestRuleName = "interbridge_dev_ingest_rule";
+constexpr const char* kDevResponseRuleName = "interbridge_dev_response_rule";
+
+// Rule names are explicit environment-owned inputs; there are no
+// provisional or production defaults.
 struct MqttTopicsConfig {
     std::string deviceId;
-    std::string ingestRuleName = "interbridge_ingest";      // placeholder, see CONTEXT.md
-    std::string responseRuleName = "interbridge_responses";  // placeholder, see CONTEXT.md
+    std::string ingestRuleName;
+    std::string responseRuleName;
     std::string shadowName = "interbridge";
     std::string fleetProvisioningTemplateName; // empty: not decided yet, see CONTEXT.md
 };
+
+MqttTopicsConfig devMqttTopicsConfig(const std::string& deviceId);
 
 // Central builder for every MQTT topic InterBridge uses: the normal
 // command-subscription topic, AWS IoT Basic Ingest topics (events,
