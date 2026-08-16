@@ -54,6 +54,30 @@ def main() -> int:
     if len(definitions) != 7 or any(not value.startswith("REPLACE_WITH_") for value in definitions):
         failures.append("DEV secrets example must contain exactly seven obvious REPLACE_WITH_ placeholders")
 
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--quiet", FORBIDDEN_TRACKED_PATH], check=False
+    ).returncode == 0
+    if not ignored:
+        failures.append("local DEV secrets header must be ignored")
+
+    ignore_text = Path(".gitignore").read_text()
+    for extension in ("*.pem", "*.key", "*.crt"):
+        if extension not in ignore_text:
+            failures.append(f"credential extension is not ignored: {extension}")
+
+    generator = Path("scripts/generate_dev_secrets_header.ps1").read_text()
+    required_generator_fragments = (
+        "Read-Host \"Wi-Fi password\" -AsSecureString",
+        "git -C $repoRoot check-ignore",
+        r'''.Replace("`r`n", '\n')''',
+        'private.pem.key',
+        'ZeroFreeBSTR',
+    )
+    if any(fragment not in generator for fragment in required_generator_fragments):
+        failures.append("DEV header generator is missing a required safety/escaping control")
+    if 'R\"' in generator or "@'" in generator or '@"' in generator:
+        failures.append("DEV header generator must not emit multiline raw/here strings")
+
     if failures:
         print("Repository credential safety check failed:", file=sys.stderr)
         for failure in failures:

@@ -380,6 +380,14 @@ plus new ones from this pass:)*
 
 ## DEV MQTT smoke isolation
 
+The smoke entry point delegates connectivity decisions to the native-testable
+`DevMqttSmokeState`: `WaitingForWifi` → `WaitingForDns` → `WaitingForTime` →
+`WaitingForMqtt` → `Online`. Each external operation is requested only after its
+prerequisites, with rollover-safe capped backoff. Wi-Fi loss invalidates the
+chain so DNS, time gating, MQTT, subscription, and health publication are
+re-established in order. This remains isolated from the still-stubbed production
+transport architecture.
+
 `src/dev/mqtt_smoke_main.cpp` is compiled only by `esp32-c3-dev-mqtt`; the normal
 firmware excludes it. Its dependency boundary ends at Wi-Fi/TLS/MQTT, the shared
 `MqttTopics` builder, protocol serialization/parser, and a non-actuating

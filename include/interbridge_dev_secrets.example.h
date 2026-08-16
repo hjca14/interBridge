@@ -1,7 +1,8 @@
 #pragma once
 
-// Placeholders only. Copy to interbridge_dev_secrets.h and replace every
-// value locally. Never commit that ignored file or share its private key.
+// Placeholders only, used by compile-only CI. For local credentials, use
+// scripts/generate_dev_secrets_header.ps1; never hand-write multiline raw
+// strings in macros and never commit the generated ignored header.
 #define INTERBRIDGE_DEV_WIFI_SSID "REPLACE_WITH_WIFI_SSID"
 #define INTERBRIDGE_DEV_WIFI_PASSWORD "REPLACE_WITH_WIFI_PASSWORD"
 #define INTERBRIDGE_DEV_AWS_ENDPOINT "REPLACE_WITH_AWS_IOT_ENDPOINT"
