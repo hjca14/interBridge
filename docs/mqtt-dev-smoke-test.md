@@ -12,8 +12,9 @@ command is rejected; no physical action is possible through this entry point.
 Production `Esp32AwsIotTransport`, BLE provisioning, NVS credential persistence,
 on-device private-key/CSR generation and Fleet Provisioning transports remain
 stubs. Basic Ingest rules arrive in backend Phase 1E, so successful QoS
-acknowledgment does not imply persistence. Real AWS and ESP32 validation is
-pending access to the PC and hardware.
+acknowledgment does not imply persistence. Phase 1D is complete only for the
+first controlled DEV MQTT/mTLS device. This manual injection path is not a
+production provisioning design.
 
 ## Backend contract
 
@@ -39,11 +40,13 @@ clean session, no Last Will, and `retain=false` for every publish.
 
 ## Local credentials and build
 
-1. Copy `include/interbridge_dev_secrets.example.h` to
-   `include/interbridge_dev_secrets.h`.
-2. Replace every placeholder locally with the Wi-Fi SSID/password, AWS IoT ATS
-   endpoint, unique DEV `device_id`, Amazon Root CA, unique DEV device
-   certificate, and unique DEV private key.
+1. Keep `endpoint.txt`, `AmazonRootCA1.pem`, `device-certificate.pem.crt`,
+   and `private.pem.key` in an explicitly selected directory outside this repo.
+2. Run `scripts/generate_dev_secrets_header.ps1 -CredentialsDirectory
+   <external-folder> -DeviceId ib-<32-lowercase-hex>`. It prompts for SSID and
+   a secure-string password, validates endpoint/Git ignore rules, and emits
+   escaped one-line C++ macros without displaying credential values. Never use
+   a multiline raw string inside a `#define`.
 3. Run `pio run -e esp32-c3-dev-mqtt` and flash that environment explicitly.
 4. Attach the serial monitor. Logs contain operation status and credential
    presence only, never secret values or command payloads.
@@ -52,8 +55,8 @@ clean session, no Last Will, and `retain=false` for every publish.
    `CLOCK_NOT_TRUSTWORTHY`; malformed, oversized, version, and timestamp errors
    use their canonical errors; an otherwise valid command returns
    `COMMAND_NOT_ALLOWED`.
-6. Interrupt Wi-Fi/broker connectivity and confirm capped reconnect behavior and
-   resubscription/health publish after connection returns.
+6. In a future bench session, interrupt and restore the access point while the
+   board remains powered; that specific recovery scenario is not yet validated.
 
 The local header is ignored by Git. Selecting this environment without it fails
 at preprocessing with a clear error. The default `esp32-c3` environment neither
@@ -69,4 +72,19 @@ PlatformIO 6.1.18 on Python 3.12. CI copies the committed example header to the
 ignored local-header path immediately before the smoke build. Those values stay
 obvious placeholders: firmware is compiled but never executed, no Wi-Fi or AWS
 connection is attempted, no hardware is flashed, and no GitHub secrets are
-used. Real AWS IoT and ESP32 runtime validation remains a manual pending step.
+used.
+
+## Real bench result
+
+A generic 4 MB ESP32-C3 Super Mini (PlatformIO 6.1.18, temporary compatible
+`esp32-c3-devkitm-1` definition) validated build/upload, native USB CDC with
+`ARDUINO_USB_MODE=1` and `ARDUINO_USB_CDC_ON_BOOT=1`, 2.4 GHz Wi-Fi, MQTT/mTLS
+8883 with a unique device certificate, the existing ClientId/topics/QoS/retain
+contract, safe `OPEN_DOOR` rejection and response, cold-boot reconnection, and
+recovery from transient DNS failures. DHCP-provided DNS remains authoritative.
+
+Not validated: access-point loss/return while powered, real BLE onboarding,
+NVS, Fleet Provisioning, Secure Boot, Flash Encryption, intercom hardware,
+Phase 1E Basic Ingest persistence, or the final custom PCB. A bounded serial
+wait preserves headless operation; a credential-free 15-second heartbeat helps
+late-attached monitors without logging SSID, endpoint, identity, PEM, or payload.

@@ -22,7 +22,9 @@ around:
   reset) — see `src/hardware/button.h`. The button's GPIO is not
   assigned yet.
 
-Several hardware, cloud, and protocol decisions have not been made yet,
+The isolated DEV smoke firmware has now been validated on a real generic
+ESP32-C3 Super Mini against AWS IoT Core. Several production hardware, cloud,
+and protocol decisions have not been made yet,
 and several of the pieces above are real, tested coordinators sitting
 behind interfaces whose ESP32/AWS-side implementation is still a
 documented stub (no MQTT/TLS client, no NTP, no real NVS, no signing
@@ -34,9 +36,9 @@ the full device/cloud protocol specification.
 ## Target hardware
 
 - **MCU:** ESP32-C3 (RISC-V, single core).
-- **Dev board:** not finalized. `platformio.ini` currently targets
-  `esp32-c3-devkitm-1` as a generic placeholder — update it once the real
-  board/module is chosen.
+- **Validated bench board:** generic 4 MB ESP32-C3 Super Mini using the
+  compatible `esp32-c3-devkitm-1` definition and native USB CDC. This does not
+  determine the module or behavior of the eventual custom PCB.
 - **Intercom interface circuit, audio hardware, door-release circuit:**
   not defined yet. The firmware isolates these behind interfaces (see
   `src/hardware/gpio.h`, `src/audio/audio.h`) so they can be implemented
@@ -120,3 +122,10 @@ or provisioning. See [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)
 for scope, local placeholder configuration, safety constraints, and PC/ESP32
 steps. The ordinary `esp32-c3` entry point remains `src/main.cpp` and requires no
 DEV secrets header.
+
+The first controlled device test validated build/upload, USB CDC, 2.4 GHz
+Wi-Fi, MQTT/mTLS on port 8883 with an individual X.509 certificate, QoS 1
+command subscription, QoS 0 health, safe `OPEN_DOOR` rejection and response,
+and cold-boot reconnection. Transient DNS failures recovered through retry.
+Access-point loss and return while the board stays powered has **not** yet been
+validated.

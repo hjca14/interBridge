@@ -12,13 +12,15 @@
 #include <time.h>
 #include "interbridge_dev_secrets.h"
 #include "mqtt_smoke_handler.h"
+#include "mqtt_smoke_state.h"
 #include "../network/mqtt_topics.h"
 
 namespace {
 using namespace interbridge;
 constexpr uint16_t kMqttPort = 8883;
 constexpr size_t kMqttBufferBytes = kMaxJsonPayloadBytes + 1024;
-constexpr uint32_t kReconnectMaxMs = 300000;
+constexpr uint32_t kSerialWaitMs = 1500;
+constexpr uint32_t kHeartbeatMs = 15000;
 
 class NtpClock final : public IClock {
 public:
@@ -32,8 +34,9 @@ MQTTClient mqtt(kMqttBufferBytes);
 NtpClock clockSource;
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 DevMqttSmokeHandler handler(INTERBRIDGE_DEV_DEVICE_ID, clockSource);
-uint32_t retryAt = 0;
-uint32_t retryDelay = 1000;
+DevMqttSmokeState connectivity;
+uint32_t heartbeatAt = 0;
+bool mqttConfigured = false;
 
 void safeStatus(const char* operation, bool ok) {
     Serial.printf("[DEV MQTT] %s: %s\n", operation, ok ? "ok" : "failed");
@@ -54,36 +57,77 @@ void onConnected() {
                                                    kDevSmokeRetain, kDevSmokeHealthPublishQos));
 }
 
-void connectMqtt() {
-    if (mqtt.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID).c_str())) {
-        retryDelay = 1000;
-        onConnected();
-    } else {
-        retryAt = millis() + retryDelay;
-        retryDelay = min(retryDelay * 2, kReconnectMaxMs);
-        safeStatus("MQTT connect", false);
+const char* stateName(DevSmokeState state) {
+    switch (state) {
+        case DevSmokeState::WaitingForWifi: return "wifi";
+        case DevSmokeState::WaitingForDns: return "dns";
+        case DevSmokeState::WaitingForTime: return "time";
+        case DevSmokeState::WaitingForMqtt: return "mqtt";
+        case DevSmokeState::Online: return "online";
     }
+    return "unknown";
+}
+
+void heartbeat(uint32_t now) {
+    if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
+    heartbeatAt = now + kHeartbeatMs;
+    Serial.printf("[DEV MQTT] status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu\n", stateName(connectivity.state()),
+                  WiFi.status() == WL_CONNECTED ? "up" : "down", clockSource.hasValidTime() ? "valid" : "pending",
+                  mqtt.connected() ? "up" : "down", static_cast<unsigned long>(now / 1000));
 }
 } // namespace
 
 void setup() {
     Serial.begin(115200);
+    const uint32_t serialDeadline = millis() + kSerialWaitMs;
+    while (!Serial && !DevMqttSmokeState::deadlineReached(millis(), serialDeadline)) delay(10);
     Serial.println("[DEV MQTT] controlled smoke harness; physical actions disabled");
     Serial.println("[DEV MQTT] local Wi-Fi/TLS credentials configured (values not logged)");
-    WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
-    while (WiFi.status() != WL_CONNECTED) delay(250);
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
     tls.setCACert(INTERBRIDGE_DEV_ROOT_CA_PEM);
     tls.setCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     tls.setPrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
-    mqtt.begin(INTERBRIDGE_DEV_AWS_ENDPOINT, kMqttPort, tls);
-    mqtt.setOptions(300, true, 1000); // keepalive, clean session, timeout
     mqtt.onMessage(onMessage);
-    connectMqtt();
 }
 
 void loop() {
-    mqtt.loop();
-    if (!mqtt.connected() && static_cast<int32_t>(millis() - retryAt) >= 0) connectMqtt();
+    const uint32_t now = millis();
+    const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    if (!wifiConnected && mqtt.connected()) mqtt.disconnect();
+
+    switch (connectivity.update(now, wifiConnected, clockSource.hasValidTime(), mqtt.connected())) {
+        case DevSmokeAction::ConnectWifi:
+            WiFi.mode(WIFI_STA);
+            WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
+            Serial.println("[DEV MQTT] Wi-Fi connect requested");
+            break;
+        case DevSmokeAction::ResolveDns: {
+            IPAddress resolved;
+            const IPAddress dns = WiFi.dnsIP();
+            const bool networkReady = dns != IPAddress() && WiFi.localIP() != IPAddress();
+            const bool resolvedOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
+            connectivity.dnsResult(now, resolvedOk);
+            Serial.printf("[DEV MQTT] DNS: %s\n", resolvedOk ? "ready" : "pending");
+            break;
+        }
+        case DevSmokeAction::ConfigureTime:
+            configTime(0, 0, "pool.ntp.org", "time.google.com");
+            Serial.println("[DEV MQTT] time sync requested");
+            break;
+        case DevSmokeAction::ConnectMqtt: {
+            if (!mqttConfigured) {
+                mqtt.begin(INTERBRIDGE_DEV_AWS_ENDPOINT, kMqttPort, tls);
+                mqtt.setOptions(300, true, 1000); // keepalive, clean session, timeout
+                mqttConfigured = true;
+            }
+            const bool connected = mqtt.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID).c_str());
+            connectivity.mqttResult(now, connected);
+            safeStatus("MQTT connect", connected);
+            if (connected) onConnected();
+            break;
+        }
+        case DevSmokeAction::None: break;
+    }
+    if (mqtt.connected()) mqtt.loop();
+    heartbeat(now);
     delay(10);
 }

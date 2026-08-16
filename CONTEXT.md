@@ -51,8 +51,10 @@ happened:
 All built against interfaces, with real logic where it doesn't require
 unavailable hardware/AWS/crypto, and clearly-labeled stubs where it does.
 
-**Nothing in this codebase can complete a real AWS IoT connection, a real
-BLE provisioning session, or a real signed OTA update yet.** See
+**The isolated, manually provisioned DEV smoke entry point can complete an AWS
+IoT MQTT/mTLS connection and has been validated on a bench device. The
+production composition root still cannot complete a real AWS IoT connection,
+BLE provisioning session, or signed OTA update.** See
 Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
@@ -1003,3 +1005,31 @@ executes firmware, connects to Wi-Fi/AWS, uses GitHub secrets, or flashes
 hardware. The corrected smoke contract is command subscribe QoS 1, health
 publish QoS 0, event publish QoS 1, response publish QoS 1, and `retain=false`
 for every publication. Hardware and AWS runtime validation remain pending.
+
+## Phase 1D.2 — real ESP32-C3 DEV validation and recovery hardening (2026-08-16)
+
+Phase 1D is complete in the narrow scope of the first controlled DEV MQTT/mTLS
+device. A generic 4 MB ESP32-C3 Super Mini, temporarily built as
+`esp32-c3-devkitm-1`, validated build, USB upload, native USB CDC, 2.4 GHz
+Wi-Fi, MQTT/mTLS port 8883 with an individual X.509 certificate, ClientId from
+`device_id`, QoS 1 command subscription, QoS 0 initial health, safe receipt and
+rejection of `OPEN_DOOR` without physical action, response publication, and a
+power-off/cold-boot reconnection followed by another command/response. Repeated
+transient DHCP/DNS readiness failures recovered through retry; no endpoint IP or
+public DNS resolver is hardcoded.
+
+The smoke harness now uses a small hardware-independent five-state coordinator
+(`WaitingForWifi`, `WaitingForDns`, `WaitingForTime`, `WaitingForMqtt`,
+`Online`). It performs bounded, rollover-safe retry; gates DNS on DHCP network
+configuration, gates TLS/MQTT on `NtpClock::hasValidTime()`, and repeats
+subscription plus health publication after MQTT reconnect. Serial startup waits
+only briefly for USB enumeration, remains headless, and emits a compact
+credential-free heartbeat every 15 seconds. Both ESP32 environments define
+`ARDUINO_USB_MODE=1` and `ARDUINO_USB_CDC_ON_BOOT=1` for the validated native
+USB path.
+
+Still explicitly unvalidated: access-point loss and return while the board
+remains powered, real BLE onboarding, NVS, Fleet Provisioning, Secure Boot,
+Flash Encryption, intercom hardware, Phase 1E Basic Ingest persistence, and the
+final custom PCB. The manually injected ignored DEV header remains bench-only
+and does not supersede production key generation and provisioning.
