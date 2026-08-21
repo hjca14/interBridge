@@ -74,7 +74,8 @@ private:
 
 // In-memory fake used for native tests and local development without a
 // real broker. Records every publish() call, tracks subscriptions, and
-// lets tests simulate an incoming message via deliver(). Use
+// lets tests simulate an incoming message via deliver(). Disconnect clears
+// subscriptions so reconnect logic must subscribe again. Use
 // armConnectFailure() to make the next N connect() calls fail, for
 // deterministic reconnect-logic tests.
 class FakeDeviceTransport : public IDeviceTransport {
@@ -95,13 +96,19 @@ public:
     void poll() override;
 
     void armConnectFailure(int timesToFail);
+    void armPublishFailure(int timesToFail);
+    void armPublishFailureOnCall(int callNumber);
     const std::vector<PublishedMessage>& publishedMessages() const;
+    size_t subscriptionCount() const;
     const std::string& lastClientId() const;
     void deliver(const std::string& topic, const std::string& payload);
 
 private:
     bool connected_;
     int connectFailuresRemaining_;
+    int publishFailuresRemaining_;
+    int publishCallCount_;
+    int failPublishCall_;
     std::string clientId_;
     std::vector<PublishedMessage> published_;
     std::vector<std::pair<std::string, MqttMessageCallback>> subscriptions_;

@@ -53,8 +53,8 @@ enum class ProtocolIntercomState { Idle, Ringing, OffHook, InCall, Error };
 const char* toString(ProtocolIntercomState state);
 
 // ---- Commands ----
-// Protocol v1 remotely supports only OpenDoor and Restart (see
-// docs/communication-protocol.md > Remote Commands).
+// Internal vocabulary retained for compatibility. The Phase 2D remote
+// allowlist in CommandHandler contains only OpenDoor.
 // EnterProvisioning/FactoryReset are recognized so a well-formed request
 // gets a clear COMMAND_NOT_ALLOWED response instead of UNKNOWN_COMMAND,
 // but are never executed remotely. AnswerCall/RejectCall/EndCall are
@@ -104,6 +104,7 @@ enum class ProtocolErrorCode {
     NotProvisioned,                  // backend: reserved, not produced by firmware
     WifiUnavailable,                  // backend: reserved, not produced by firmware
     CloudUnavailable,                  // backend/application: reserved, not produced by firmware
+    CapabilityDisabled,                // device: OPEN_DOOR capability is disabled
     DoorOutputFailure,                  // device: hardware reported door actuation failure
     OtaDownloadFailed,                   // device: OTA download step failed
     OtaValidationFailed,                  // device: OTA hash/signature validation failed
@@ -163,6 +164,7 @@ struct DeviceCommand {
     CommandType type;
     std::string rawCommand; // original "command" string as received
     std::string commandId;  // 32 lowercase hex chars, validated by parseCommand() via isValidCommandId()
+    std::string deviceId;
     std::string rawPayload; // raw JSON text of the "payload" field, "" if absent
 
     // Command time-safety fields (see docs > Command Time Safety).
@@ -190,10 +192,10 @@ struct CommandParseResult {
     DeviceCommand command; // only meaningful if status == Ok
 };
 
-// Parses+structurally validates a raw MQTT command payload: JSON
-// validity, size limit, protocol_version, and presence of command/
-// command_id. Does NOT validate command semantics (unknown command,
-// expiry, allowed-in-current-state) - see command_handler.*.
+// The expectedDeviceId overload is the strict remote parser. It additionally
+// requires the exact device_id and an empty parameters object and rejects
+// physical-control fields. Time and allowlist validation live in the handler.
+CommandParseResult parseCommand(const std::string& json, const std::string& expectedDeviceId);
 CommandParseResult parseCommand(const std::string& json);
 
 } // namespace interbridge

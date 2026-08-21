@@ -128,6 +128,7 @@ void test_all_protocol_error_codes_have_stable_strings() {
     TEST_ASSERT_EQUAL_STRING("NOT_PROVISIONED", toString(ProtocolErrorCode::NotProvisioned));
     TEST_ASSERT_EQUAL_STRING("WIFI_UNAVAILABLE", toString(ProtocolErrorCode::WifiUnavailable));
     TEST_ASSERT_EQUAL_STRING("CLOUD_UNAVAILABLE", toString(ProtocolErrorCode::CloudUnavailable));
+    TEST_ASSERT_EQUAL_STRING("CAPABILITY_DISABLED", toString(ProtocolErrorCode::CapabilityDisabled));
     TEST_ASSERT_EQUAL_STRING("DOOR_OUTPUT_FAILURE", toString(ProtocolErrorCode::DoorOutputFailure));
     TEST_ASSERT_EQUAL_STRING("OTA_DOWNLOAD_FAILED", toString(ProtocolErrorCode::OtaDownloadFailed));
     TEST_ASSERT_EQUAL_STRING("OTA_VALIDATION_FAILED", toString(ProtocolErrorCode::OtaValidationFailed));
@@ -147,6 +148,7 @@ void test_all_protocol_error_codes_have_a_default_message() {
         ProtocolErrorCode::ClockNotTrustworthy,    ProtocolErrorCode::InvalidTimestamp,
         ProtocolErrorCode::DeviceBusy,              ProtocolErrorCode::NotProvisioned,
         ProtocolErrorCode::WifiUnavailable,          ProtocolErrorCode::CloudUnavailable,
+        ProtocolErrorCode::CapabilityDisabled,
         ProtocolErrorCode::DoorOutputFailure,         ProtocolErrorCode::OtaDownloadFailed,
         ProtocolErrorCode::OtaValidationFailed,        ProtocolErrorCode::OtaInstallFailed,
         ProtocolErrorCode::ProvisioningFailed,          ProtocolErrorCode::InternalError,

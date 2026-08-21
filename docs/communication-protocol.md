@@ -848,11 +848,12 @@ Base command:
 ```json
 {
   "protocol_version": 1,
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
   "command_id": "0123456789abcdef0123456789abcdef",
   "command": "OPEN_DOOR",
+  "parameters": {},
   "issued_at": 1786467600,
-  "expires_at": 1786467610,
-  "payload": {}
+  "expires_at": 1786467630
 }
 ```
 
@@ -864,26 +865,26 @@ whose `issued_at`/`expires_at` are sent as strings is treated by the
 firmware as if those fields were absent, which fails time-safety
 validation (`INVALID_TIMESTAMP`) rather than being parsed.
 
-Initial commands:
+Phase 2D remote allowlist:
 
 ```text
 OPEN_DOOR
-RESTART
 ```
 
-`ENTER_PROVISIONING` and `FACTORY_RESET` require physical button confirmation and
-are not remotely executable commands in protocol v1.
+`RESTART`, `ENTER_PROVISIONING`, `FACTORY_RESET`, call commands, and unknown
+commands are not remotely executable. `parameters` must be present and exactly an
+empty object. DTMF, key, GPIO, mode, relay, and pulse-duration fields are rejected.
 
 All remote commands include `issued_at` and `expires_at`. The device must reject a
 command when its clock is not valid, the command is expired, the validity interval
 exceeds the allowed maximum, either timestamp is missing/malformed, or its
-identifier has already been processed.
+identifier has already been processed. The device accepts `issued_at` at most 5
+seconds in the future.
 
 Initial maximum validity:
 
 ```text
-OPEN_DOOR  10 seconds
-RESTART    60 seconds
+OPEN_DOOR  30 seconds
 ```
 
 The firmware must establish trustworthy wall-clock time before accepting remote
@@ -926,11 +927,11 @@ Example:
   "device_id": "ib-0123456789abcdef0123456789abcdef",
   "command_id": "0123456789abcdef0123456789abcdef",
   "command": "OPEN_DOOR",
-  "status": "COMPLETED"
+  "status": "ACCEPTED"
 }
 ```
 
-Failure:
+Phase 2D terminal response:
 
 ```json
 {
@@ -938,10 +939,10 @@ Failure:
   "device_id": "ib-0123456789abcdef0123456789abcdef",
   "command_id": "0123456789abcdef0123456789abcdef",
   "command": "OPEN_DOOR",
-  "status": "FAILED",
+  "status": "REJECTED",
   "error": {
-    "code": "DOOR_OUTPUT_FAILURE",
-    "message": "Door output could not be activated"
+    "code": "CAPABILITY_DISABLED",
+    "message": "Door opening capability is disabled"
   }
 }
 ```
@@ -971,6 +972,9 @@ in-memory implementation behind the same abstraction.
 
 - Publish `ACCEPTED` only after validation and before beginning an asynchronous action.
 - Publish one terminal result: `COMPLETED`, `FAILED`, or `REJECTED`.
+- In Phase 2D, `ACCEPTED` means accepted only for processing. With the default
+  `DISABLED` capability, `OPEN_DOOR` is followed by
+  `REJECTED/CAPABILITY_DISABLED`; it never produces physical success.
 - `OPEN_DOOR` should normally emit its terminal result within 5 seconds.
 - `RESTART` may publish `ACCEPTED` before reboot; the subsequent successful cloud
   reconnect is the authoritative completion signal.
@@ -1007,6 +1011,7 @@ must not be made to fabricate them just to look more complete.
 | `WIFI_UNAVAILABLE` | Backend | Reserved for the backend to describe a device it knows to be offline at the Wi-Fi level; not produced by the firmware |
 | `CLOUD_UNAVAILABLE` | Backend/Application | Reserved for the backend/app to describe an AWS IoT Core outage; not produced by the firmware |
 | `DOOR_OUTPUT_FAILURE` | Device | `IHardwareIO::setDoorOutput()` reported failure (always true today - see CONTEXT.md, the hardware layer is a stub) |
+| `CAPABILITY_DISABLED` | Device | `OPEN_DOOR` was valid but door-opening capability is `DISABLED` |
 | `OTA_DOWNLOAD_FAILED` | Device | `IOtaPlatform::downloadAndHash()` failed |
 | `OTA_VALIDATION_FAILED` | Device | SHA-256 or signature check failed (signature always fails today - no signing scheme exists yet, see section 30) |
 | `OTA_INSTALL_FAILED` | Device | Install, reboot, or boot-confirmation step failed |

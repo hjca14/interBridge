@@ -42,6 +42,12 @@ CommandResponse CommandHandler::recordAndReturn(const DeviceCommand& command, Co
     return response;
 }
 
+CommandResponses CommandHandler::terminalOnly(CommandResponse response) const {
+    CommandResponses responses;
+    responses.terminal = std::move(response);
+    return responses;
+}
+
 std::optional<ProtocolErrorCode> CommandHandler::checkTimeSafety(const DeviceCommand& command,
                                                                     int64_t maxValiditySeconds) const {
     if (!clock_.hasValidTime()) {
@@ -69,47 +75,44 @@ std::optional<ProtocolErrorCode> CommandHandler::checkTimeSafety(const DeviceCom
     return std::nullopt;
 }
 
-CommandResponse CommandHandler::handle(const DeviceCommand& command) {
+CommandResponses CommandHandler::handle(const DeviceCommand& command) {
     auto cached = dedupCache_.find(command.commandId);
     if (cached.has_value()) {
-        return fromCache(command, *cached);
+        return terminalOnly(fromCache(command, *cached));
     }
 
     switch (command.type) {
         case CommandType::OpenDoor: {
             auto timeError = checkTimeSafety(command, kOpenDoorMaxValiditySeconds);
             if (timeError.has_value()) {
-                return recordAndReturn(command, buildResponse(command, CommandStatus::Rejected, timeError));
+                return terminalOnly(recordAndReturn(command, buildResponse(command, CommandStatus::Rejected, timeError)));
             }
-            bool opened = intercom_.requestDoorOpen();
-            if (opened) {
-                return recordAndReturn(command, buildResponse(command, CommandStatus::Completed, std::nullopt));
+            if (kDoorOpenCapability != DoorOpenCapability::Disabled) {
+                return terminalOnly(recordAndReturn(
+                    command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::CommandNotAllowed)));
             }
-            return recordAndReturn(
-                command, buildResponse(command, CommandStatus::Failed, ProtocolErrorCode::DoorOutputFailure));
+            CommandResponses responses;
+            responses.accepted = buildResponse(command, CommandStatus::Accepted, std::nullopt);
+            responses.hasAccepted = true;
+            responses.terminal = recordAndReturn(
+                command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::CapabilityDisabled));
+            return responses;
         }
 
-        case CommandType::Restart: {
-            auto timeError = checkTimeSafety(command, kRestartMaxValiditySeconds);
-            if (timeError.has_value()) {
-                return recordAndReturn(command, buildResponse(command, CommandStatus::Rejected, timeError));
-            }
-            systemControl_.restart();
-            return recordAndReturn(command, buildResponse(command, CommandStatus::Accepted, std::nullopt));
-        }
+        case CommandType::Restart:
 
         case CommandType::EnterProvisioning:
         case CommandType::FactoryReset:
         case CommandType::AnswerCall:
         case CommandType::RejectCall:
         case CommandType::EndCall:
-            return recordAndReturn(
-                command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::CommandNotAllowed));
+            return terminalOnly(recordAndReturn(
+                command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::CommandNotAllowed)));
 
         case CommandType::Unknown:
         default:
-            return recordAndReturn(
-                command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::UnknownCommand));
+            return terminalOnly(recordAndReturn(
+                command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::UnknownCommand)));
     }
 }
 
