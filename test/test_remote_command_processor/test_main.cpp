@@ -161,6 +161,52 @@ void test_strict_parser_rejects_invalid_contract_payloads() {
                 kDeviceId + "\",\"command_id\":\"" + kCommandId +
                 "\",\"command\":\"OPEN_DOOR\",\"parameters\":{\"key\":\"1\"},"
                 "\"issued_at\":1000,\"expires_at\":1030}");
+  assertInvalid(std::string("{\"protocol_version\":1,\"device_id\":\"") +
+                kDeviceId + "\",\"command_id\":\"" + kCommandId +
+                "\",\"command\":\"OPEN_DOOR\",\"parameters\":[],"
+                "\"issued_at\":1000,\"expires_at\":1030}");
+}
+
+void test_strict_parser_accepts_exactly_the_seven_contract_fields() {
+  CommandParseResult result = parseCommand(commandJson(), kDeviceId);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(CommandParseStatus::Ok),
+                    static_cast<int>(result.status));
+  TEST_ASSERT_EQUAL_STRING(kDeviceId, result.command.deviceId.c_str());
+  TEST_ASSERT_EQUAL_STRING(kCommandId, result.command.commandId.c_str());
+}
+
+void test_strict_parser_rejects_legacy_payload_field() {
+  std::string payload =
+      std::string("{\"protocol_version\":1,\"device_id\":\"") + kDeviceId +
+      "\",\"command_id\":\"" + kCommandId +
+      "\",\"command\":\"OPEN_DOOR\",\"parameters\":{},\"issued_at\":1000,"
+      "\"expires_at\":1030,\"payload\":{}}";
+
+  assertInvalid(payload);
+}
+
+void test_strict_parser_rejects_unknown_field() {
+  std::string payload =
+      std::string("{\"protocol_version\":1,\"device_id\":\"") + kDeviceId +
+      "\",\"command_id\":\"" + kCommandId +
+      "\",\"command\":\"OPEN_DOOR\",\"parameters\":{},\"issued_at\":1000,"
+      "\"expires_at\":1030,\"unexpected\":true}";
+
+  assertInvalid(payload);
+}
+
+void test_legacy_parser_preserves_payload_compatibility() {
+  std::string payload =
+      std::string("{\"protocol_version\":1,\"command_id\":\"") + kCommandId +
+      "\",\"command\":\"UPDATE_FIRMWARE\",\"payload\":{\"version\":\"0.2.0\"}}";
+
+  CommandParseResult result = parseCommand(payload);
+
+  TEST_ASSERT_EQUAL(static_cast<int>(CommandParseStatus::Ok),
+                    static_cast<int>(result.status));
+  TEST_ASSERT_NOT_EQUAL(std::string::npos,
+                        result.command.rawPayload.find("0.2.0"));
 }
 
 void test_physical_fields_are_rejected() {
@@ -234,6 +280,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_duplicate_publishes_only_stored_terminal_response);
   RUN_TEST(test_deduplication_survives_handler_and_cache_reconstruction);
   RUN_TEST(test_strict_parser_rejects_invalid_contract_payloads);
+  RUN_TEST(test_strict_parser_accepts_exactly_the_seven_contract_fields);
+  RUN_TEST(test_strict_parser_rejects_legacy_payload_field);
+  RUN_TEST(test_strict_parser_rejects_unknown_field);
+  RUN_TEST(test_legacy_parser_preserves_payload_compatibility);
   RUN_TEST(test_physical_fields_are_rejected);
   RUN_TEST(test_publish_failures_are_observable);
   RUN_TEST(test_exact_topic_qos_callback_and_resubscription);

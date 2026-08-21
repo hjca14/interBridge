@@ -183,6 +183,34 @@ CommandParseResult parseCommand(const std::string& json, const std::string& expe
         return result;
     }
 
+    if (!expectedDeviceId.empty()) {
+        const char* allowedFields[] = {
+            "protocol_version", "device_id", "command_id", "command", "parameters", "issued_at", "expires_at",
+        };
+        JsonObjectConst object = doc.as<JsonObjectConst>();
+        for (JsonPairConst field : object) {
+            bool allowed = false;
+            for (const char* allowedField : allowedFields) {
+                if (field.key() == allowedField) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                result.status = CommandParseStatus::InvalidPayload;
+                return result;
+            }
+        }
+    }
+
+    const char* forbiddenFields[] = {"dtmf", "key", "gpio", "mode", "relay", "pulse", "pulse_duration"};
+    for (const char* field : forbiddenFields) {
+        if (doc.containsKey(field)) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
+    }
+
     if (!doc["protocol_version"].is<int>()) {
         result.status = CommandParseStatus::InvalidPayload;
         return result;
@@ -233,11 +261,7 @@ CommandParseResult parseCommand(const std::string& json, const std::string& expe
             result.status = CommandParseStatus::InvalidPayload;
             return result;
         }
-    }
-
-    const char* forbiddenFields[] = {"dtmf", "key", "gpio", "mode", "relay", "pulse", "pulse_duration"};
-    for (const char* field : forbiddenFields) {
-        if (doc.containsKey(field)) {
+        if (!doc["issued_at"].is<int64_t>() || !doc["expires_at"].is<int64_t>()) {
             result.status = CommandParseStatus::InvalidPayload;
             return result;
         }
