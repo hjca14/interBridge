@@ -110,6 +110,7 @@ enum class ProtocolErrorCode {
     OtaInstallFailed,                      // device: OTA install/reboot step failed
     ProvisioningFailed,                     // device: reserved for a ProvisioningManager failure path (not implemented yet)
     InternalError,                           // device: catch-all
+    CapabilityDisabled,
 };
 const char* toString(ProtocolErrorCode code);
 
@@ -154,6 +155,8 @@ struct CommandResponse {
     std::string command; // original command string, echoed back verbatim
     CommandStatus status;
     std::optional<ProtocolError> error;
+    int64_t issuedAtUnixSeconds = 0;
+    int64_t expiresAtUnixSeconds = 0;
     std::string toJson() const;
 };
 
@@ -163,7 +166,7 @@ struct DeviceCommand {
     CommandType type;
     std::string rawCommand; // original "command" string as received
     std::string commandId;  // 32 lowercase hex chars, validated by parseCommand() via isValidCommandId()
-    std::string rawPayload; // raw JSON text of the "payload" field, "" if absent
+    std::string deviceId;
 
     // Command time-safety fields (see docs > Command Time Safety).
     // Unix epoch seconds (NOT ISO-8601 - see docs > Common Message
@@ -194,6 +197,6 @@ struct CommandParseResult {
 // validity, size limit, protocol_version, and presence of command/
 // command_id. Does NOT validate command semantics (unknown command,
 // expiry, allowed-in-current-state) - see command_handler.*.
-CommandParseResult parseCommand(const std::string& json);
+CommandParseResult parseCommand(const std::string& json, const std::string& expectedDeviceId);
 
 } // namespace interbridge

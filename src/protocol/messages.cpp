@@ -91,6 +91,7 @@ const char* toString(ProtocolErrorCode code) {
         case ProtocolErrorCode::OtaInstallFailed: return "OTA_INSTALL_FAILED";
         case ProtocolErrorCode::ProvisioningFailed: return "PROVISIONING_FAILED";
         case ProtocolErrorCode::InternalError: return "INTERNAL_ERROR";
+        case ProtocolErrorCode::CapabilityDisabled: return "CAPABILITY_DISABLED";
     }
     return "UNKNOWN_ERROR";
 }
@@ -115,6 +116,7 @@ std::string defaultErrorMessage(ProtocolErrorCode code) {
         case ProtocolErrorCode::OtaInstallFailed: return "Firmware install failed";
         case ProtocolErrorCode::ProvisioningFailed: return "Provisioning failed";
         case ProtocolErrorCode::InternalError: return "Internal firmware error";
+        case ProtocolErrorCode::CapabilityDisabled: return "Door opening capability is disabled";
     }
     return "Unknown error";
 }
@@ -156,6 +158,8 @@ std::string CommandResponse::toJson() const {
     doc["command_id"] = commandId;
     doc["command"] = command;
     doc["status"] = toString(status);
+    doc["issued_at"] = issuedAtUnixSeconds;
+    doc["expires_at"] = expiresAtUnixSeconds;
     if (error.has_value()) {
         JsonObject errorObj = doc["error"].to<JsonObject>();
         errorObj["code"] = toString(error->code);
@@ -166,7 +170,7 @@ std::string CommandResponse::toJson() const {
     return out;
 }
 
-CommandParseResult parseCommand(const std::string& json) {
+CommandParseResult parseCommand(const std::string& json, const std::string& expectedDeviceId) {
     CommandParseResult result;
 
     if (json.size() > kMaxJsonPayloadBytes) {
@@ -188,6 +192,10 @@ CommandParseResult parseCommand(const std::string& json) {
     int version = doc["protocol_version"];
     if (version != kProtocolVersion) {
         result.status = CommandParseStatus::UnsupportedProtocolVersion;
+        return result;
+    }
+    if (!doc["device_id"].is<const char*>() || doc["device_id"].as<std::string>() != expectedDeviceId) {
+        result.status = CommandParseStatus::InvalidPayload;
         return result;
     }
 
@@ -215,11 +223,12 @@ CommandParseResult parseCommand(const std::string& json) {
     cmd.type = commandTypeFromString(rawCommand);
     cmd.rawCommand = rawCommand;
     cmd.commandId = commandId;
-
-    if (doc["payload"].is<JsonObjectConst>()) {
-        std::string payloadJson;
-        serializeJson(doc["payload"], payloadJson);
-        cmd.rawPayload = payloadJson;
+    cmd.deviceId = doc["device_id"].as<std::string>();
+    if (!doc["parameters"].is<JsonObjectConst>() || doc["parameters"].size() != 0 ||
+        doc.containsKey("payload") || doc.containsKey("dtmf") || doc.containsKey("key") ||
+        doc.containsKey("gpio") || doc.containsKey("pulse_duration") || doc.containsKey("mode")) {
+        result.status = CommandParseStatus::InvalidPayload;
+        return result;
     }
 
     if (doc["issued_at"].is<int64_t>()) {
@@ -229,6 +238,10 @@ CommandParseResult parseCommand(const std::string& json) {
     if (doc["expires_at"].is<int64_t>()) {
         cmd.expiresAtUnixSeconds = doc["expires_at"].as<int64_t>();
         cmd.hasExpiresAt = true;
+    }
+    if (!cmd.hasIssuedAt || !cmd.hasExpiresAt) {
+        result.status = CommandParseStatus::InvalidPayload;
+        return result;
     }
 
     result.status = CommandParseStatus::Ok;

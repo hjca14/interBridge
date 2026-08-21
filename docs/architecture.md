@@ -394,3 +394,28 @@ firmware excludes it. Its dependency boundary ends at Wi-Fi/TLS/MQTT, the shared
 `DevMqttSmokeHandler`. It intentionally cannot reach intercom GPIO, restart,
 factory reset, BLE/Fleet Provisioning, Shadow, or Jobs. Manual ignored DEV
 credentials are an integration-test exception, not production architecture.
+
+## Phase 2D — fail-closed door command
+
+The Phase 2D backend command contract is implemented and awaits deployment and
+end-to-end validation. Firmware subscribes only to
+`interbridge/{device_id}/commands`; the existing reconnect loop clears its
+subscription flag after every successful connection and restores that exact
+subscription. No wildcard subscription is used.
+
+`OPEN_DOOR` is recognized and time-validated, but door capability is represented
+internally as `DISABLED` (the only operational value), with `DTMF` and `RELAY`
+reserved as future design decisions. A valid first delivery produces `ACCEPTED`
+(meaning only “accepted for processing”) followed by `REJECTED` with
+`CAPABILITY_DISABLED`. No physical output path is called.
+
+The bounded deduplication cache is intentionally RAM-only in this phase. It
+prevents repeat processing during a boot; after reboot it is empty. Flash
+persistence was not added because its write-wear and lifecycle policy have not
+been approved. Expiry and fail-closed clock validation remain the safety boundary
+across reboot.
+
+Door capability configuration belongs to the Device, never to a user or
+membership. Only an `OWNER` may be allowed to configure it in a future phase.
+There is no remote capability configuration today, and no DTMF sequence, GPIO,
+relay, or pulse duration is stored.

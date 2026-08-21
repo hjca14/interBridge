@@ -26,7 +26,7 @@ CommandResponse DevMqttSmokeHandler::reject(const DeviceCommand& command, Protoc
 }
 
 CommandResponse DevMqttSmokeHandler::handle(const std::string& payload) const {
-    const CommandParseResult parsed = parseCommand(payload);
+    const CommandParseResult parsed = parseCommand(payload, deviceId_);
     if (parsed.status != CommandParseStatus::Ok) return reject(DeviceCommand{}, parseError(parsed.status));
     const DeviceCommand& command = parsed.command;
     if (!clock_.hasValidTime()) return reject(command, ProtocolErrorCode::ClockNotTrustworthy);

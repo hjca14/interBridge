@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "../hardware/clock.h"
 #include "../hardware/system_control.h"
@@ -34,12 +35,15 @@ constexpr int64_t kClockSkewToleranceSeconds = 5;
 // immediate ACCEPTED followed later by a separate terminal publish - see
 // CONTEXT.md > Technical Debt for the two-phase lifecycle this should
 // grow into once door actuation can be genuinely asynchronous.
+enum class DoorCapability { Disabled, Dtmf, Relay };
+struct DoorCapabilityConfig { DoorCapability capability = DoorCapability::Disabled; };
+
 class CommandHandler {
 public:
     CommandHandler(std::string deviceId, IClock& clock, IDedupCache& dedupCache, Intercom& intercom,
                     ISystemControl& systemControl);
 
-    CommandResponse handle(const DeviceCommand& command);
+    std::vector<CommandResponse> handle(const DeviceCommand& command);
 
 private:
     CommandResponse buildResponse(const DeviceCommand& command, CommandStatus status,
@@ -57,6 +61,7 @@ private:
     IDedupCache& dedupCache_;
     Intercom& intercom_;
     ISystemControl& systemControl_;
+    DoorCapabilityConfig capability_{};
 };
 
 } // namespace interbridge

@@ -1033,3 +1033,21 @@ remains powered, real BLE onboarding, NVS, Fleet Provisioning, Secure Boot,
 Flash Encryption, intercom hardware, Phase 1E Basic Ingest persistence, and the
 final custom PCB. The manually injected ignored DEV header remains bench-only
 and does not supersede production key generation and provisioning.
+
+## Phase 2D safe logical command handling (2026-08-21)
+
+The backend portion is implemented and awaits deployment/validation. Firmware now
+recognizes the strict semantic `OPEN_DOOR` envelope, restores its device-specific
+(no-wildcard) subscription after reconnect, and remains fail-closed. The internal
+capability defaults to and operates only as `DISABLED`; `DTMF` and `RELAY` are
+future decisions. A valid command receives `ACCEPTED` followed by
+`REJECTED/CAPABILITY_DISABLED`, without calling intercom output, DTMF, GPIO, or a
+relay. `ACCEPTED` is processing acknowledgement only, never evidence of opening.
+
+Deduplication is bounded and RAM-only, so it resets on reboot; flash persistence
+was deliberately not added without an approved wear/lifecycle analysis. Strict
+expiry, a trustworthy clock, and the documented five-second skew tolerance fail
+closed. Invalid uncorrelatable envelopes receive no fabricated response and raw
+payloads are not logged. Future capability configuration belongs to Device (not
+user/membership) and only `OWNER` may configure it. No real AWS publish, DTMF,
+GPIO, relay, or physical action was performed or tested.

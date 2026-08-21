@@ -9,7 +9,7 @@ void setUp() {}
 void tearDown() {}
 
 std::string command(int64_t issued, int64_t expires) {
-    return R"({"protocol_version":1,"command":"OPEN_DOOR","command_id":")" + std::string(kCmd) +
+    return R"({"protocol_version":1,"device_id":"ib-dev-test-placeholder","command":"OPEN_DOOR","parameters":{},"command_id":")" + std::string(kCmd) +
            R"(","issued_at":)" + std::to_string(issued) + R"(,"expires_at":)" + std::to_string(expires) + "}";
 }
 

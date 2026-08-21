@@ -43,7 +43,8 @@ void test_subscribe_and_deliver_invokes_callback() {
 
     std::string receivedTopic;
     std::string receivedPayload;
-    transport.subscribe("interbridge/ib-abc123/commands", [&](const std::string& topic, const std::string& payload) {
+    transport.subscribe("interbridge/ib-abc123/commands", MqttQos::AtLeastOnce,
+                        [&](const std::string& topic, const std::string& payload) {
         receivedTopic = topic;
         receivedPayload = payload;
     });

@@ -72,7 +72,7 @@ bool subscribedToCommands = false;
 uint32_t nextConnectAttemptAtMs = 0;
 
 // ---- Protocol ----
-PersistentDedupCache dedupCache(persistentStore);
+InMemoryDedupCache dedupCache;
 PersistentEventOutbox eventOutbox(persistentStore);
 std::optional<CommandHandler> commandHandler;
 
@@ -155,24 +155,19 @@ void publishProtocolEvent(ProtocolEventName eventName) {
 
 void handleIncomingCommand(const std::string& topic, const std::string& payload) {
     (void)topic;
-    auto parsed = parseCommand(payload);
+    auto parsed = parseCommand(payload, deviceIdentity.deviceId);
 
-    CommandResponse response;
     if (parsed.status != CommandParseStatus::Ok) {
-        ProtocolErrorCode code = ProtocolErrorCode::InvalidPayload;
-        if (parsed.status == CommandParseStatus::PayloadTooLarge) {
-            code = ProtocolErrorCode::PayloadTooLarge;
-        } else if (parsed.status == CommandParseStatus::UnsupportedProtocolVersion) {
-            code = ProtocolErrorCode::UnsupportedProtocolVersion;
-        }
-        response.deviceId = deviceIdentity.deviceId;
-        response.status = CommandStatus::Rejected;
-        response.error = ProtocolError{code, defaultErrorMessage(code)};
+        Logger::warn("Rejected uncorrelatable MQTT command envelope");
+        return;
     } else {
-        response = commandHandler->handle(parsed.command);
+        for (const auto& response : commandHandler->handle(parsed.command)) {
+            if (!transport.publish(mqttTopics->responsesIngest(), response.toJson(), MqttQos::AtLeastOnce)) {
+                Logger::warn("Command response publish failed");
+                break;
+            }
+        }
     }
-
-    transport.publish(mqttTopics->responsesIngest(), response.toJson(), MqttQos::AtLeastOnce);
 }
 
 void initializeLogging() {
@@ -293,7 +288,8 @@ void updateNetwork() {
     transport.poll();
 
     if (!subscribedToCommands) {
-        subscribedToCommands = transport.subscribe(mqttTopics->commands(), handleIncomingCommand);
+        subscribedToCommands = transport.subscribe(mqttTopics->commands(), MqttQos::AtLeastOnce,
+                                                   handleIncomingCommand);
     }
 
     for (const auto& entry : eventOutbox.pending()) {

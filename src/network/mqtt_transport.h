@@ -42,7 +42,7 @@ public:
     virtual bool isConnected() const = 0;
 
     virtual bool publish(const std::string& topic, const std::string& payload, MqttQos qos) = 0;
-    virtual bool subscribe(const std::string& topic, MqttMessageCallback callback) = 0;
+    virtual bool subscribe(const std::string& topic, MqttQos qos, MqttMessageCallback callback) = 0;
 
     // Must be called regularly (non-blocking) to process incoming
     // messages and keep-alive traffic.
@@ -63,7 +63,7 @@ public:
     void disconnect() override;
     bool isConnected() const override;
     bool publish(const std::string& topic, const std::string& payload, MqttQos qos) override;
-    bool subscribe(const std::string& topic, MqttMessageCallback callback) override;
+    bool subscribe(const std::string& topic, MqttQos qos, MqttMessageCallback callback) override;
     void poll() override;
 
 private:
@@ -91,7 +91,7 @@ public:
     void disconnect() override;
     bool isConnected() const override;
     bool publish(const std::string& topic, const std::string& payload, MqttQos qos) override;
-    bool subscribe(const std::string& topic, MqttMessageCallback callback) override;
+    bool subscribe(const std::string& topic, MqttQos qos, MqttMessageCallback callback) override;
     void poll() override;
 
     void armConnectFailure(int timesToFail);

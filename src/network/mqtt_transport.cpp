@@ -29,9 +29,10 @@ bool Esp32AwsIotTransport::publish(const std::string& topic, const std::string& 
     return false;
 }
 
-bool Esp32AwsIotTransport::subscribe(const std::string& topic, MqttMessageCallback callback) {
+bool Esp32AwsIotTransport::subscribe(const std::string& topic, MqttQos qos, MqttMessageCallback callback) {
     (void)topic;
     (void)callback;
+    (void)qos;
     // TODO: not implemented. See CONTEXT.md > Open Questions.
     return false;
 }
@@ -69,7 +70,8 @@ bool FakeDeviceTransport::publish(const std::string& topic, const std::string& p
     return true;
 }
 
-bool FakeDeviceTransport::subscribe(const std::string& topic, MqttMessageCallback callback) {
+bool FakeDeviceTransport::subscribe(const std::string& topic, MqttQos qos, MqttMessageCallback callback) {
+    (void)qos;
     if (!connected_) {
         return false;
     }

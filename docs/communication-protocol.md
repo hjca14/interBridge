@@ -1592,3 +1592,34 @@ Reserved
 ```
 
 Defining this document does not mean AWS connectivity, provisioning, OTA, BLE, or physical hardware behavior is already implemented or validated.
+
+## Phase 2D OPEN_DOOR profile
+
+Phase 2D uses the command envelope below (the former generic `payload` member is
+not accepted for this command):
+
+```json
+{"protocol_version":1,"device_id":"ib-<32 lowercase hex>","command_id":"<32 lowercase hex>","command":"OPEN_DOOR","parameters":{},"issued_at":1786467600,"expires_at":1786467610}
+```
+
+The firmware requires the authenticated device's exact `device_id`, an empty
+object for `parameters`, integer timestamps, a validity window of at most 10
+seconds, and permits at most 5 seconds of future clock skew. An unsynchronized
+clock fails closed. Physical fields (including DTMF/key, GPIO, pulse duration,
+or mode) and non-empty parameters are invalid.
+
+Structurally valid `OPEN_DOOR` produces `ACCEPTED`, then `REJECTED` /
+`CAPABILITY_DISABLED`; `ACCEPTED` never claims that a door opened. A duplicate
+within the bounded in-memory cache deterministically replays the terminal
+response. Structurally invalid payloads are not answered when a valid correlation
+identity cannot be established: firmware does not invent `command_id`, `device_id`,
+or `command` values merely to publish a response, and it never logs raw payloads.
+Response envelopes echo `device_id`, `command_id`, `command`, `issued_at`, and
+`expires_at`.
+
+The backend half of Phase 2D is implemented but awaits deploy/validation. Real
+door opening, DTMF, GPIO, and relay operation have neither been implemented nor
+tested. `DISABLED` is the default and only operational capability; `DTMF` and
+`RELAY` remain future decisions. Capability configuration is Device-owned (not
+user/membership-owned), will be restricted to `OWNER`, and is not remotely
+configurable in this phase. No physical action was executed during Phase 2D.
