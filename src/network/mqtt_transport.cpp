@@ -40,7 +40,12 @@ void Esp32AwsIotTransport::poll() {
     // TODO: not implemented. See CONTEXT.md > Open Questions.
 }
 
-FakeDeviceTransport::FakeDeviceTransport() : connected_(false), connectFailuresRemaining_(0) {}
+FakeDeviceTransport::FakeDeviceTransport()
+    : connected_(false),
+      connectFailuresRemaining_(0),
+      publishFailuresRemaining_(0),
+      publishCallCount_(0),
+      failPublishCall_(0) {}
 
 bool FakeDeviceTransport::connect(const std::string& clientId) {
     if (connectFailuresRemaining_ > 0) {
@@ -55,6 +60,7 @@ bool FakeDeviceTransport::connect(const std::string& clientId) {
 
 void FakeDeviceTransport::disconnect() {
     connected_ = false;
+    subscriptions_.clear();
 }
 
 bool FakeDeviceTransport::isConnected() const {
@@ -63,6 +69,14 @@ bool FakeDeviceTransport::isConnected() const {
 
 bool FakeDeviceTransport::publish(const std::string& topic, const std::string& payload, MqttQos qos) {
     if (!connected_) {
+        return false;
+    }
+    publishCallCount_++;
+    if (publishCallCount_ == failPublishCall_) {
+        return false;
+    }
+    if (publishFailuresRemaining_ > 0) {
+        publishFailuresRemaining_--;
         return false;
     }
     published_.push_back(PublishedMessage{topic, payload, qos});
@@ -81,6 +95,18 @@ void FakeDeviceTransport::poll() {}
 
 void FakeDeviceTransport::armConnectFailure(int timesToFail) {
     connectFailuresRemaining_ = timesToFail;
+}
+
+void FakeDeviceTransport::armPublishFailure(int timesToFail) {
+    publishFailuresRemaining_ = timesToFail;
+}
+
+void FakeDeviceTransport::armPublishFailureOnCall(int callNumber) {
+    failPublishCall_ = callNumber;
+}
+
+size_t FakeDeviceTransport::subscriptionCount() const {
+    return subscriptions_.size();
 }
 
 const std::vector<FakeDeviceTransport::PublishedMessage>& FakeDeviceTransport::publishedMessages() const {

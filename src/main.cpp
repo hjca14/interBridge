@@ -28,6 +28,7 @@
 #include "protocol/command_handler.h"
 #include "protocol/event_outbox.h"
 #include "protocol/messages.h"
+#include "protocol/remote_command_processor.h"
 #include "provisioning/ble_provisioning.h"
 #include "provisioning/device_identity.h"
 #include "provisioning/factory_reset_coordinator.h"
@@ -75,6 +76,7 @@ uint32_t nextConnectAttemptAtMs = 0;
 PersistentDedupCache dedupCache(persistentStore);
 PersistentEventOutbox eventOutbox(persistentStore);
 std::optional<CommandHandler> commandHandler;
+std::optional<RemoteCommandProcessor> remoteCommandProcessor;
 
 // ---- Provisioning ----
 Esp32BleProvisioning bleProvisioning; // default Security2-requested, see ble_provisioning.h
@@ -153,28 +155,6 @@ void publishProtocolEvent(ProtocolEventName eventName) {
     eventOutbox.enqueue(event.eventId, event.toJson());
 }
 
-void handleIncomingCommand(const std::string& topic, const std::string& payload) {
-    (void)topic;
-    auto parsed = parseCommand(payload);
-
-    CommandResponse response;
-    if (parsed.status != CommandParseStatus::Ok) {
-        ProtocolErrorCode code = ProtocolErrorCode::InvalidPayload;
-        if (parsed.status == CommandParseStatus::PayloadTooLarge) {
-            code = ProtocolErrorCode::PayloadTooLarge;
-        } else if (parsed.status == CommandParseStatus::UnsupportedProtocolVersion) {
-            code = ProtocolErrorCode::UnsupportedProtocolVersion;
-        }
-        response.deviceId = deviceIdentity.deviceId;
-        response.status = CommandStatus::Rejected;
-        response.error = ProtocolError{code, defaultErrorMessage(code)};
-    } else {
-        response = commandHandler->handle(parsed.command);
-    }
-
-    transport.publish(mqttTopics->responsesIngest(), response.toJson(), MqttQos::AtLeastOnce);
-}
-
 void initializeLogging() {
     Serial.begin(115200);
     Logger::info("Booting InterBridge");
@@ -195,6 +175,7 @@ void initializeIdentity() {
     mqttTopics.emplace(topicsConfig);
 
     commandHandler.emplace(deviceIdentity.deviceId, clock, dedupCache, intercom, systemControl);
+    remoteCommandProcessor.emplace(deviceIdentity.deviceId, transport, *commandHandler, *mqttTopics);
 
     fleetProvisioningCoordinator.emplace(keyPairGenerator, fleetProvisioningTransport, credentialStore,
                                           topicsConfig.fleetProvisioningTemplateName);
@@ -293,7 +274,7 @@ void updateNetwork() {
     transport.poll();
 
     if (!subscribedToCommands) {
-        subscribedToCommands = transport.subscribe(mqttTopics->commands(), handleIncomingCommand);
+        subscribedToCommands = remoteCommandProcessor->subscribe();
     }
 
     for (const auto& entry : eventOutbox.pending()) {

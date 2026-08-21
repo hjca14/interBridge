@@ -42,7 +42,7 @@ DeviceCommand makeCommand(CommandType type, const std::string& rawCommand, const
 void setUp() {}
 void tearDown() {}
 
-void test_open_door_completes_when_hardware_succeeds() {
+void test_open_door_is_accepted_then_rejected_when_capability_disabled() {
     MockHardware hw;
     Intercom intercom(hw);
     FakeClock clock;
@@ -54,12 +54,16 @@ void test_open_door_completes_when_hardware_succeeds() {
     auto cmd = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "cmd-1", 995, 1005);
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Completed), static_cast<int>(response.status));
-    TEST_ASSERT_FALSE(response.error.has_value());
-    TEST_ASSERT_EQUAL(1, hw.doorCallCount);
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_TRUE(response.hasAccepted);
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Accepted), static_cast<int>(response.accepted.status));
+    TEST_ASSERT_TRUE(response.terminal.error.has_value());
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CapabilityDisabled),
+                      static_cast<int>(response.terminal.error->code));
+    TEST_ASSERT_EQUAL(0, hw.doorCallCount);
 }
 
-void test_open_door_fails_when_hardware_reports_failure() {
+void test_open_door_does_not_call_failing_hardware_when_capability_disabled() {
     MockHardware hw;
     hw.doorOutputSucceeds = false;
     Intercom intercom(hw);
@@ -72,9 +76,9 @@ void test_open_door_fails_when_hardware_reports_failure() {
     auto cmd = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "cmd-1", 995, 1005);
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Failed), static_cast<int>(response.status));
-    TEST_ASSERT_TRUE(response.error.has_value());
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::DoorOutputFailure), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_TRUE(response.terminal.error.has_value());
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CapabilityDisabled), static_cast<int>(response.terminal.error->code));
 }
 
 void test_open_door_rejected_when_clock_not_trustworthy() {
@@ -88,8 +92,8 @@ void test_open_door_rejected_when_clock_not_trustworthy() {
     auto cmd = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "cmd-1", 995, 1005);
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::ClockNotTrustworthy), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::ClockNotTrustworthy), static_cast<int>(response.terminal.error->code));
     TEST_ASSERT_EQUAL(0, hw.doorCallCount);
 }
 
@@ -105,8 +109,8 @@ void test_open_door_rejected_when_expired() {
     auto cmd = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "cmd-1", 995, 1005);
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandExpired), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandExpired), static_cast<int>(response.terminal.error->code));
     TEST_ASSERT_EQUAL(0, hw.doorCallCount);
 }
 
@@ -119,15 +123,81 @@ void test_open_door_rejected_when_validity_window_exceeds_maximum() {
     FakeSystemControl sysControl;
     CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
 
-    // OPEN_DOOR max validity is 10s; this window is 100s.
+    // OPEN_DOOR max validity is 30s; this window is 100s.
     auto cmd = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "cmd-1", 995, 1095);
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::InvalidTimestamp), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::InvalidTimestamp), static_cast<int>(response.terminal.error->code));
 }
 
-void test_restart_accepted_and_triggers_system_control() {
+void test_open_door_accepts_exact_thirty_second_window() {
+    MockHardware hw;
+    Intercom intercom(hw);
+    FakeClock clock;
+    clock.setUnixTimeSeconds(1000);
+    InMemoryDedupCache cache;
+    FakeSystemControl sysControl;
+    CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
+
+    auto command = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "test_open_door_accepts_exact_thirty_second_window", 1000, 1030);
+    auto response = handler.handle(command);
+
+    TEST_ASSERT_TRUE(response.hasAccepted);
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CapabilityDisabled),
+                      static_cast<int>(response.terminal.error->code));
+}
+
+void test_open_door_rejects_thirty_one_second_window() {
+    MockHardware hw;
+    Intercom intercom(hw);
+    FakeClock clock;
+    clock.setUnixTimeSeconds(1000);
+    InMemoryDedupCache cache;
+    FakeSystemControl sysControl;
+    CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
+
+    auto command = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "test_open_door_rejects_thirty_one_second_window", 1000, 1031);
+    auto response = handler.handle(command);
+
+    TEST_ASSERT_FALSE(response.hasAccepted);
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::InvalidTimestamp),
+                      static_cast<int>(response.terminal.error->code));
+}
+
+void test_open_door_accepts_issued_at_five_seconds_in_future() {
+    MockHardware hw;
+    Intercom intercom(hw);
+    FakeClock clock;
+    clock.setUnixTimeSeconds(1000);
+    InMemoryDedupCache cache;
+    FakeSystemControl sysControl;
+    CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
+
+    auto command = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "test_open_door_accepts_issued_at_five_seconds_in_future", 1005, 1030);
+    auto response = handler.handle(command);
+
+    TEST_ASSERT_TRUE(response.hasAccepted);
+}
+
+void test_open_door_rejects_issued_at_six_seconds_in_future() {
+    MockHardware hw;
+    Intercom intercom(hw);
+    FakeClock clock;
+    clock.setUnixTimeSeconds(1000);
+    InMemoryDedupCache cache;
+    FakeSystemControl sysControl;
+    CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
+
+    auto command = makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "test_open_door_rejects_issued_at_six_seconds_in_future", 1006, 1030);
+    auto response = handler.handle(command);
+
+    TEST_ASSERT_FALSE(response.hasAccepted);
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::InvalidTimestamp),
+                      static_cast<int>(response.terminal.error->code));
+}
+
+void test_restart_is_rejected_without_triggering_system_control() {
     MockHardware hw;
     Intercom intercom(hw);
     FakeClock clock;
@@ -139,8 +209,10 @@ void test_restart_accepted_and_triggers_system_control() {
     auto cmd = makeCommand(CommandType::Restart, "RESTART", "cmd-1", 995, 1030);
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Accepted), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(1, sysControl.restartCount());
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandNotAllowed),
+                      static_cast<int>(response.terminal.error->code));
+    TEST_ASSERT_EQUAL(0, sysControl.restartCount());
 }
 
 void test_duplicate_open_door_does_not_actuate_hardware_twice() {
@@ -156,8 +228,10 @@ void test_duplicate_open_door_does_not_actuate_hardware_twice() {
     auto first = handler.handle(cmd);
     auto second = handler.handle(cmd); // simulates MQTT QoS 1 redelivery
 
-    TEST_ASSERT_EQUAL(1, hw.doorCallCount);
-    TEST_ASSERT_EQUAL(static_cast<int>(first.status), static_cast<int>(second.status));
+    TEST_ASSERT_EQUAL(0, hw.doorCallCount);
+    TEST_ASSERT_TRUE(first.hasAccepted);
+    TEST_ASSERT_FALSE(second.hasAccepted);
+    TEST_ASSERT_EQUAL(static_cast<int>(first.terminal.status), static_cast<int>(second.terminal.status));
 }
 
 void test_enter_provisioning_is_not_remotely_allowed() {
@@ -174,8 +248,8 @@ void test_enter_provisioning_is_not_remotely_allowed() {
     cmd.commandId = "cmd-1";
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandNotAllowed), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandNotAllowed), static_cast<int>(response.terminal.error->code));
 }
 
 void test_factory_reset_is_not_remotely_allowed() {
@@ -192,8 +266,8 @@ void test_factory_reset_is_not_remotely_allowed() {
     cmd.commandId = "cmd-1";
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandNotAllowed), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::CommandNotAllowed), static_cast<int>(response.terminal.error->code));
 }
 
 void test_reserved_call_command_is_rejected() {
@@ -210,7 +284,7 @@ void test_reserved_call_command_is_rejected() {
     cmd.commandId = "cmd-1";
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
 }
 
 void test_unknown_command_is_rejected() {
@@ -227,20 +301,24 @@ void test_unknown_command_is_rejected() {
     cmd.commandId = "cmd-1";
     auto response = handler.handle(cmd);
 
-    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.status));
-    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::UnknownCommand), static_cast<int>(response.error->code));
+    TEST_ASSERT_EQUAL(static_cast<int>(CommandStatus::Rejected), static_cast<int>(response.terminal.status));
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolErrorCode::UnknownCommand), static_cast<int>(response.terminal.error->code));
 }
 
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
     UNITY_BEGIN();
-    RUN_TEST(test_open_door_completes_when_hardware_succeeds);
-    RUN_TEST(test_open_door_fails_when_hardware_reports_failure);
+    RUN_TEST(test_open_door_is_accepted_then_rejected_when_capability_disabled);
+    RUN_TEST(test_open_door_does_not_call_failing_hardware_when_capability_disabled);
     RUN_TEST(test_open_door_rejected_when_clock_not_trustworthy);
     RUN_TEST(test_open_door_rejected_when_expired);
     RUN_TEST(test_open_door_rejected_when_validity_window_exceeds_maximum);
-    RUN_TEST(test_restart_accepted_and_triggers_system_control);
+    RUN_TEST(test_open_door_accepts_exact_thirty_second_window);
+    RUN_TEST(test_open_door_rejects_thirty_one_second_window);
+    RUN_TEST(test_open_door_accepts_issued_at_five_seconds_in_future);
+    RUN_TEST(test_open_door_rejects_issued_at_six_seconds_in_future);
+    RUN_TEST(test_restart_is_rejected_without_triggering_system_control);
     RUN_TEST(test_duplicate_open_door_does_not_actuate_hardware_twice);
     RUN_TEST(test_enter_provisioning_is_not_remotely_allowed);
     RUN_TEST(test_factory_reset_is_not_remotely_allowed);

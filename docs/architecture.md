@@ -340,6 +340,17 @@ plus new ones from this pass:)*
   doesn't need to change when the protocol's message shapes change, and
   vice versa. `mqtt_topics.h` and `protocol/messages.h` depend on
   nothing from `mqtt_transport.h`.
+- **Phase 2D command processing is fail-closed.** `RemoteCommandProcessor`
+  strictly parses the device-scoped command payload, delegates to
+  `CommandHandler`, and publishes its two logical responses through
+  `IDeviceTransport` at QoS 1. Native tests use only `FakeDeviceTransport`.
+  `Esp32AwsIotTransport` remains an honest production stub, so this layer does
+  not demonstrate a real AWS subscription or publication.
+- **Door-open capability is explicit:** `Disabled` is the default and only
+  operational Phase 2D mode. `Dtmf` and `Relay` are reserved names without
+  sequence, key, GPIO, pulse, or physical implementation. A valid request is
+  accepted for processing and then rejected as `CAPABILITY_DISABLED` without
+  calling intercom, system control, provisioning, reset, or hardware.
 - **No custom Last Will / availability topic.** AWS IoT Core's own
   connectivity lifecycle events are the intended authoritative
   online/offline signal (see `docs/communication-protocol.md`), so

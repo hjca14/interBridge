@@ -85,6 +85,7 @@ const char* toString(ProtocolErrorCode code) {
         case ProtocolErrorCode::NotProvisioned: return "NOT_PROVISIONED";
         case ProtocolErrorCode::WifiUnavailable: return "WIFI_UNAVAILABLE";
         case ProtocolErrorCode::CloudUnavailable: return "CLOUD_UNAVAILABLE";
+        case ProtocolErrorCode::CapabilityDisabled: return "CAPABILITY_DISABLED";
         case ProtocolErrorCode::DoorOutputFailure: return "DOOR_OUTPUT_FAILURE";
         case ProtocolErrorCode::OtaDownloadFailed: return "OTA_DOWNLOAD_FAILED";
         case ProtocolErrorCode::OtaValidationFailed: return "OTA_VALIDATION_FAILED";
@@ -109,6 +110,7 @@ std::string defaultErrorMessage(ProtocolErrorCode code) {
         case ProtocolErrorCode::NotProvisioned: return "Device is not provisioned";
         case ProtocolErrorCode::WifiUnavailable: return "Wi-Fi is unavailable";
         case ProtocolErrorCode::CloudUnavailable: return "Cloud connection is unavailable";
+        case ProtocolErrorCode::CapabilityDisabled: return "Door opening capability is disabled";
         case ProtocolErrorCode::DoorOutputFailure: return "Door output could not be activated";
         case ProtocolErrorCode::OtaDownloadFailed: return "Firmware download failed";
         case ProtocolErrorCode::OtaValidationFailed: return "Firmware validation failed";
@@ -166,7 +168,7 @@ std::string CommandResponse::toJson() const {
     return out;
 }
 
-CommandParseResult parseCommand(const std::string& json) {
+CommandParseResult parseCommand(const std::string& json, const std::string& expectedDeviceId) {
     CommandParseResult result;
 
     if (json.size() > kMaxJsonPayloadBytes) {
@@ -179,6 +181,34 @@ CommandParseResult parseCommand(const std::string& json) {
     if (err) {
         result.status = CommandParseStatus::InvalidPayload;
         return result;
+    }
+
+    if (!expectedDeviceId.empty()) {
+        const char* allowedFields[] = {
+            "protocol_version", "device_id", "command_id", "command", "parameters", "issued_at", "expires_at",
+        };
+        JsonObjectConst object = doc.as<JsonObjectConst>();
+        for (JsonPairConst field : object) {
+            bool allowed = false;
+            for (const char* allowedField : allowedFields) {
+                if (field.key() == allowedField) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                result.status = CommandParseStatus::InvalidPayload;
+                return result;
+            }
+        }
+    }
+
+    const char* forbiddenFields[] = {"dtmf", "key", "gpio", "mode", "relay", "pulse", "pulse_duration"};
+    for (const char* field : forbiddenFields) {
+        if (doc.containsKey(field)) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
     }
 
     if (!doc["protocol_version"].is<int>()) {
@@ -211,10 +241,37 @@ CommandParseResult parseCommand(const std::string& json) {
         return result;
     }
 
+    std::string deviceId;
+    if (!expectedDeviceId.empty()) {
+        if (!doc["device_id"].is<const char*>()) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
+        deviceId = doc["device_id"].as<std::string>();
+        if (deviceId != expectedDeviceId) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
+        if (!doc["parameters"].is<JsonObjectConst>()) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
+        JsonObjectConst parameters = doc["parameters"].as<JsonObjectConst>();
+        if (parameters.size() != 0) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
+        if (!doc["issued_at"].is<int64_t>() || !doc["expires_at"].is<int64_t>()) {
+            result.status = CommandParseStatus::InvalidPayload;
+            return result;
+        }
+    }
+
     DeviceCommand cmd;
     cmd.type = commandTypeFromString(rawCommand);
     cmd.rawCommand = rawCommand;
     cmd.commandId = commandId;
+    cmd.deviceId = deviceId;
 
     if (doc["payload"].is<JsonObjectConst>()) {
         std::string payloadJson;
@@ -234,6 +291,10 @@ CommandParseResult parseCommand(const std::string& json) {
     result.status = CommandParseStatus::Ok;
     result.command = cmd;
     return result;
+}
+
+CommandParseResult parseCommand(const std::string& json) {
+    return parseCommand(json, "");
 }
 
 } // namespace interbridge

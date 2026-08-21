@@ -1033,3 +1033,32 @@ remains powered, real BLE onboarding, NVS, Fleet Provisioning, Secure Boot,
 Flash Encryption, intercom hardware, Phase 1E Basic Ingest persistence, and the
 final custom PCB. The manually injected ignored DEV header remains bench-only
 and does not supersede production key generation and provisioning.
+
+## Phase 2D — fail-closed OPEN_DOOR logic (2026-08-21)
+
+The backend portion of Phase 2D is implemented and awaits deployment and
+validation. This firmware pass adds only the strict semantic parser, explicit
+remote allowlist, persistent deduplication flow, and logical response publishing
+through `IDeviceTransport`. Production `Esp32AwsIotTransport` remains stubbed;
+no production AWS MQTT subscribe or publish has been implemented or validated.
+
+The future command topic is `interbridge/{device_id}/commands` at QoS 1 without
+wildcards. The strict payload requires protocol version 1, the exact local
+`device_id`, a 32-character lowercase hexadecimal `command_id`, `OPEN_DOOR`, an
+exactly empty `parameters` object, and integer epoch timestamps. Backend and
+firmware validity are exactly 30 seconds, future clock tolerance is 5 seconds,
+and an untrustworthy clock fails closed.
+
+Door opening capability is modeled as `Disabled`, `Dtmf`, or `Relay`. `Disabled`
+is the default and only operational value in this phase. `Dtmf` and `Relay` are
+future placeholders only. A valid `OPEN_DOOR` produces `ACCEPTED` (accepted only
+for processing), then terminal `REJECTED/CAPABILITY_DISABLED`. No COMPLETED,
+DOOR_OPENED, DTMF, key, GPIO, relay, pulse, restart, reset, provisioning, or
+physical action is produced. Configuration belongs to the Device and, when it
+is implemented in a future phase, only an OWNER may change it.
+
+Native logical integration uses `FakeDeviceTransport`, including exact-topic
+subscription, callback delivery, QoS 1 responses, observable publish failures,
+and required resubscription after reconnect. These tests do not prove real AWS
+connectivity. The pre-change inventory was 28 test files and 170 tests; this
+pass preserves every suite and adds a new suite rather than replacing one.
