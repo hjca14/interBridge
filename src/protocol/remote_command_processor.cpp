@@ -65,8 +65,15 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
   if (!result.terminalPublished) {
     Logger::error("Remote command terminal response publish failed");
   }
-  if (diagnosticCallback_) diagnosticCallback_({CommandDiagnosticStage::TerminalPublished,
-      result.terminalPublished ? "ok" : "publish_failed"});
+  if (diagnosticCallback_) {
+    const char *safeCode = "publish_failed";
+    if (result.terminalPublished) {
+      safeCode = responses.terminal.error.has_value()
+                     ? toString(responses.terminal.error->code)
+                     : toString(responses.terminal.status);
+    }
+    diagnosticCallback_({CommandDiagnosticStage::TerminalPublished, safeCode});
+  }
   return result;
 }
 

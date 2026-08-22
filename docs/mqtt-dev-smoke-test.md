@@ -34,11 +34,17 @@ The harness does not access Shadow or Jobs.
 
 The harness publishes the protocol `HealthReport` to the centralized
 `MqttTopics::healthIngest()` Basic Ingest route at QoS 0 once after each successful
-connection/subscription and hourly thereafter, matching the protocol cadence. A
+connection/subscription and every 60 seconds thereafter. The DEV backend uses
+`FRESH_SECONDS=120`, so this cadence refreshes `last_seen_at` halfway through the
+freshness window and tolerates one missed periodic report without changing the
+backend threshold. A
 failed attempt is not retried in the tight loop, preventing a reconnect/publish
-storm. The hourly report is intentionally low-volume (24 periodic messages/device/day,
-plus reconnects), so its qualitative broker, rule, Lambda, and storage cost is much
-lower than reusing the 15-second local-status cadence (5,760 messages/device/day).
+storm: it waits until the next 60-second cadence. This produces up to 1,440 periodic
+messages/device/day (plus reconnects), increasing DEV broker, rule, Lambda, and
+storage traffic relative to an hourly report, but remaining four times lower than
+reusing the 15-second local-status cadence (5,760 messages/device/day). Production
+keeps its independently configurable cadence for explicit freshness/cost review;
+the DEV override must not silently become the production default.
 Only measurements available on the ESP32 are emitted: firmware version, safe idle
 intercom state (the DEV hardware never changes it), wrap-safe uptime, RSSI, and free
 heap, in addition to required protocol/device fields.

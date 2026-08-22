@@ -34,6 +34,9 @@ constexpr uint16_t kMqttKeepAliveSeconds = 300;
 constexpr uint16_t kMqttTimeoutMs = 1000;
 constexpr uint32_t kSerialWaitMs = 1500;
 constexpr uint32_t kHeartbeatMs = 15000;
+// DEV backend considers a device stale after 120s. Publishing halfway through
+// that window leaves one missed-report margin without using the 15s log cadence.
+constexpr uint32_t kDevHealthIntervalMs = 60u * 1000u;
 
 class NtpClock final : public IClock {
 public:
@@ -86,7 +89,7 @@ RemoteCommandProcessor processor(INTERBRIDGE_DEV_DEVICE_ID, transport,
 DevMqttSmokeState connectivity;
 uint32_t heartbeatAt = 0;
 bool subscribed = false;
-HealthReporter healthReporter;
+HealthReporter healthReporter(kDevHealthIntervalMs);
 
 void onTimeSynchronized(struct timeval*) { clockSource.syncCompleted(millis()); }
 
@@ -148,7 +151,7 @@ void setup() {
                 Serial.printf("[DEV MQTT] command rejected code=%s\n", event.safeCode); break;
             case CommandDiagnosticStage::AcceptedPublished: Serial.println("[DEV MQTT] ACCEPTED published"); break;
             case CommandDiagnosticStage::TerminalPublished:
-                Serial.printf("[DEV MQTT] terminal response %s\n", event.safeCode); break;
+                Serial.printf("[DEV MQTT] terminal response code=%s\n", event.safeCode); break;
         }
     });
 }
