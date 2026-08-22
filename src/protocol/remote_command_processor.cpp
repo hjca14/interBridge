@@ -14,8 +14,14 @@ RemoteCommandProcessor::RemoteCommandProcessor(std::string deviceId,
 
 bool RemoteCommandProcessor::subscribe() {
   return transport_.subscribe(
-      topics_.commands(),
-      [this](const std::string &, const std::string &payload) {
+      topics_.commands(), MqttQos::AtLeastOnce,
+      [this](const std::string &topic, const std::string &payload) {
+        if (topic != topics_.commands() ||
+            payload.size() > kMaxJsonPayloadBytes) {
+          Logger::warn("Remote command rejected before parsing");
+          lastResult_ = CommandPublishResult{};
+          return;
+        }
         lastResult_ = processPayload(payload);
       });
 }

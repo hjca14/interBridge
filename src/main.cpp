@@ -198,7 +198,7 @@ void initializeHardware() {
 }
 
 void initializeNetwork() {
-    Logger::info("Network layer initialized (AWS IoT MQTT/TLS transport not implemented yet)");
+    Logger::info("Network layer initialized (AWS IoT MQTT/mTLS; fail-closed until configured)");
 }
 
 void initializeIntercom() {
@@ -252,6 +252,10 @@ void updateNetwork() {
     }
 
     if (!wifiManager.isConnected()) {
+        if (transport.isConnected()) {
+            transport.disconnect();
+            subscribedToCommands = false;
+        }
         return; // nothing more to do without a network link
     }
 
@@ -304,8 +308,7 @@ void updateNetwork() {
                            MqttQos::AtLeastOnce);
     }
 
-    // AWS IoT Jobs / OTA: currently always a no-op because
-    // Esp32JobsClient and Esp32AwsIotTransport are stubs.
+    // AWS IoT Jobs / OTA remains a no-op because Esp32JobsClient is a stub.
     auto otaResult = jobsCoordinator.pollAndProcess();
     if (otaResult.has_value()) {
         publishProtocolEvent(*otaResult == OtaResult::Success ? ProtocolEventName::OtaCompleted

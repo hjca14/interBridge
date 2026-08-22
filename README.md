@@ -4,8 +4,8 @@ Firmware for **InterBridge**, a bridge between a traditional analog
 intercom and a mobile app, intended to eventually run on an **ESP32-C3**.
 
 This repository currently contains an architectural foundation and a
-first AWS IoT Core integration layer — clean, testable, extensible, but
-**not** a working end-to-end device yet. The control plane is designed
+AWS IoT Core integration layer with a real ESP32 MQTT/mTLS transport, while still
+**not** being a validated end-to-end device. The control plane is designed
 around:
 
 - **MQTT 3.1.1 over TLS to AWS IoT Core**, with mutual TLS (a unique
@@ -25,10 +25,9 @@ around:
 The isolated DEV smoke firmware has now been validated on a real generic
 ESP32-C3 Super Mini against AWS IoT Core. Several production hardware, cloud,
 and protocol decisions have not been made yet,
-and several of the pieces above are real, tested coordinators sitting
-behind interfaces whose ESP32/AWS-side implementation is still a
-documented stub (no MQTT/TLS client, no NTP, no real NVS, no signing
-scheme). See [`CONTEXT.md`](CONTEXT.md) for exactly what is implemented,
+and several of the pieces above remain coordinators behind interfaces. The MQTT/mTLS implementation uses
+`256dpi/MQTT` and `WiFiClientSecure`; production NVS, production SNTP and signing remain
+incomplete. See [`CONTEXT.md`](CONTEXT.md) for exactly what is implemented,
 what is a stub, and what is still open — and
 [`docs/communication-protocol.md`](docs/communication-protocol.md) for
 the full device/cloud protocol specification.
@@ -129,3 +128,31 @@ command subscription, QoS 0 health, safe `OPEN_DOOR` rejection and response,
 and cold-boot reconnection. Transient DNS failures recovered through retry.
 Access-point loss and return while the board stays powered has **not** yet been
 validated.
+
+
+## Phase 2D MQTT command transport
+
+`Esp32AwsIotTransport` now configures the established `256dpi/MQTT` client over
+Arduino `WiFiClientSecure` for AWS IoT Data ATS on port 8883. It uses the provisioned
+`device_id` unchanged as Client ID, explicit 30-second keepalive/1500 ms timeout, no
+custom Last Will, and credentials obtained through `DeviceCredentialStore`. The loop
+only attempts MQTT while Wi-Fi is connected, uses bounded full-jitter backoff, clears
+subscription state on loss, and subscribes once after every connection. Commands are
+accepted only from `interbridge/{device_id}/commands`, QoS 1, without wildcard; payloads
+over 8 KiB are rejected before parsing. Responses use the existing Basic Ingest response
+topic, QoS 1 and `retain=false`.
+
+For a future local physical DEV check, generate the ignored
+`include/interbridge_dev_secrets.h` from the example/generator and provide only local
+values for `<WIFI_SSID>`, `<WIFI_PASSWORD>`,
+`<AWS_IOT_DATA_ATS_ENDPOINT>`, `<DEVICE_ID>`, `<AMAZON_ROOT_CA_PEM>`,
+`<DEVICE_CERTIFICATE_PEM>`, and `<DEVICE_PRIVATE_KEY_PEM>`. Never commit or log that
+file. Missing/inconsistent endpoint, identity, CA, certificate, or key fails closed.
+
+This change was tested only with host fakes and compile checks: Codex made no AWS call,
+published no real MQTT message, performed no provisioning, and flashed no hardware. A
+physical end-to-end validation remains required. `OPEN_DOOR` still emits only `ACCEPTED`
+then `REJECTED/CAPABILITY_DISABLED`; it cannot invoke DTMF, relay, GPIO, key sequences,
+or any physical opening. The app's visual command integration remains disabled until
+API → AWS IoT → ESP32 → Basic Ingest → GET is validated. DTMF, relay, and opening
+configuration remain deferred. Phase 2D is therefore not declared complete.
