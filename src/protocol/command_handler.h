@@ -36,6 +36,11 @@ struct CommandResponses {
     CommandResponse accepted;
     CommandResponse terminal;
     bool hasAccepted = false;
+    // Sanitized DEV diagnostics. These differences deliberately contain no
+    // identifiers or absolute timestamps.
+    bool timeValidationPassed = false;
+    int64_t ageSeconds = 0;
+    int64_t remainingSeconds = 0;
 };
 
 class CommandHandler {

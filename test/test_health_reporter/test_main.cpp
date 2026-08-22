@@ -38,6 +38,22 @@ void test_force_next_publish_overrides_cadence() {
     TEST_ASSERT_TRUE(reporter.isDue(150 + 1000));
 }
 
+void test_interval_is_wraparound_safe() {
+    HealthReporter reporter(32);
+    TEST_ASSERT_TRUE(reporter.isDue(0xfffffff0u));
+    TEST_ASSERT_FALSE(reporter.isDue(0x0000000fu));
+    TEST_ASSERT_TRUE(reporter.isDue(0x00000010u));
+}
+
+void test_failed_publish_policy_does_not_retry_in_a_tight_loop() {
+    HealthReporter reporter(1000);
+    // isDue records an attempt, regardless of transport result supplied by the
+    // caller, so failure cannot produce a publish storm.
+    TEST_ASSERT_TRUE(reporter.isDue(10));
+    TEST_ASSERT_FALSE(reporter.isDue(11));
+    TEST_ASSERT_TRUE(reporter.isDue(1010));
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -46,5 +62,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_not_due_before_interval_elapses);
     RUN_TEST(test_due_once_interval_elapses);
     RUN_TEST(test_force_next_publish_overrides_cadence);
+    RUN_TEST(test_interval_is_wraparound_safe);
+    RUN_TEST(test_failed_publish_policy_does_not_retry_in_a_tight_loop);
     return UNITY_END();
 }

@@ -16,6 +16,7 @@ bool RemoteCommandProcessor::subscribe() {
   return transport_.subscribe(
       topics_.commands(), MqttQos::AtLeastOnce,
       [this](const std::string &topic, const std::string &payload) {
+        if (diagnosticCallback_) diagnosticCallback_({CommandDiagnosticStage::Received});
         if (topic != topics_.commands() ||
             payload.size() > kMaxJsonPayloadBytes) {
           Logger::warn("Remote command rejected before parsing");
@@ -32,11 +33,21 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
   CommandParseResult parsed = parseCommand(payload, deviceId_);
   if (parsed.status != CommandParseStatus::Ok) {
     Logger::warn("Remote command rejected during validation");
+    if (diagnosticCallback_) diagnosticCallback_({CommandDiagnosticStage::Rejected, "MESSAGE_INVALID"});
     return result;
   }
 
   result.parsed = true;
   CommandResponses responses = handler_.handle(parsed.command);
+  if (diagnosticCallback_) {
+    if (responses.timeValidationPassed) {
+      diagnosticCallback_({CommandDiagnosticStage::ValidationPassed, nullptr,
+                           responses.ageSeconds, responses.remainingSeconds});
+    } else if (responses.terminal.error.has_value()) {
+      diagnosticCallback_({CommandDiagnosticStage::Rejected,
+                           toString(responses.terminal.error->code)});
+    }
+  }
   if (responses.hasAccepted) {
     result.acceptedPublished =
         transport_.publish(topics_.responsesIngest(),
@@ -45,6 +56,7 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
       Logger::error("Remote command ACCEPTED response publish failed");
       return result;
     }
+    if (diagnosticCallback_) diagnosticCallback_({CommandDiagnosticStage::AcceptedPublished});
   }
 
   result.terminalPublished =
@@ -53,7 +65,13 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
   if (!result.terminalPublished) {
     Logger::error("Remote command terminal response publish failed");
   }
+  if (diagnosticCallback_) diagnosticCallback_({CommandDiagnosticStage::TerminalPublished,
+      result.terminalPublished ? "ok" : "publish_failed"});
   return result;
+}
+
+void RemoteCommandProcessor::setDiagnosticCallback(CommandDiagnosticCallback callback) {
+  diagnosticCallback_ = std::move(callback);
 }
 
 const CommandPublishResult &RemoteCommandProcessor::lastResult() const {

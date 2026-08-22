@@ -8,14 +8,19 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
+#include <esp_sntp.h>
 #include "interbridge_dev_secrets.h"
 #include "mqtt_smoke_state.h"
 #include "../hardware/clock.h"
+#include "../hardware/ntp_sync_state.h"
 #include "../hardware/gpio.h"
 #include "../hardware/system_control.h"
 #include "../intercom/intercom.h"
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
+#include "../network/health_reporter.h"
+#include "../protocol/messages.h"
+#include "../core/version.h"
 #include "../protocol/command_cache.h"
 #include "../protocol/command_handler.h"
 #include "../protocol/remote_command_processor.h"
@@ -33,8 +38,15 @@ constexpr uint32_t kHeartbeatMs = 15000;
 class NtpClock final : public IClock {
 public:
     uint32_t monotonicMs() const override { return millis(); }
-    bool hasValidTime() const override { return time(nullptr) >= 1700000000; }
-    int64_t unixTimeSeconds() const override { return time(nullptr); }
+    void syncStarted() { syncState_.synchronizationStarted(); }
+    void syncCompleted(uint32_t nowMs) { syncState_.synchronizationCompleted(nowMs); }
+    bool hasValidTime() const override {
+        return syncState_.isTrustworthy(millis(),
+            sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS);
+    }
+    int64_t unixTimeSeconds() const override { return static_cast<int64_t>(time(nullptr)); }
+private:
+    NtpSyncState syncState_;
 };
 class DisabledHardware final : public IHardwareIO {
 public:
@@ -74,6 +86,9 @@ RemoteCommandProcessor processor(INTERBRIDGE_DEV_DEVICE_ID, transport,
 DevMqttSmokeState connectivity;
 uint32_t heartbeatAt = 0;
 bool subscribed = false;
+HealthReporter healthReporter;
+
+void onTimeSynchronized(struct timeval*) { clockSource.syncCompleted(millis()); }
 
 void safeStatus(const char* operation, bool ok) {
     Serial.printf("[DEV MQTT] %s: %s\n", operation, ok ? "ok" : "failed");
@@ -91,11 +106,25 @@ const char* stateName(DevSmokeState state) {
 void heartbeat(uint32_t now) {
     if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
     heartbeatAt = now + kHeartbeatMs;
-    Serial.printf("[DEV MQTT] status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu\n",
+    Serial.printf("[DEV MQTT] local_status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu\n",
                   stateName(connectivity.state()), WiFi.status() == WL_CONNECTED ? "up" : "down",
                   clockSource.hasValidTime() ? "valid" : "pending",
                   transport.isConnected() ? "up" : "down",
                   static_cast<unsigned long>(now / 1000));
+}
+
+void publishHealth(uint32_t now) {
+    if (!subscribed || WiFi.status() != WL_CONNECTED || !clockSource.hasValidTime() ||
+        !transport.isConnected() || !healthReporter.isDue(now)) return;
+    HealthReport health;
+    health.deviceId = INTERBRIDGE_DEV_DEVICE_ID;
+    health.firmwareVersion = FIRMWARE_VERSION;
+    health.intercomState = toString(ProtocolIntercomState::Idle);
+    health.uptimeMs = now;
+    health.wifiRssi = WiFi.RSSI();
+    health.freeHeapBytes = ESP.getFreeHeap();
+    safeStatus("health publish", transport.publish(topics.healthIngest(), health.toJson(),
+                                                    MqttQos::AtMostOnce));
 }
 } // namespace
 
@@ -107,6 +136,21 @@ void setup() {
     Serial.println("[DEV MQTT] local configuration loaded into transient DEV memory (values not logged)");
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
+    sntp_set_time_sync_notification_cb(onTimeSynchronized);
+    processor.setDiagnosticCallback([](const CommandDiagnostic &event) {
+        switch (event.stage) {
+            case CommandDiagnosticStage::Received: Serial.println("[DEV MQTT] command received"); break;
+            case CommandDiagnosticStage::ValidationPassed:
+                Serial.printf("[DEV MQTT] time validation ok age_s=%lld remaining_s=%lld\n",
+                              static_cast<long long>(event.ageSeconds),
+                              static_cast<long long>(event.remainingSeconds)); break;
+            case CommandDiagnosticStage::Rejected:
+                Serial.printf("[DEV MQTT] command rejected code=%s\n", event.safeCode); break;
+            case CommandDiagnosticStage::AcceptedPublished: Serial.println("[DEV MQTT] ACCEPTED published"); break;
+            case CommandDiagnosticStage::TerminalPublished:
+                Serial.printf("[DEV MQTT] terminal response %s\n", event.safeCode); break;
+        }
+    });
 }
 
 void loop() {
@@ -133,6 +177,7 @@ void loop() {
             break;
         }
         case DevSmokeAction::ConfigureTime:
+            clockSource.syncStarted();
             configTime(0, 0, "pool.ntp.org", "time.google.com");
             Serial.println("[DEV MQTT] time sync requested");
             break;
@@ -143,6 +188,7 @@ void loop() {
                 subscribed = processor.subscribe();
                 safeStatus("command QoS1 subscription", subscribed);
                 if (!subscribed) transport.disconnect();
+                else healthReporter.forceNextPublish();
             }
             connectivity.mqttResult(now, connected && subscribed);
             safeStatus("MQTT connect", connected && subscribed);
@@ -151,6 +197,7 @@ void loop() {
         case DevSmokeAction::None: break;
     }
     if (transport.isConnected()) transport.poll();
+    publishHealth(now);
     heartbeat(now);
     delay(10);
 }
