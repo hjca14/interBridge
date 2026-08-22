@@ -37,7 +37,7 @@ public:
     return mqtt_.connect(id.c_str());
   }
   void disconnect() override { mqtt_.disconnect(); }
-  bool connected() const override { return mqtt_.connected(); }
+  bool connected() override { return mqtt_.connected(); }
   bool publish(const std::string &topic, const std::string &payload,
                MqttQos qos, bool retain) override {
     return mqtt_.publish(topic.c_str(), payload.c_str(), retain,
@@ -64,7 +64,7 @@ public:
   void setMessageCallback(MqttMessageCallback) override {}
   bool connect(const std::string &) override { return false; }
   void disconnect() override {}
-  bool connected() const override { return false; }
+  bool connected() override { return false; }
   bool publish(const std::string &, const std::string &, MqttQos,
                bool) override {
     return false;

@@ -36,7 +36,7 @@ public:
   virtual void setMessageCallback(MqttMessageCallback callback) = 0;
   virtual bool connect(const std::string &clientId) = 0;
   virtual void disconnect() = 0;
-  virtual bool connected() const = 0;
+  virtual bool connected() = 0;
   virtual bool publish(const std::string &topic, const std::string &payload,
                        MqttQos qos, bool retain) = 0;
   virtual bool subscribe(const std::string &topic, MqttQos qos) = 0;

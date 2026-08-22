@@ -32,7 +32,7 @@ public:
     return connectResult;
   }
   void disconnect() override { isConnected = false; }
-  bool connected() const override { return isConnected; }
+  bool connected() override { return isConnected; }
   bool publish(const std::string &, const std::string &, MqttQos qos,
                bool retain) override {
     publishedQos = qos;
