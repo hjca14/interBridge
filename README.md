@@ -116,8 +116,11 @@ still needs manual validation on real hardware — see
 ## Controlled DEV MQTT smoke firmware
 
 A separate `esp32-c3-dev-mqtt` PlatformIO environment now provides a guarded,
-non-actuating MQTT/mTLS bench harness. It does not replace production transport
-or provisioning. See [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)
+non-actuating MQTT/mTLS bench harness. The earlier harness used a parallel
+MQTT/TLS client and `DevMqttSmokeHandler`; it did not validate the production
+classes added in PR #6. The corrected harness composes `Esp32AwsIotTransport`,
+`RemoteCommandProcessor`, deduplication, and the fail-closed `CommandHandler`.
+It does not replace production provisioning. See [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)
 for scope, local placeholder configuration, safety constraints, and PC/ESP32
 steps. The ordinary `esp32-c3` entry point remains `src/main.cpp` and requires no
 DEV secrets header.
@@ -155,4 +158,5 @@ physical end-to-end validation remains required. `OPEN_DOOR` still emits only `A
 then `REJECTED/CAPABILITY_DISABLED`; it cannot invoke DTMF, relay, GPIO, key sequences,
 or any physical opening. The app's visual command integration remains disabled until
 API → AWS IoT → ESP32 → Basic Ingest → GET is validated. DTMF, relay, and opening
-configuration remain deferred. Phase 2D is therefore not declared complete.
+configuration, production NVS, provisioning, and onboarding remain deferred. Phase 2D
+cannot be declared validated until the complete real-device path is tested.

@@ -5,11 +5,14 @@
 `esp32-c3-dev-mqtt` is a separate, guarded bench firmware for DEV AWS IoT
 Core validation. It is **not production provisioning**. It connects Wi-Fi,
 synchronizes UTC with NTP, opens MQTT 3.1.1/mTLS on port 8883, and reconnects
-with capped exponential delay. It never constructs `CommandHandler`, GPIO,
-system reset, BLE, Fleet Provisioning, Shadow, or Jobs objects. Every parsed
-command is rejected; no physical action is possible through this entry point.
+with capped exponential delay. MQTT connect, subscribe, poll, disconnect, and
+publish all pass through `Esp32AwsIotTransport`. Commands pass through
+`RemoteCommandProcessor`, existing deduplication, and `CommandHandler`; the door
+capability and DEV hardware/system-control implementations are non-actuating.
 
-Production `Esp32AwsIotTransport`, BLE provisioning, NVS credential persistence,
+PR #6 implemented and compiled `Esp32AwsIotTransport`, but the old physical harness
+still instantiated its own MQTT/TLS stack and `DevMqttSmokeHandler`. This correction
+removes that parallel path. BLE provisioning, production NVS credential persistence,
 on-device private-key/CSR generation and Fleet Provisioning transports remain
 stubs. Basic Ingest rules arrive in backend Phase 1E, so successful QoS
 acknowledgment does not imply persistence. Phase 1D is complete only for the
@@ -24,10 +27,7 @@ DEV uses only these explicit rule names:
 - `interbridge_dev_response_rule`
 
 For local `device_id`, the harness subscribes only to
-`interbridge/{device_id}/commands` at QoS 1. It publishes non-retained health at
-QoS 0 (and any optional safe diagnostic event at QoS 1) to
-`$aws/rules/interbridge_dev_ingest_rule/interbridge/{device_id}/...`
-and non-retained responses to
+`interbridge/{device_id}/commands` at QoS 1. It publishes responses only to
 `$aws/rules/interbridge_dev_response_rule/interbridge/{device_id}/responses`.
 Command responses use QoS 1. ClientId is exactly `device_id`. No mirror or diagnostic topic exists.
 The harness does not access Shadow or Jobs.
@@ -51,10 +51,10 @@ clean session, no Last Will, and `retain=false` for every publish.
 4. Attach the serial monitor. Logs contain operation status and credential
    presence only, never secret values or command payloads.
 5. Send a protocol-v1 command on that exact device's commands topic and verify a
-   protocol-v1 `REJECTED` response. Before NTP is trustworthy it returns
-   `CLOCK_NOT_TRUSTWORTHY`; malformed, oversized, version, and timestamp errors
-   use their canonical errors; an otherwise valid command returns
-   `COMMAND_NOT_ALLOWED`.
+   protocol-v1 `ACCEPTED` followed by `REJECTED/CAPABILITY_DISABLED`. Verify no
+   `COMPLETED`, `DOOR_OPENED`, DTMF, GPIO, relay, pulse, key, restart, or remote
+   provisioning action. Also exercise invalid clock, expiry, oversize, wrong-topic,
+   duplicate, publish-failure, disconnect/reconnect, and one resubscribe per connection.
 6. In a future bench session, interrupt and restore the access point while the
    board remains powered; that specific recovery scenario is not yet validated.
 
@@ -75,6 +75,12 @@ connection is attempted, no hardware is flashed, and no GitHub secrets are
 used.
 
 ## Real bench result
+
+The result below is historical: it exercised the removed parallel handler, not the
+PR #6 transport/processor composition. Codex made no AWS call, published no real MQTT
+message, and flashed no board for this correction. The corrected harness still requires
+a complete physical validation whose expected result is ordered `ACCEPTED` then
+`REJECTED/CAPABILITY_DISABLED` through Basic Ingest.
 
 A generic 4 MB ESP32-C3 Super Mini (PlatformIO 6.1.18, temporary compatible
 `esp32-c3-devkitm-1` definition) validated build/upload, native USB CDC with

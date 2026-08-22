@@ -6,19 +6,27 @@
 #endif
 
 #include <Arduino.h>
-#include <MQTT.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <time.h>
 #include "interbridge_dev_secrets.h"
-#include "mqtt_smoke_handler.h"
 #include "mqtt_smoke_state.h"
+#include "../hardware/clock.h"
+#include "../hardware/gpio.h"
+#include "../hardware/system_control.h"
+#include "../intercom/intercom.h"
 #include "../network/mqtt_topics.h"
+#include "../network/mqtt_transport.h"
+#include "../protocol/command_cache.h"
+#include "../protocol/command_handler.h"
+#include "../protocol/remote_command_processor.h"
+#include "../storage/credential_store.h"
+#include "../storage/memory_store.h"
 
 namespace {
 using namespace interbridge;
 constexpr uint16_t kMqttPort = 8883;
-constexpr size_t kMqttBufferBytes = kMaxJsonPayloadBytes + 1024;
+constexpr uint16_t kMqttKeepAliveSeconds = 300;
+constexpr uint16_t kMqttTimeoutMs = 1000;
 constexpr uint32_t kSerialWaitMs = 1500;
 constexpr uint32_t kHeartbeatMs = 15000;
 
@@ -28,35 +36,48 @@ public:
     bool hasValidTime() const override { return time(nullptr) >= 1700000000; }
     int64_t unixTimeSeconds() const override { return time(nullptr); }
 };
+class DisabledHardware final : public IHardwareIO {
+public:
+    bool readLineState() override { return false; }
+    bool setDoorOutput(bool) override { return false; }
+};
+class DisabledSystemControl final : public ISystemControl {
+public:
+    void restart() override {}
+};
 
-WiFiClientSecure tls;
-MQTTClient mqtt(kMqttBufferBytes);
+AwsIotConnectionConfig connectionConfig() {
+    AwsIotConnectionConfig config;
+    config.endpoint = INTERBRIDGE_DEV_AWS_ENDPOINT;
+    config.rootCaPem = INTERBRIDGE_DEV_ROOT_CA_PEM;
+    config.port = kMqttPort;
+    config.keepAliveSeconds = kMqttKeepAliveSeconds;
+    config.timeoutMs = kMqttTimeoutMs;
+    return config;
+}
+
 NtpClock clockSource;
+// DEV-only transient composition: credentials and deduplication do not survive
+// reboot. Production NVS and provisioning remain separate and pending.
+MemoryStore devStore;
+DeviceCredentialStore credentials(devStore);
+InMemoryDedupCache dedupCache;
+DisabledHardware hardware;
+Intercom intercom(hardware);
+DisabledSystemControl systemControl;
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
-DevMqttSmokeHandler handler(INTERBRIDGE_DEV_DEVICE_ID, clockSource);
+Esp32AwsIotTransport transport(connectionConfig(), credentials);
+CommandHandler commandHandler(INTERBRIDGE_DEV_DEVICE_ID, clockSource, dedupCache,
+                              intercom, systemControl);
+RemoteCommandProcessor processor(INTERBRIDGE_DEV_DEVICE_ID, transport,
+                                 commandHandler, topics);
 DevMqttSmokeState connectivity;
 uint32_t heartbeatAt = 0;
-bool mqttConfigured = false;
+bool subscribed = false;
 
 void safeStatus(const char* operation, bool ok) {
     Serial.printf("[DEV MQTT] %s: %s\n", operation, ok ? "ok" : "failed");
 }
-
-void onMessage(String& topic, String& payload) {
-    if (topic != topics.commands().c_str()) return;
-    const CommandResponse response = handler.handle(std::string(payload.c_str(), payload.length()));
-    safeStatus("response publish", mqtt.publish(topics.responsesIngest().c_str(), response.toJson().c_str(),
-                                                kDevSmokeRetain, kDevSmokeResponsePublishQos));
-}
-
-void onConnected() {
-    safeStatus("command QoS1 subscription",
-               mqtt.subscribe(topics.commands().c_str(), kDevSmokeCommandSubscribeQos));
-    HealthReport health{INTERBRIDGE_DEV_DEVICE_ID, "dev-mqtt-smoke", "IDLE", millis(), WiFi.RSSI(), ESP.getFreeHeap()};
-    safeStatus("health QoS0 publish", mqtt.publish(topics.healthIngest().c_str(), health.toJson().c_str(),
-                                                   kDevSmokeRetain, kDevSmokeHealthPublishQos));
-}
-
 const char* stateName(DevSmokeState state) {
     switch (state) {
         case DevSmokeState::WaitingForWifi: return "wifi";
@@ -67,13 +88,14 @@ const char* stateName(DevSmokeState state) {
     }
     return "unknown";
 }
-
 void heartbeat(uint32_t now) {
     if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
     heartbeatAt = now + kHeartbeatMs;
-    Serial.printf("[DEV MQTT] status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu\n", stateName(connectivity.state()),
-                  WiFi.status() == WL_CONNECTED ? "up" : "down", clockSource.hasValidTime() ? "valid" : "pending",
-                  mqtt.connected() ? "up" : "down", static_cast<unsigned long>(now / 1000));
+    Serial.printf("[DEV MQTT] status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu\n",
+                  stateName(connectivity.state()), WiFi.status() == WL_CONNECTED ? "up" : "down",
+                  clockSource.hasValidTime() ? "valid" : "pending",
+                  transport.isConnected() ? "up" : "down",
+                  static_cast<unsigned long>(now / 1000));
 }
 } // namespace
 
@@ -81,20 +103,22 @@ void setup() {
     Serial.begin(115200);
     const uint32_t serialDeadline = millis() + kSerialWaitMs;
     while (!Serial && !DevMqttSmokeState::deadlineReached(millis(), serialDeadline)) delay(10);
-    Serial.println("[DEV MQTT] controlled smoke harness; physical actions disabled");
-    Serial.println("[DEV MQTT] local Wi-Fi/TLS credentials configured (values not logged)");
-    tls.setCACert(INTERBRIDGE_DEV_ROOT_CA_PEM);
-    tls.setCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
-    tls.setPrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
-    mqtt.onMessage(onMessage);
+    Serial.println("[DEV MQTT] production-path harness; physical actions disabled");
+    Serial.println("[DEV MQTT] local configuration loaded into transient DEV memory (values not logged)");
+    credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
+    credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
 }
 
 void loop() {
     const uint32_t now = millis();
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    if (!wifiConnected && mqtt.connected()) mqtt.disconnect();
+    if ((!wifiConnected || !clockSource.hasValidTime()) && transport.isConnected()) {
+        transport.disconnect();
+        subscribed = false;
+    }
+    if (!transport.isConnected()) subscribed = false;
 
-    switch (connectivity.update(now, wifiConnected, clockSource.hasValidTime(), mqtt.connected())) {
+    switch (connectivity.update(now, wifiConnected, clockSource.hasValidTime(), transport.isConnected())) {
         case DevSmokeAction::ConnectWifi:
             WiFi.mode(WIFI_STA);
             WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
@@ -102,8 +126,7 @@ void loop() {
             break;
         case DevSmokeAction::ResolveDns: {
             IPAddress resolved;
-            const IPAddress dns = WiFi.dnsIP();
-            const bool networkReady = dns != IPAddress() && WiFi.localIP() != IPAddress();
+            const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
             const bool resolvedOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
             connectivity.dnsResult(now, resolvedOk);
             Serial.printf("[DEV MQTT] DNS: %s\n", resolvedOk ? "ready" : "pending");
@@ -114,20 +137,20 @@ void loop() {
             Serial.println("[DEV MQTT] time sync requested");
             break;
         case DevSmokeAction::ConnectMqtt: {
-            if (!mqttConfigured) {
-                mqtt.begin(INTERBRIDGE_DEV_AWS_ENDPOINT, kMqttPort, tls);
-                mqtt.setOptions(300, true, 1000); // keepalive, clean session, timeout
-                mqttConfigured = true;
+            const bool connected = clockSource.hasValidTime() &&
+                transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
+            if (connected) {
+                subscribed = processor.subscribe();
+                safeStatus("command QoS1 subscription", subscribed);
+                if (!subscribed) transport.disconnect();
             }
-            const bool connected = mqtt.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID).c_str());
-            connectivity.mqttResult(now, connected);
-            safeStatus("MQTT connect", connected);
-            if (connected) onConnected();
+            connectivity.mqttResult(now, connected && subscribed);
+            safeStatus("MQTT connect", connected && subscribed);
             break;
         }
         case DevSmokeAction::None: break;
     }
-    if (mqtt.connected()) mqtt.loop();
+    if (transport.isConnected()) transport.poll();
     heartbeat(now);
     delay(10);
 }
