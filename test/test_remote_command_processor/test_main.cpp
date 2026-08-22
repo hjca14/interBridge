@@ -101,6 +101,10 @@ void test_valid_open_door_publishes_accepted_then_capability_disabled() {
   TEST_ASSERT_NOT_NULL(
       strstr(fixture.transport.publishedMessages()[1].payload.c_str(),
              "CAPABILITY_DISABLED"));
+  TEST_ASSERT_NULL(strstr(
+      fixture.transport.publishedMessages()[0].payload.c_str(), "COMPLETED"));
+  TEST_ASSERT_NULL(strstr(
+      fixture.transport.publishedMessages()[1].payload.c_str(), "COMPLETED"));
   TEST_ASSERT_EQUAL(0, fixture.hardware.doorOutputCalls);
   TEST_ASSERT_EQUAL(0, fixture.systemControl.restartCount());
 }
@@ -253,11 +257,28 @@ void test_exact_topic_qos_callback_and_resubscription() {
   TEST_ASSERT_EQUAL(
       static_cast<int>(MqttQos::AtLeastOnce),
       static_cast<int>(fixture.transport.publishedMessages()[0].qos));
+  TEST_ASSERT_FALSE(fixture.transport.publishedMessages()[0].retain);
+  TEST_ASSERT_EQUAL(static_cast<int>(MqttQos::AtLeastOnce),
+                    static_cast<int>(fixture.transport.subscriptions()[0].qos));
+  TEST_ASSERT_EQUAL(std::string::npos, fixture.topics.commands().find('#'));
+  TEST_ASSERT_EQUAL(std::string::npos, fixture.topics.commands().find('+'));
   fixture.transport.disconnect();
   TEST_ASSERT_EQUAL(0, fixture.transport.subscriptionCount());
   fixture.transport.connect(kDeviceId);
   TEST_ASSERT_TRUE(fixture.processor.subscribe());
   TEST_ASSERT_EQUAL(1, fixture.transport.subscriptionCount());
+}
+
+void test_oversized_and_wrong_topic_messages_never_reach_processor() {
+  Fixture fixture;
+  TEST_ASSERT_TRUE(fixture.processor.subscribe());
+  fixture.transport.deliver(fixture.topics.commands(),
+                            std::string(kMaxJsonPayloadBytes + 1, 'x'));
+  fixture.transport.deliver(
+      "interbridge/ib-ffffffffffffffffffffffffffffffff/commands",
+      commandJson());
+  TEST_ASSERT_FALSE(fixture.processor.lastResult().parsed);
+  TEST_ASSERT_EQUAL(0, fixture.transport.publishedMessages().size());
 }
 
 void test_logs_never_contain_raw_payload_or_identifiers() {
@@ -287,6 +308,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_physical_fields_are_rejected);
   RUN_TEST(test_publish_failures_are_observable);
   RUN_TEST(test_exact_topic_qos_callback_and_resubscription);
+  RUN_TEST(test_oversized_and_wrong_topic_messages_never_reach_processor);
   RUN_TEST(test_logs_never_contain_raw_payload_or_identifiers);
   return UNITY_END();
 }

@@ -1597,3 +1597,24 @@ Reserved
 ```
 
 Defining this document does not mean AWS connectivity, provisioning, OTA, BLE, or physical hardware behavior is already implemented or validated.
+
+
+## Phase 2D concrete ESP32 transport profile
+
+The ESP32 implementation uses MQTT 3.1.1 through `256dpi/MQTT` and mTLS through
+`WiFiClientSecure`, connecting directly to the locally configured AWS IoT Data ATS
+endpoint (never `DescribeEndpoint`). Client ID is exactly `device_id`. Keepalive is 30 s
+and client timeout is 1500 ms; no custom Last Will is set. It subscribes only to
+`interbridge/{device_id}/commands` at QoS 1, with no wildcard, and rejects wrong-topic
+or greater-than-8-KiB deliveries before protocol parsing. Command results publish to
+the existing Basic Ingest response topic at QoS 1 with retain disabled. Reconnection is
+Wi-Fi-gated and non-blocking with bounded exponential full jitter, and each new session
+gets one subscription attempt (a failed subscription remains fail-closed and can be
+retried by the loop without duplicating a successful subscription).
+
+Credential PEM values are read only through `DeviceCredentialStore`; errors are
+sanitized and raw payloads and private keys are never logged. DEV inputs live only in
+the Git-ignored local header documented in the README. No real AWS/physical validation
+was performed for this code change. `OPEN_DOOR` remains a deliberately non-actuating
+`ACCEPTED` followed by `REJECTED/CAPABILITY_DISABLED`; `COMPLETED` and physical action
+statuses are forbidden in this phase.

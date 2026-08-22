@@ -62,7 +62,7 @@ src/
 │   ├── wifi.h/.cpp            IWifiConnection + WifiManager (Arduino) + fake.
 │   ├── wifi_fake.cpp          FakeWifiConnection (native-safe, separate TU - see below).
 │   ├── mqtt_topics.h/.cpp     Central builder for every MQTT topic used.
-│   ├── mqtt_transport.h/.cpp  IDeviceTransport (MQTT pub/sub) + stub/fake.
+│   ├── mqtt_transport.h/.cpp  IDeviceTransport + real 256dpi/MQTT/WiFiClientSecure adapter + fake.
 │   ├── reconnect_manager.h/.cpp  Non-blocking exponential backoff + full jitter.
 │   ├── health_reporter.h/.cpp    Health/Shadow publish cadence.
 │   └── protocol.h/.cpp        Legacy ICommunicationProtocol/NullProtocol - superseded, unused by main.cpp.
@@ -102,7 +102,7 @@ strategy below.
    └──────────────────────────────────────────────────────────┘
                         │
                         ▼
-              ESP32-C3 / Arduino / AWS IoT SDK APIs (none wired up yet)
+              ESP32-C3 / Arduino APIs (MQTT/mTLS wired; other platform adapters may remain stubs)
 ```
 
 `core/`, `intercom/`, `audio/`, `protocol/`, `provisioning/`, `aws/` and
@@ -344,8 +344,8 @@ plus new ones from this pass:)*
   strictly parses the device-scoped command payload, delegates to
   `CommandHandler`, and publishes its two logical responses through
   `IDeviceTransport` at QoS 1. Native tests use only `FakeDeviceTransport`.
-  `Esp32AwsIotTransport` remains an honest production stub, so this layer does
-  not demonstrate a real AWS subscription or publication.
+  `Esp32AwsIotTransport` now uses the injected MQTT/mTLS adapter; offline tests
+  demonstrate its contract, but no real AWS subscription/publication was executed in this change.
 - **Door-open capability is explicit:** `Disabled` is the default and only
   operational Phase 2D mode. `Dtmf` and `Relay` are reserved names without
   sequence, key, GPIO, pulse, or physical implementation. A valid request is
@@ -405,3 +405,17 @@ firmware excludes it. Its dependency boundary ends at Wi-Fi/TLS/MQTT, the shared
 `DevMqttSmokeHandler`. It intentionally cannot reach intercom GPIO, restart,
 factory reset, BLE/Fleet Provisioning, Shadow, or Jobs. Manual ignored DEV
 credentials are an integration-test exception, not production architecture.
+
+
+## MQTT/mTLS command lifecycle (Phase 2D)
+
+The composition root retains the existing layering: Wi-Fi readiness gates MQTT;
+`ReconnectManager` supplies non-blocking bounded exponential full jitter; a successful
+connection resets the backoff and causes exactly one QoS 1 subscription through
+`RemoteCommandProcessor`. Disconnecting clears both transport callback and composition
+subscription state. `IMqttClient` is the native-test seam; the ESP32 adapter delegates
+TLS to `WiFiClientSecure` and MQTT 3.1.1 to `256dpi/MQTT`, rather than implementing either.
+The inbound boundary checks the exact `MqttTopics::commands()` value and 8 KiB limit
+before the existing parser/handler. Outbound command results use only
+`MqttTopics::responsesIngest()`, QoS 1, `retain=false`. No LWT is configured. Failure at
+configuration, connect, subscribe, validation, or publish remains fail-closed.

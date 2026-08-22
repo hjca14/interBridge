@@ -151,7 +151,7 @@ module - see also the Tests section for exactly what was verified.)*
   `IClock::monotonicMs()`).
 - **MQTT transport**: `network/mqtt_transport.h` - `IDeviceTransport`,
   `FakeDeviceTransport` (**implemented**, used in tests), `Esp32AwsIotTransport`
-  (**stub** - no MQTT/TLS client library chosen/wired yet).
+  (**implemented** with `256dpi/MQTT` + `WiFiClientSecure`, locally configured ATS endpoint and credentials).
 - **Protocol messages**: `protocol/messages.h` - `DeviceEvent`,
   `HealthReport`, `CommandResponse`, `DeviceCommand`+`parseCommand()`
   (**implemented** via ArduinoJson: 8 KiB size limit, protocol_version
@@ -804,7 +804,7 @@ Implemented:
   `provisioning_manager.*`, `fleet_provisioning.*`,
   `factory_reset_coordinator.*`.
 - `network/mqtt_topics.*`, `reconnect_manager.*`, `mqtt_transport.*`
-  (`Esp32AwsIotTransport` stub), `health_reporter.*`. `network/wifi.h`
+  (`Esp32AwsIotTransport` was a stub in that pass), `health_reporter.*`. `network/wifi.h`
   changed to expose `IWifiConnection`; added `network/wifi_fake.cpp`.
 - `protocol/messages.*`, `command_cache.*`, `command_handler.*`,
   `event_outbox.*`.
@@ -1039,8 +1039,8 @@ and does not supersede production key generation and provisioning.
 The backend portion of Phase 2D is implemented and awaits deployment and
 validation. This firmware pass adds only the strict semantic parser, explicit
 remote allowlist, persistent deduplication flow, and logical response publishing
-through `IDeviceTransport`. Production `Esp32AwsIotTransport` remains stubbed;
-no production AWS MQTT subscribe or publish has been implemented or validated.
+through `IDeviceTransport`. At that pass, production `Esp32AwsIotTransport` remained stubbed;
+the 2026-08-22 continuation below implements it, without real AWS validation.
 
 The future command topic is `interbridge/{device_id}/commands` at QoS 1 without
 wildcards. The strict payload requires protocol version 1, the exact local
@@ -1062,3 +1062,23 @@ subscription, callback delivery, QoS 1 responses, observable publish failures,
 and required resubscription after reconnect. These tests do not prove real AWS
 connectivity. The pre-change inventory was 28 test files and 170 tests; this
 pass preserves every suite and adds a new suite rather than replacing one.
+
+
+## Phase 2D transport continuation (2026-08-22)
+
+The production `Esp32AwsIotTransport` is no longer a stub: it delegates MQTT/TLS to
+`256dpi/MQTT` and `WiFiClientSecure`, validates ATS endpoint and `ib-<32hex>` identity,
+loads certificate/key solely through `DeviceCredentialStore`, uses explicit short DEV
+keepalive/timeout, and exposes an injected `IMqttClient` seam for offline tests. Existing
+`RemoteCommandProcessor`, `CommandHandler`, persistent deduplication, `MqttTopics`, and
+fail-closed policy were preserved. Exact-topic QoS 1 command subscription, pre-parser
+8-KiB rejection, Basic Ingest QoS 1/non-retained response publication, Wi-Fi gating,
+bounded jitter backoff, and reconnect subscription reset are explicit.
+
+No AWS call, MQTT publication, certificate operation, provisioning, firmware flash, or
+physical action was performed by Codex. The transport is compile/native-tested only.
+Production NVS/SNTP/provisioning limitations still prevent claiming end-to-end completion.
+Future hardware validation must observe `ACCEPTED` then
+`REJECTED/CAPABILITY_DISABLED` through API → IoT → ESP32 → Basic Ingest → GET. The app
+command UI remains disabled; DTMF, relay/GPIO/key sequences and opening configuration
+remain deferred.
