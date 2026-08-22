@@ -400,11 +400,13 @@ re-established in order. This remains isolated from the still-stubbed production
 transport architecture.
 
 `src/dev/mqtt_smoke_main.cpp` is compiled only by `esp32-c3-dev-mqtt`; the normal
-firmware excludes it. Its dependency boundary ends at Wi-Fi/TLS/MQTT, the shared
-`MqttTopics` builder, protocol serialization/parser, and a non-actuating
-`DevMqttSmokeHandler`. It intentionally cannot reach intercom GPIO, restart,
-factory reset, BLE/Fleet Provisioning, Shadow, or Jobs. Manual ignored DEV
-credentials are an integration-test exception, not production architecture.
+firmware excludes it. PR #6 implemented and compiled the real transport, but the
+previous harness bypassed it with direct MQTT/TLS objects and a parallel handler.
+The corrected composition uses `Esp32AwsIotTransport`, `RemoteCommandProcessor`,
+the existing deduplication, and `CommandHandler` with capability disabled. Its
+hardware and system-control dependencies are explicitly non-actuating. Ignored DEV
+credentials live only in a transient `MemoryStore`; this is not reboot persistence.
+Production NVS, BLE/Fleet Provisioning, and onboarding remain pending.
 
 
 ## MQTT/mTLS command lifecycle (Phase 2D)

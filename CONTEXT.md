@@ -1082,3 +1082,18 @@ Future hardware validation must observe `ACCEPTED` then
 `REJECTED/CAPABILITY_DISABLED` through API → IoT → ESP32 → Basic Ingest → GET. The app
 command UI remains disabled; DTMF, relay/GPIO/key sequences and opening configuration
 remain deferred.
+
+## Phase 2D DEV harness correction (2026-08-22)
+
+PR #6 implemented and compiled `Esp32AwsIotTransport`, but its physical DEV entrypoint
+still used direct MQTT/TLS objects and `DevMqttSmokeHandler`. The corrected harness now
+loads the ignored local certificate/key into an explicitly transient `MemoryStore` and
+composes `Esp32AwsIotTransport` -> `RemoteCommandProcessor` -> existing deduplication ->
+`CommandHandler` with capability `Disabled`. Safe DEV hardware and system-control
+implementations cannot actuate or restart. The old parallel handler was removed.
+
+Codex performed no AWS call, MQTT publication, certificate operation, firmware flash, or
+physical validation. Production NVS, Fleet Provisioning, BLE/onboarding, and the main
+firmware's incomplete configuration remain unchanged. The required future physical
+result is ordered `ACCEPTED` then `REJECTED/CAPABILITY_DISABLED` through Basic Ingest;
+Phase 2D remains unvalidated until that complete real-device test passes.

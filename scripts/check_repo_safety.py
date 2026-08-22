@@ -78,6 +78,26 @@ def main() -> int:
     if 'R\"' in generator or "@'" in generator or '@"' in generator:
         failures.append("DEV header generator must not emit multiline raw/here strings")
 
+    dev_entrypoint = Path("src/dev/mqtt_smoke_main.cpp").read_text()
+    required_dev_composition = (
+        "Esp32AwsIotTransport transport",
+        "RemoteCommandProcessor processor",
+        "CommandHandler commandHandler",
+        "DeviceCredentialStore credentials",
+        "transport.poll()",
+        "processor.subscribe()",
+    )
+    forbidden_dev_composition = (
+        "MQTTClient",
+        "WiFiClientSecure",
+        "DevMqttSmokeHandler",
+        "mqtt_smoke_handler",
+    )
+    if any(fragment not in dev_entrypoint for fragment in required_dev_composition):
+        failures.append("DEV entrypoint is missing the production MQTT command composition")
+    if any(fragment in dev_entrypoint for fragment in forbidden_dev_composition):
+        failures.append("DEV entrypoint contains a forbidden parallel MQTT implementation")
+
     if failures:
         print("Repository credential safety check failed:", file=sys.stderr)
         for failure in failures:
