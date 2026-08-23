@@ -18,6 +18,7 @@ public:
     void mqttResult(uint32_t nowMs, bool success);
     DevSmokeState state() const;
     uint32_t retryDelayMs() const;
+    uint32_t retryAtMs() const;
 
     static bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs);
 

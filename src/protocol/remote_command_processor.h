@@ -2,6 +2,7 @@
 
 #include <string>
 #include <functional>
+#include <deque>
 
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
@@ -30,6 +31,10 @@ public:
                          CommandHandler &handler, MqttTopics topics);
 
   bool subscribe();
+  // MQTT callbacks execute inside the client's poll() call.  Processing a
+  // command there would publish recursively through the same client and can
+  // deadlock its socket/TLS state. Drain commands from the main loop instead.
+  void processPending();
   CommandPublishResult processPayload(const std::string &payload);
   const CommandPublishResult &lastResult() const;
   void setDiagnosticCallback(CommandDiagnosticCallback callback);
@@ -40,6 +45,7 @@ private:
   CommandHandler &handler_;
   MqttTopics topics_;
   CommandPublishResult lastResult_;
+  std::deque<std::string> pendingPayloads_;
   CommandDiagnosticCallback diagnosticCallback_;
 };
 

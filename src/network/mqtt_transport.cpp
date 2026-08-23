@@ -1,6 +1,7 @@
 #include "mqtt_transport.h"
 
 #include "../core/logger.h"
+#include <algorithm>
 #include <cctype>
 
 #ifdef ARDUINO
@@ -21,6 +22,10 @@ public:
     tls_.setCACert(ca.c_str());
     tls_.setCertificate(cert.c_str());
     tls_.setPrivateKey(key.c_str());
+    // WiFiClientSecure otherwise inherits a long/default stream timeout.  All
+    // TLS reads and writes must return so the loop watchdog can be serviced.
+    tls_.setTimeout(timeout);
+    tls_.setHandshakeTimeout(std::max<uint16_t>(1, (timeout + 999) / 1000));
     mqtt_.begin(endpoint.c_str(), port, tls_);
     mqtt_.setOptions(keepAlive, true, timeout);
     return true;

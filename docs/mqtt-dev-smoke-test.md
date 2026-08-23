@@ -55,6 +55,21 @@ retained-message selection, clean sessions, and configurable keepalive/buffer.
 The harness uses a buffer above the protocol's 8 KiB ceiling, keepalive 300,
 clean session, no Last Will, and `retain=false` for every publish.
 
+MQTT receive callbacks only validate and enqueue commands. The main loop drains
+that bounded queue after `MQTTClient::loop()` returns, so command responses never
+recursively publish while the MQTT/TLS client is dispatching an inbound packet.
+TLS stream/handshake operations use the configured one-second timeout. A task
+watchdog is fed only after the complete loop (including network work) returns.
+
+The local heartbeat reports current state plus free/minimum heap and remaining
+loop-task stack. Boot diagnostics report the previous reset reason, persistent
+boot count, and only whether Wi-Fi configuration is present. Wi-Fi driver events
+include disconnect reason codes. Each expired Wi-Fi attempt is explicitly torn
+down before one new `WiFi.begin()`, with capped backoff and the next deadline
+logged. Ten continuous minutes without full Wi-Fi/MQTT recovery triggers a
+controlled restart as a last resort; a call stuck inside the network stack is
+recovered sooner by the watchdog.
+
 ## Local credentials and build
 
 1. Keep `endpoint.txt`, `AmazonRootCA1.pem`, `device-certificate.pem.crt`,

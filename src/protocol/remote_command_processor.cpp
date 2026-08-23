@@ -4,6 +4,9 @@
 #include "messages.h"
 
 namespace interbridge {
+namespace {
+constexpr size_t kMaxPendingCommands = 4;
+}
 
 RemoteCommandProcessor::RemoteCommandProcessor(std::string deviceId,
                                                IDeviceTransport &transport,
@@ -23,8 +26,19 @@ bool RemoteCommandProcessor::subscribe() {
           lastResult_ = CommandPublishResult{};
           return;
         }
-        lastResult_ = processPayload(payload);
+        if (pendingPayloads_.size() >= kMaxPendingCommands) {
+          Logger::warn("Remote command queue full; command dropped");
+          return;
+        }
+        pendingPayloads_.push_back(payload);
       });
+}
+
+void RemoteCommandProcessor::processPending() {
+  if (pendingPayloads_.empty()) return;
+  std::string payload = std::move(pendingPayloads_.front());
+  pendingPayloads_.pop_front();
+  lastResult_ = processPayload(payload);
 }
 
 CommandPublishResult

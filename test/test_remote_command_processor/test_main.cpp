@@ -268,6 +268,10 @@ void test_exact_topic_qos_callback_and_resubscription() {
 
   fixture.transport.deliver(fixture.topics.commands(), commandJson());
 
+  // Delivery is the MQTT callback context: publishing here would recursively
+  // enter the same client and previously could wedge its TLS socket.
+  TEST_ASSERT_EQUAL(0, fixture.transport.publishedMessages().size());
+  fixture.processor.processPending();
   TEST_ASSERT_TRUE(fixture.processor.lastResult().terminalPublished);
   TEST_ASSERT_EQUAL_STRING(
       "interbridge/ib-0123456789abcdef0123456789abcdef/commands",
