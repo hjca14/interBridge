@@ -13,6 +13,16 @@ namespace {
 #ifdef ARDUINO
 constexpr uint32_t kTlsHandshakeTimeoutSeconds = 10;
 
+// 256dpi/MQTT already calls Client::stop() internally on a failed
+// publish/subscribe/keepalive (see MQTTClient::close()), but that leaves the
+// *same* WiFiClientSecure object/socket in place. Reusing the identical
+// object across a broken session is what produces
+// "[E][WiFiClient.cpp] setSocketOption(): fail on ... Bad file number" on
+// the next connect() attempt: a stale fd/session lingers inside the
+// WiFiClientSecure/mbedTLS session state even after stop(). Allocating a
+// fresh WiFiClientSecure per connection attempt (instead of stop()+reconnect
+// on the same instance) is the documented workaround for this ESP32 Arduino
+// core quirk and is what actually avoids reusing an invalid socket.
 class ArduinoMqttClient final : public IMqttClient {
 public:
   ArduinoMqttClient() : mqtt_(9216) {}
@@ -20,18 +30,26 @@ public:
                     const std::string &ca, const std::string &cert,
                     const std::string &key, uint16_t keepAlive,
                     uint16_t timeout) override {
-    tls_.setCACert(ca.c_str());
-    tls_.setCertificate(cert.c_str());
-    tls_.setPrivateKey(key.c_str());
+    // Tear down the *previous* session (if any) while tls_ is still valid,
+    // before allocating its replacement below.
+    teardownSocket();
+    auto freshTls = std::unique_ptr<WiFiClientSecure>(new WiFiClientSecure());
+    freshTls->setCACert(ca.c_str());
+    freshTls->setCertificate(cert.c_str());
+    freshTls->setPrivateKey(key.c_str());
     // WiFiClientSecure otherwise inherits a long/default stream timeout. Keep
     // individual TLS reads and writes bounded so the main loop remains live.
-    tls_.setTimeout(timeout);
+    freshTls->setTimeout(timeout);
     // TLS negotiation can legitimately take several seconds on a congested
     // link. Keep it bounded without applying the shorter stream timeout to the
     // complete AWS IoT handshake.
-    tls_.setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
-    mqtt_.begin(endpoint.c_str(), port, tls_);
+    freshTls->setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
+    // Rebind mqtt_ to the new object *before* the old one (if any) is freed
+    // by the tls_ assignment below, so mqtt_'s internal Client* pointer is
+    // never left dangling even for an instant.
+    mqtt_.begin(endpoint.c_str(), port, *freshTls);
     mqtt_.setOptions(keepAlive, true, timeout);
+    tls_ = std::move(freshTls); // old socket/session (if any) destroyed here
     return true;
   }
   void setMessageCallback(MqttMessageCallback callback) override {
@@ -43,22 +61,43 @@ public:
     });
   }
   bool connect(const std::string &id) override {
-    return mqtt_.connect(id.c_str());
+    return tls_ && mqtt_.connect(id.c_str());
   }
-  void disconnect() override { mqtt_.disconnect(); }
-  bool connected() override { return mqtt_.connected(); }
+  // Explicit, deterministic teardown - do not rely solely on mqtt_.disconnect()
+  // (a no-op once the client already considers itself disconnected) or on the
+  // WiFiClientSecure destructor's timing.
+  void disconnect() override { teardownSocket(); }
+  bool connected() override { return tls_ && mqtt_.connected(); }
   bool publish(const std::string &topic, const std::string &payload,
                MqttQos qos, bool retain) override {
-    return mqtt_.publish(topic.c_str(), payload.c_str(), retain,
-                         static_cast<int>(qos));
+    return tls_ && mqtt_.publish(topic.c_str(), payload.c_str(), retain,
+                                 static_cast<int>(qos));
   }
   bool subscribe(const std::string &topic, MqttQos qos) override {
-    return mqtt_.subscribe(topic.c_str(), static_cast<int>(qos));
+    return tls_ && mqtt_.subscribe(topic.c_str(), static_cast<int>(qos));
   }
-  void poll() override { mqtt_.loop(); }
+  void poll() override {
+    if (tls_)
+      mqtt_.loop();
+  }
 
 private:
-  WiFiClientSecure tls_;
+  // Best-effort clean MQTT-level disconnect (no-op if the client already
+  // considers itself disconnected) plus an explicit socket stop() - never
+  // assumes disconnect() alone released the underlying socket. Deliberately
+  // does NOT free/null tls_ itself: it is only replaced (and the old object
+  // destroyed) by configureTls()'s safe swap above, so mqtt_'s internal
+  // Client* pointer is never left dangling in between. connected()/publish()/
+  // subscribe()/poll() all still report "not usable" afterwards because
+  // mqtt_.connected() itself becomes false once disconnected.
+  void teardownSocket() {
+    if (!tls_)
+      return;
+    mqtt_.disconnect();
+    tls_->stop();
+  }
+
+  std::unique_ptr<WiFiClientSecure> tls_;
   MQTTClient mqtt_;
   MqttMessageCallback callback_;
 };
@@ -119,6 +158,13 @@ bool Esp32AwsIotTransport::validDeviceId(const std::string &id) {
   return true;
 }
 bool Esp32AwsIotTransport::connect(const std::string &clientId) {
+  // Tear down any previous session before reconnecting. A prior
+  // publish/subscribe/poll failure may have already broken the underlying
+  // client without the caller ever calling disconnect() explicitly (Wi-Fi
+  // and clock can still be fine while only the MQTT/TLS session died) -
+  // never assume the last known session/socket is still safe to reuse.
+  client_->disconnect();
+  sessionValid_ = false;
   if (!validEndpoint(config_.endpoint) || !validDeviceId(clientId) ||
       config_.rootCaPem.empty() || !credentials_.hasCertificate() ||
       !credentials_.hasPrivateKey()) {
@@ -149,28 +195,46 @@ bool Esp32AwsIotTransport::connect(const std::string &clientId) {
     Logger::warn("AWS IoT MQTT connection failed");
     return false;
   }
+  sessionValid_ = true;
   return true;
 }
 void Esp32AwsIotTransport::disconnect() {
   client_->disconnect();
+  sessionValid_ = false;
   callback_ = nullptr;
 }
-bool Esp32AwsIotTransport::isConnected() const { return client_->connected(); }
+bool Esp32AwsIotTransport::isConnected() const {
+  return sessionValid_ && client_->connected();
+}
 bool Esp32AwsIotTransport::publish(const std::string &topic,
                                    const std::string &payload, MqttQos qos,
                                    bool retain) {
-  return isConnected() && client_->publish(topic, payload, qos, retain);
+  if (!isConnected())
+    return false;
+  const bool ok = client_->publish(topic, payload, qos, retain);
+  if (!ok) {
+    Logger::warn("AWS IoT publish failed; session marked invalid");
+    sessionValid_ = false;
+  }
+  return ok;
 }
 bool Esp32AwsIotTransport::subscribe(const std::string &topic, MqttQos qos,
                                      MqttMessageCallback callback) {
-  if (!isConnected() || !client_->subscribe(topic, qos))
+  if (!isConnected() || !client_->subscribe(topic, qos)) {
+    sessionValid_ = false;
     return false;
+  }
   callback_ = std::move(callback);
   return true;
 }
 void Esp32AwsIotTransport::poll() {
-  if (isConnected())
-    client_->poll();
+  if (!isConnected())
+    return;
+  client_->poll();
+  if (!client_->connected()) {
+    Logger::warn("AWS IoT poll detected broken session; session marked invalid");
+    sessionValid_ = false;
+  }
 }
 
 FakeDeviceTransport::FakeDeviceTransport()

@@ -31,7 +31,10 @@ public:
     isConnected = connectResult;
     return connectResult;
   }
-  void disconnect() override { isConnected = false; }
+  void disconnect() override {
+    isConnected = false;
+    ++disconnectCalls;
+  }
   bool connected() override { return isConnected; }
   bool publish(const std::string &, const std::string &, MqttQos qos,
                bool retain) override {
@@ -44,11 +47,18 @@ public:
     subscribedQos = qos;
     return subscribeResult;
   }
-  void poll() override { polls++; }
+  void poll() override {
+    ++polls;
+    // Simulates MQTTClient::loop() closing the connection internally after
+    // a keepalive/read failure (see MQTTClient::close() in the vendored
+    // 256dpi/MQTT library).
+    if (pollBreaksConnection) isConnected = false;
+  }
   bool configureResult = true, connectResult = true, publishResult = true,
-       subscribeResult = true, isConnected = false;
+       subscribeResult = true, isConnected = false, pollBreaksConnection = false;
   bool publishedRetain = true;
   int polls = 0;
+  int disconnectCalls = 0;
   uint16_t configuredKeepAlive = 0, configuredTimeout = 0;
   MqttQos publishedQos = MqttQos::AtMostOnce,
           subscribedQos = MqttQos::AtMostOnce;
@@ -109,7 +119,17 @@ void test_real_transport_qos_retain_subscribe_failure_and_disconnect() {
   TEST_ASSERT_FALSE(
       transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
                           [](const std::string &, const std::string &) {}));
+  // A subscribe failure invalidates the session (see
+  // Esp32AwsIotTransport::isConnected()) - it must never be reusable again
+  // without an explicit reconnect, even once the underlying client would
+  // otherwise succeed.
+  TEST_ASSERT_FALSE(transport.isConnected());
   mqtt.subscribeResult = true;
+  TEST_ASSERT_FALSE(
+      transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
+                          [](const std::string &, const std::string &) {}));
+
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
   TEST_ASSERT_TRUE(
       transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
                           [](const std::string &, const std::string &) {}));
@@ -120,6 +140,80 @@ void test_real_transport_qos_retain_subscribe_failure_and_disconnect() {
   TEST_ASSERT_FALSE(mqtt.publishedRetain);
   transport.disconnect();
   TEST_ASSERT_FALSE(transport.isConnected());
+}
+
+void test_publish_failure_marks_transport_invalid_even_if_client_still_reports_connected() {
+  MemoryStore store;
+  DeviceCredentialStore credentials(store);
+  credentials.saveCertificate("CERT");
+  credentials.savePrivateKey("KEY");
+  FakeMqttClient mqtt;
+  Esp32AwsIotTransport transport(validConfig(), credentials, mqtt);
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
+
+  mqtt.publishResult = false;
+  TEST_ASSERT_FALSE(transport.publish("topic", "{}", MqttQos::AtLeastOnce));
+  // The transport must not rely solely on the underlying client's own
+  // connected() bookkeeping - a failed publish invalidates the session even
+  // if the (possibly stale) underlying client still reports connected.
+  TEST_ASSERT_TRUE(mqtt.isConnected);
+  TEST_ASSERT_FALSE(transport.isConnected());
+}
+
+void test_subscribe_failure_marks_transport_invalid() {
+  MemoryStore store;
+  DeviceCredentialStore credentials(store);
+  credentials.saveCertificate("CERT");
+  credentials.savePrivateKey("KEY");
+  FakeMqttClient mqtt;
+  Esp32AwsIotTransport transport(validConfig(), credentials, mqtt);
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
+
+  mqtt.subscribeResult = false;
+  TEST_ASSERT_FALSE(
+      transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
+                          [](const std::string &, const std::string &) {}));
+  TEST_ASSERT_FALSE(transport.isConnected());
+}
+
+void test_poll_detects_broken_session() {
+  MemoryStore store;
+  DeviceCredentialStore credentials(store);
+  credentials.saveCertificate("CERT");
+  credentials.savePrivateKey("KEY");
+  FakeMqttClient mqtt;
+  Esp32AwsIotTransport transport(validConfig(), credentials, mqtt);
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
+
+  mqtt.pollBreaksConnection = true;
+  transport.poll();
+  TEST_ASSERT_FALSE(transport.isConnected());
+}
+
+void test_reconnect_tears_down_before_reusing_invalid_session() {
+  MemoryStore store;
+  DeviceCredentialStore credentials(store);
+  credentials.saveCertificate("CERT");
+  credentials.savePrivateKey("KEY");
+  FakeMqttClient mqtt;
+  Esp32AwsIotTransport transport(validConfig(), credentials, mqtt);
+
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
+  const int disconnectsAfterFirstConnect = mqtt.disconnectCalls;
+  TEST_ASSERT_TRUE(disconnectsAfterFirstConnect >= 1);
+
+  // A publish failure breaks the session without any explicit disconnect()
+  // call from the orchestration loop (mirrors Wi-Fi/time staying valid while
+  // only the MQTT/TLS session dies mid-command).
+  mqtt.publishResult = false;
+  TEST_ASSERT_FALSE(transport.publish("topic", "{}", MqttQos::AtLeastOnce));
+  TEST_ASSERT_FALSE(transport.isConnected());
+  mqtt.publishResult = true;
+
+  // Reconnecting must tear the old session down first, never reuse it as-is.
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
+  TEST_ASSERT_TRUE(mqtt.disconnectCalls > disconnectsAfterFirstConnect);
+  TEST_ASSERT_TRUE(transport.isConnected());
 }
 
 void test_connect_succeeds_and_records_client_id() {
@@ -188,5 +282,9 @@ int main(int argc, char **argv) {
   RUN_TEST(test_real_transport_configures_mtls_and_exact_client_id);
   RUN_TEST(test_real_transport_rejects_invalid_or_missing_configuration);
   RUN_TEST(test_real_transport_qos_retain_subscribe_failure_and_disconnect);
+  RUN_TEST(test_publish_failure_marks_transport_invalid_even_if_client_still_reports_connected);
+  RUN_TEST(test_subscribe_failure_marks_transport_invalid);
+  RUN_TEST(test_poll_detects_broken_session);
+  RUN_TEST(test_reconnect_tears_down_before_reusing_invalid_session);
   return UNITY_END();
 }

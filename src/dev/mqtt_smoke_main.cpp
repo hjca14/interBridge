@@ -174,16 +174,33 @@ void setup() {
     sntp_set_time_sync_notification_cb(onTimeSynchronized);
     processor.setDiagnosticCallback([](const CommandDiagnostic &event) {
         switch (event.stage) {
-            case CommandDiagnosticStage::Received: Serial.println("[DEV MQTT] command received"); break;
+            case CommandDiagnosticStage::Received:
+                // No seq yet here - it is assigned once the command reaches
+                // the front of the queue and starts processing (see the
+                // stages below), not at raw MQTT delivery time.
+                Serial.println("[DEV MQTT] command received"); break;
             case CommandDiagnosticStage::ValidationPassed:
-                Serial.printf("[DEV MQTT] time validation ok age_s=%lld remaining_s=%lld\n",
+                Serial.printf("[DEV MQTT] time validation ok seq=%lu age_s=%lld remaining_s=%lld\n",
+                              static_cast<unsigned long>(event.commandSeq),
                               static_cast<long long>(event.ageSeconds),
                               static_cast<long long>(event.remainingSeconds)); break;
             case CommandDiagnosticStage::Rejected:
-                Serial.printf("[DEV MQTT] command rejected code=%s\n", event.safeCode); break;
-            case CommandDiagnosticStage::AcceptedPublished: Serial.println("[DEV MQTT] ACCEPTED published"); break;
+                Serial.printf("[DEV MQTT] command rejected seq=%lu code=%s\n",
+                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
+            case CommandDiagnosticStage::AcceptedPublished:
+                Serial.printf("[DEV MQTT] ACCEPTED published seq=%lu\n",
+                              static_cast<unsigned long>(event.commandSeq)); break;
+            case CommandDiagnosticStage::AcceptedPending:
+                Serial.printf("[DEV MQTT] ACCEPTED pending (publish failed; queued) seq=%lu\n",
+                              static_cast<unsigned long>(event.commandSeq)); break;
             case CommandDiagnosticStage::TerminalPublished:
-                Serial.printf("[DEV MQTT] terminal response code=%s\n", event.safeCode); break;
+                // event.safeCode here is the device's own terminal status/error code
+                // (e.g. CAPABILITY_DISABLED), never a transport/publish artifact.
+                Serial.printf("[DEV MQTT] terminal published seq=%lu code=%s\n",
+                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
+            case CommandDiagnosticStage::TerminalPending:
+                Serial.printf("[DEV MQTT] terminal pending (publish failed; queued) seq=%lu code=%s\n",
+                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
         }
     });
 }
@@ -192,6 +209,15 @@ void loop() {
     const uint32_t now = millis();
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
     if ((!wifiConnected || !clockSource.hasValidTime()) && transport.isConnected()) {
+        transport.disconnect();
+        subscribed = false;
+    } else if (!transport.isConnected() && subscribed) {
+        // Wi-Fi/time are still fine, but a publish/subscribe/poll failure
+        // already invalidated the MQTT/TLS session (see
+        // Esp32AwsIotTransport::isConnected()). Tear it down explicitly so
+        // the next ConnectMqtt attempt never reuses a stale socket/session,
+        // instead of only discovering this implicitly on the next connect().
+        Serial.println("[DEV MQTT] transport session invalidated; tearing down before reconnect");
         transport.disconnect();
         subscribed = false;
     }
@@ -237,8 +263,13 @@ void loop() {
             if (connected) {
                 subscribed = processor.subscribe();
                 safeStatus("command QoS1 subscription", subscribed);
-                if (!subscribed) transport.disconnect();
-                else healthReporter.forceNextPublish();
+                if (!subscribed) {
+                    transport.disconnect();
+                } else {
+                    healthReporter.forceNextPublish();
+                    Serial.printf("[DEV MQTT] reconnected; pending_responses=%u\n",
+                                  static_cast<unsigned>(processor.pendingResponseCount()));
+                }
             }
             connectivity.mqttResult(now, connected && subscribed);
             safeStatus("MQTT connect", connected && subscribed);

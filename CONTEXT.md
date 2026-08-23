@@ -642,6 +642,18 @@ this pass:)*
   a job - only the terminal `OTA_COMPLETED`/`OTA_FAILED`.
 - `docs/architecture.md` and this file must be kept manually in sync with
   the code; no automated drift check exists.
+- `RemoteCommandProcessor`'s response outbox is RAM-only (`kMaxOutboxSize`,
+  bounded) - a reboot while a response is still queued loses it, same
+  tradeoff as the in-memory event outbox (section 17). Production should
+  eventually back it with NVS the same way `PersistentDedupCache` does.
+- The hypothesis that reusing the same `WiFiClientSecure`/socket across a
+  broken MQTT session is what produced `setSocketOption(): ... Bad file
+  number` after a publish failure is based on documented ESP32 Arduino
+  core behavior and the vendored `256dpi/MQTT` source, not a real-hardware
+  A/B test - see docs/mqtt-dev-smoke-test.md and the PR that introduced
+  the fresh-`WiFiClientSecure`-per-reconnect change. Needs bench
+  confirmation that the error no longer appears under the same
+  few-consecutive-commands repro.
 
 ## Future Work
 
