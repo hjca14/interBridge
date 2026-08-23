@@ -82,6 +82,11 @@ private:
   std::unique_ptr<IMqttClient> ownedClient_;
   IMqttClient *client_;
   MqttMessageCallback callback_;
+  // Independent of the underlying client's own connected() bookkeeping:
+  // becomes false the moment any publish/subscribe/poll/connect fails, so a
+  // stale session is never trusted or reused without an explicit teardown +
+  // reconnect first. See connect()/disconnect().
+  bool sessionValid_ = false;
   // WiFiClientSecure may retain PEM pointers, so credential buffers must
   // outlive the TLS session. They are never exposed to logging/diagnostics.
   std::string certificatePem_;

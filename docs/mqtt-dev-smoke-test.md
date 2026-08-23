@@ -61,6 +61,22 @@ recursively publish while the MQTT/TLS client is dispatching an inbound packet.
 TLS stream operations use the configured one-second timeout, while the complete
 AWS IoT TLS handshake has its own ten-second limit.
 
+If a response publish fails, it is queued in a small bounded RAM outbox
+(`RemoteCommandProcessor`, `kMaxOutboxSize`) instead of being dropped, and the
+harness explicitly tears the MQTT/TLS session down (`transport.disconnect()`) as
+soon as it observes the session invalidated, even if Wi-Fi and NTP time remain
+fine - a publish/subscribe/poll failure alone is now treated as an untrustworthy
+session. `Esp32AwsIotTransport` also allocates a fresh `WiFiClientSecure` on every
+reconnect rather than reusing the previous socket/TLS object. The outbox is
+drained (oldest first, ACCEPTED before its terminal response) once the harness
+reconnects and resubscribes; a retry never re-invokes `CommandHandler`. Log lines
+add a local `seq` counter to correlate a command's ACCEPTED/terminal lines without
+ever logging `command_id`. The outbox is RAM-only: a reboot loses any response
+still queued at that moment (the command itself was already handled exactly once;
+only its delivery confirmation to the backend is at risk, and the backend must
+treat a republished ACCEPTED/terminal for the same `command_id` idempotently per
+`docs/communication-protocol.md` section 20.1).
+
 The local heartbeat reports current state plus free/minimum heap and remaining
 loop-task stack. Boot diagnostics report the previous reset reason and only
 whether Wi-Fi configuration is present. Wi-Fi driver events include disconnect

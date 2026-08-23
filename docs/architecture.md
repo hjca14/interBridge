@@ -421,3 +421,21 @@ The inbound boundary checks the exact `MqttTopics::commands()` value and 8 KiB l
 before the existing parser/handler. Outbound command results use only
 `MqttTopics::responsesIngest()`, QoS 1, `retain=false`. No LWT is configured. Failure at
 configuration, connect, subscribe, validation, or publish remains fail-closed.
+
+`Esp32AwsIotTransport` tracks its own session-valid flag independent of the
+underlying `IMqttClient::connected()` bookkeeping: any publish/subscribe/poll/connect
+failure marks the session untrusted, and `connect()` always tears the previous
+session down (`client_->disconnect()`) before configuring TLS again, rather than
+assuming the caller already did so or that the last session is safe to reuse. The
+ESP32 adapter additionally allocates a fresh `WiFiClientSecure` per connection
+attempt instead of reusing the same socket/TLS object across a broken session -
+reusing it is what produced the `setSocketOption(): ... Bad file number` pattern
+observed after a publish failure on real hardware.
+
+`RemoteCommandProcessor` holds a small bounded (`kMaxOutboxSize`) in-RAM outbox for
+ACCEPTED/terminal responses that failed to publish. `processPending()` drains it
+before ever starting a new queued command, which is what keeps ACCEPTED-before-
+terminal ordering strict across a disconnect/reconnect. Draining only republishes
+already-serialized bytes - it never re-invokes `CommandHandler` or the dedup cache.
+The outbox is RAM-only and does not survive reboot, matching the event outbox's
+documented in-memory-during-development posture (section 17 of the protocol doc).
