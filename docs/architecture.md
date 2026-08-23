@@ -432,10 +432,30 @@ attempt instead of reusing the same socket/TLS object across a broken session -
 reusing it is what produced the `setSocketOption(): ... Bad file number` pattern
 observed after a publish failure on real hardware.
 
-`RemoteCommandProcessor` holds a small bounded (`kMaxOutboxSize`) in-RAM outbox for
-ACCEPTED/terminal responses that failed to publish. `processPending()` drains it
-before ever starting a new queued command, which is what keeps ACCEPTED-before-
-terminal ordering strict across a disconnect/reconnect. Draining only republishes
-already-serialized bytes - it never re-invokes `CommandHandler` or the dedup cache.
-The outbox is RAM-only and does not survive reboot, matching the event outbox's
-documented in-memory-during-development posture (section 17 of the protocol doc).
+`RemoteCommandProcessor` holds a small bounded (`kMaxOutboxSize = 2`) in-RAM outbox
+for ACCEPTED/terminal responses that failed to publish. `processPending()` never
+starts a new queued command while the outbox is non-empty, so under that invariant
+at most one command's own ACCEPTED+terminal pair is ever pending - `kMaxOutboxSize`
+is an explicit, logged backstop for that invariant being bypassed (e.g. a direct
+`processPayload()` call), not working capacity for several commands' worth of
+responses. Each `processPending()` call attempts to publish only the item at the
+front of the outbox, at most once, then returns - publishing several queued
+responses in one call was rejected because a single publish can itself block up to
+the configured transport timeout. On success the item is popped; on failure it
+stays queued and the normal invalidate/reconnect/backoff flow handles the retry on
+a later call. Reaching capacity never evicts an already-pending entry (that could
+silently drop a promised ACCEPTED while keeping only its terminal); the new
+response is rejected and logged instead. Draining only republishes
+already-serialized bytes, including the response's own sanitized terminal code, so
+a retried terminal still reports its real status - it never re-invokes
+`CommandHandler` or the dedup cache. The outbox is RAM-only and does not survive
+reboot, matching the event outbox's documented in-memory-during-development
+posture (section 17 of the protocol doc).
+
+`CommandHandler::handle()` computes ACCEPTED and the terminal result synchronously,
+before ACCEPTED is even attempted - safe only because `DoorOpenCapability` stays
+`Disabled` and no physical action is taken. A future capability that actually
+actuates hardware cannot reuse this shape unmodified: it needs to separate
+validation, publishing (and confirming) ACCEPTED, and only then triggering the
+physical action as a distinct step gated on that confirmation. This PR does not
+implement or guarantee that ordering.

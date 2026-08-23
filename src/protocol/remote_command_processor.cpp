@@ -15,45 +15,53 @@ RemoteCommandProcessor::RemoteCommandProcessor(std::string deviceId,
     : deviceId_(std::move(deviceId)), transport_(transport), handler_(handler),
       topics_(std::move(topics)) {}
 
-void RemoteCommandProcessor::enqueue(PendingResponse entry) {
+bool RemoteCommandProcessor::enqueue(PendingResponse entry) {
   if (outbox_.size() >= kMaxOutboxSize) {
-    // Bounded by construction; explicit, logged eviction rather than an
-    // unbounded queue or a silent drop. This only happens if commands keep
-    // arriving and failing to publish across multiple reconnect cycles,
-    // which already exceeds kMaxPendingCommands worth of in-flight replies.
-    Logger::warn("Response outbox full; dropping oldest pending response");
-    outbox_.pop_front();
+    // Never evict an already-pending response to make room for a new one -
+    // dropping e.g. a still-queued ACCEPTED to fit a later terminal would
+    // corrupt that command's ordering/semantics. Reaching capacity here
+    // means the processPending() invariant (never start a new command while
+    // the outbox is non-empty) was bypassed by a direct call or unexpected
+    // state; reject and log rather than touching any existing entry or
+    // taking any further action for this one.
+    Logger::error(
+        "Response outbox at capacity; response rejected without evicting a pending one");
+    return false;
   }
   outbox_.push_back(std::move(entry));
+  return true;
 }
 
 bool RemoteCommandProcessor::publishOrQueue(const std::string &topic,
                                             const std::string &payload,
                                             MqttQos qos, bool isTerminal,
-                                            uint32_t commandSeq) {
+                                            uint32_t commandSeq,
+                                            const char *safeCode) {
   if (transport_.publish(topic, payload, qos))
     return true;
-  enqueue({topic, payload, qos, isTerminal, commandSeq});
+  enqueue({topic, payload, qos, isTerminal, commandSeq, safeCode});
   return false;
 }
 
 void RemoteCommandProcessor::drainOutbox() {
-  while (!outbox_.empty()) {
-    const PendingResponse &front = outbox_.front();
-    // Retrying a response never re-invokes CommandHandler or re-executes any
-    // action - this republishes the exact bytes already computed, which the
-    // backend must already treat idempotently for QoS 1 redelivery (see
-    // docs/communication-protocol.md > Duplicate Command Protection > 20.1).
-    if (!transport_.publish(front.topic, front.payload, front.qos))
-      return; // Still unreachable - retry on a later call once reconnected.
-    if (diagnosticCallback_) {
-      diagnosticCallback_({front.isTerminal
-                               ? CommandDiagnosticStage::TerminalPublished
-                               : CommandDiagnosticStage::AcceptedPublished,
-                           nullptr, 0, 0, front.commandSeq});
-    }
-    outbox_.pop_front();
+  if (outbox_.empty())
+    return;
+  const PendingResponse &front = outbox_.front();
+  // Retrying a response never re-invokes CommandHandler or re-executes any
+  // action - this republishes the exact bytes already computed, which the
+  // backend must already treat idempotently for QoS 1 redelivery (see
+  // docs/communication-protocol.md > Duplicate Command Protection > 20.1).
+  // At most one publish attempt happens here (it can itself block up to the
+  // configured transport timeout) - never a burst of retries in one call.
+  if (!transport_.publish(front.topic, front.payload, front.qos))
+    return; // Still unreachable - left queued; retry on a later call.
+  if (diagnosticCallback_) {
+    diagnosticCallback_({front.isTerminal
+                             ? CommandDiagnosticStage::TerminalPublished
+                             : CommandDiagnosticStage::AcceptedPublished,
+                         front.safeCode, 0, 0, front.commandSeq});
   }
+  outbox_.pop_front();
 }
 
 size_t RemoteCommandProcessor::pendingResponseCount() const {
@@ -105,6 +113,15 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
   }
 
   result.parsed = true;
+  // CommandHandler::handle() computes both ACCEPTED and the terminal result
+  // synchronously, before ACCEPTED is even attempted below - safe today
+  // only because DoorOpenCapability is Disabled and no physical action is
+  // ever taken. This is NOT "ACCEPTED confirmed published, then execute
+  // physically": a future capability that actually actuates hardware must
+  // not reuse this synchronous shape as-is. It will need to split
+  // validation, publishing (and confirming) ACCEPTED, and only then
+  // triggering the physical action as a separate step gated on that
+  // confirmation - this PR does not implement or guarantee that ordering.
   CommandResponses responses = handler_.handle(parsed.command);
   if (diagnosticCallback_) {
     if (responses.timeValidationPassed) {
@@ -121,9 +138,9 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
   const std::string terminalPayload = responses.terminal.toJson();
 
   if (responses.hasAccepted) {
-    result.acceptedPublished =
-        publishOrQueue(topics_.responsesIngest(), responses.accepted.toJson(),
-                       MqttQos::AtLeastOnce, /*isTerminal=*/false, seq);
+    result.acceptedPublished = publishOrQueue(
+        topics_.responsesIngest(), responses.accepted.toJson(),
+        MqttQos::AtLeastOnce, /*isTerminal=*/false, seq, /*safeCode=*/nullptr);
     if (diagnosticCallback_) {
       diagnosticCallback_({result.acceptedPublished
                                ? CommandDiagnosticStage::AcceptedPublished
@@ -139,7 +156,7 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
       // that would risk delivering it before ACCEPTED if the connection
       // recovers between the two publish attempts.
       enqueue({topics_.responsesIngest(), terminalPayload,
-               MqttQos::AtLeastOnce, /*isTerminal=*/true, seq});
+               MqttQos::AtLeastOnce, /*isTerminal=*/true, seq, terminalCode});
       if (diagnosticCallback_) {
         diagnosticCallback_({CommandDiagnosticStage::TerminalPending,
                              terminalCode, 0, 0, seq});
@@ -150,9 +167,9 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
     }
   }
 
-  result.terminalPublished =
-      publishOrQueue(topics_.responsesIngest(), terminalPayload,
-                     MqttQos::AtLeastOnce, /*isTerminal=*/true, seq);
+  result.terminalPublished = publishOrQueue(
+      topics_.responsesIngest(), terminalPayload, MqttQos::AtLeastOnce,
+      /*isTerminal=*/true, seq, terminalCode);
   if (!result.terminalPublished) {
     Logger::error(
         "Remote command terminal response publish failed; queued for retry");

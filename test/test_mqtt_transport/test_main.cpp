@@ -119,7 +119,17 @@ void test_real_transport_qos_retain_subscribe_failure_and_disconnect() {
   TEST_ASSERT_FALSE(
       transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
                           [](const std::string &, const std::string &) {}));
+  // A subscribe failure invalidates the session (see
+  // Esp32AwsIotTransport::isConnected()) - it must never be reusable again
+  // without an explicit reconnect, even once the underlying client would
+  // otherwise succeed.
+  TEST_ASSERT_FALSE(transport.isConnected());
   mqtt.subscribeResult = true;
+  TEST_ASSERT_FALSE(
+      transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
+                          [](const std::string &, const std::string &) {}));
+
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
   TEST_ASSERT_TRUE(
       transport.subscribe("interbridge/x/commands", MqttQos::AtLeastOnce,
                           [](const std::string &, const std::string &) {}));

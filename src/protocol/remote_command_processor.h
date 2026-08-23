@@ -41,10 +41,14 @@ struct CommandDiagnostic {
 };
 using CommandDiagnosticCallback = std::function<void(const CommandDiagnostic &)>;
 
-// Bounded, RAM-only outbox capacity: at most kMaxPendingCommands queued
-// incoming commands, each producing at most two responses (ACCEPTED +
-// terminal).
-constexpr size_t kMaxOutboxSize = 8;
+// Bounded, RAM-only outbox capacity. processPending() never starts a new
+// queued command while the outbox is non-empty (see below), so under that
+// invariant at most one command's own pair of responses (ACCEPTED +
+// terminal) can ever be pending at once. kMaxOutboxSize exists as an
+// explicit, logged backstop for that invariant being bypassed (e.g. a
+// direct processPayload() call while responses are already queued) - not as
+// working capacity for multiple commands' worth of delayed responses.
+constexpr size_t kMaxOutboxSize = 2;
 
 class RemoteCommandProcessor {
 public:
@@ -56,11 +60,14 @@ public:
   // command there would publish recursively through the same client and can
   // deadlock its socket/TLS state. Drain commands from the main loop instead.
   //
-  // If earlier responses are still stuck in the outbox (last publish
-  // attempt failed), this drains them first and does not start a new
-  // command until they are flushed - this is what keeps ACCEPTED/terminal
-  // ordering strict across a reconnect. It never re-invokes CommandHandler:
-  // outbox entries are already-serialized response payloads.
+  // If an earlier response is still stuck in the outbox (last publish
+  // attempt failed), this attempts to publish only that one response and
+  // returns - it never starts a new command until the outbox is empty. This
+  // is what keeps ACCEPTED/terminal ordering strict across a reconnect, and
+  // it bounds each call to at most one publish attempt (which can itself
+  // block up to the configured transport timeout), never a burst. It never
+  // re-invokes CommandHandler: outbox entries are already-serialized
+  // response payloads.
   void processPending();
   CommandPublishResult processPayload(const std::string &payload);
   const CommandPublishResult &lastResult() const;
@@ -78,19 +85,32 @@ private:
     MqttQos qos;
     bool isTerminal;
     uint32_t commandSeq;
+    // The device's own sanitized terminal status/error code (e.g.
+    // "CAPABILITY_DISABLED"), preserved so a retried terminal response still
+    // reports its real code once published - never null for a terminal
+    // entry, always null for an ACCEPTED entry (ACCEPTED carries no code).
+    const char *safeCode;
   };
 
-  // Appends to the outbox, evicting the oldest entry first if already at
-  // kMaxOutboxSize (explicit, logged, bounded - never an unbounded queue).
-  void enqueue(PendingResponse entry);
+  // Appends to the outbox. Returns false without adding the entry if the
+  // outbox is already at kMaxOutboxSize - it never evicts an existing
+  // pending entry to make room (see the kMaxOutboxSize comment: reaching
+  // capacity means the processPending() invariant was bypassed, which is
+  // logged as an error rather than silently corrupting an older command's
+  // already-queued response pair).
+  bool enqueue(PendingResponse entry);
   // Attempts to publish immediately; on failure, appends to the outbox via
   // enqueue() so the response is retried after reconnect instead of being
   // silently dropped.
   bool publishOrQueue(const std::string &topic, const std::string &payload,
-                      MqttQos qos, bool isTerminal, uint32_t commandSeq);
-  // Publishes outbox entries front-to-back, stopping at the first failure
-  // (preserves per-command ordering and never busy-loops/re-attempts the
-  // remainder within the same call).
+                      MqttQos qos, bool isTerminal, uint32_t commandSeq,
+                      const char *safeCode);
+  // Attempts to publish only the item at the front of the outbox, at most
+  // once. On success, removes it. On failure, leaves it queued and returns -
+  // Esp32AwsIotTransport::publish() already marks the session invalid on
+  // failure, so the normal reconnect/backoff flow (owned by the caller,
+  // e.g. main.cpp/mqtt_smoke_main.cpp) handles the retry on a later call.
+  // Never attempts a second item in the same call.
   void drainOutbox();
 
   std::string deviceId_;
