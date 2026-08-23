@@ -11,6 +11,8 @@
 namespace interbridge {
 namespace {
 #ifdef ARDUINO
+constexpr uint32_t kTlsHandshakeTimeoutSeconds = 10;
+
 class ArduinoMqttClient final : public IMqttClient {
 public:
   ArduinoMqttClient() : mqtt_(9216) {}
@@ -21,6 +23,13 @@ public:
     tls_.setCACert(ca.c_str());
     tls_.setCertificate(cert.c_str());
     tls_.setPrivateKey(key.c_str());
+    // WiFiClientSecure otherwise inherits a long/default stream timeout. Keep
+    // individual TLS reads and writes bounded so the main loop remains live.
+    tls_.setTimeout(timeout);
+    // TLS negotiation can legitimately take several seconds on a congested
+    // link. Keep it bounded without applying the shorter stream timeout to the
+    // complete AWS IoT handshake.
+    tls_.setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
     mqtt_.begin(endpoint.c_str(), port, tls_);
     mqtt_.setOptions(keepAlive, true, timeout);
     return true;

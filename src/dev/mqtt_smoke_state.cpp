@@ -79,5 +79,6 @@ void DevMqttSmokeState::mqttResult(uint32_t nowMs, bool success) {
 
 DevSmokeState DevMqttSmokeState::state() const { return state_; }
 uint32_t DevMqttSmokeState::retryDelayMs() const { return retryDelayMs_; }
+uint32_t DevMqttSmokeState::retryAtMs() const { return retryAtMs_; }
 
 } // namespace interbridge

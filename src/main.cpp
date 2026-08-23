@@ -276,6 +276,7 @@ void updateNetwork() {
     }
 
     transport.poll();
+    remoteCommandProcessor->processPending();
 
     if (!subscribedToCommands) {
         subscribedToCommands = remoteCommandProcessor->subscribe();

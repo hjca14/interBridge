@@ -9,6 +9,9 @@
 #include <WiFi.h>
 #include <time.h>
 #include <esp_sntp.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include "interbridge_dev_secrets.h"
 #include "mqtt_smoke_state.h"
 #include "../hardware/clock.h"
@@ -90,6 +93,31 @@ DevMqttSmokeState connectivity;
 uint32_t heartbeatAt = 0;
 bool subscribed = false;
 HealthReporter healthReporter(kDevHealthIntervalMs);
+DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout";
+        default: return "other";
+    }
+}
+
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u\n",
+                      static_cast<unsigned>(info.wifi_sta_disconnected.reason));
+    } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+        Serial.println("[DEV MQTT] wifi event=connected");
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        Serial.println("[DEV MQTT] wifi event=got_ip");
+    }
+}
 
 void onTimeSynchronized(struct timeval*) { clockSource.syncCompleted(millis()); }
 
@@ -109,11 +137,12 @@ const char* stateName(DevSmokeState state) {
 void heartbeat(uint32_t now) {
     if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
     heartbeatAt = now + kHeartbeatMs;
-    Serial.printf("[DEV MQTT] local_status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu\n",
+    Serial.printf("[DEV MQTT] local_status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu heap_free=%u heap_min=%u stack_words=%u\n",
                   stateName(connectivity.state()), WiFi.status() == WL_CONNECTED ? "up" : "down",
                   clockSource.hasValidTime() ? "valid" : "pending",
                   transport.isConnected() ? "up" : "down",
-                  static_cast<unsigned long>(now / 1000));
+                  static_cast<unsigned long>(now / 1000), ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 }
 
 void publishHealth(uint32_t now) {
@@ -137,6 +166,9 @@ void setup() {
     while (!Serial && !DevMqttSmokeState::deadlineReached(millis(), serialDeadline)) delay(10);
     Serial.println("[DEV MQTT] production-path harness; physical actions disabled");
     Serial.println("[DEV MQTT] local configuration loaded into transient DEV memory (values not logged)");
+    Serial.printf("[DEV MQTT] previous_reset=%s wifi_config=present\n",
+                  resetReasonName(esp_reset_reason()));
+    WiFi.onEvent(onWifiEvent);
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb(onTimeSynchronized);
@@ -165,11 +197,21 @@ void loop() {
     }
     if (!transport.isConnected()) subscribed = false;
 
-    switch (connectivity.update(now, wifiConnected, clockSource.hasValidTime(), transport.isConnected())) {
+    const DevSmokeAction action = connectivity.update(
+        now, wifiConnected, clockSource.hasValidTime(), transport.isConnected());
+    if (connectivity.state() != lastLoggedState) {
+        Serial.printf("[DEV MQTT] state %s -> %s\n", stateName(lastLoggedState), stateName(connectivity.state()));
+        lastLoggedState = connectivity.state();
+    }
+    switch (action) {
         case DevSmokeAction::ConnectWifi:
+            // The state machine authorizes exactly one begin call per retry;
+            // leave interface recovery policy to the Wi-Fi driver for now.
             WiFi.mode(WIFI_STA);
             WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
-            Serial.println("[DEV MQTT] Wi-Fi connect requested");
+            Serial.printf("[DEV MQTT] Wi-Fi connect requested; next_attempt_ms=%lu delay_ms=%lu\n",
+                          static_cast<unsigned long>(connectivity.retryAtMs()),
+                          static_cast<unsigned long>(connectivity.retryAtMs() - now));
             break;
         case DevSmokeAction::ResolveDns: {
             IPAddress resolved;
@@ -177,6 +219,11 @@ void loop() {
             const bool resolvedOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
             connectivity.dnsResult(now, resolvedOk);
             Serial.printf("[DEV MQTT] DNS: %s\n", resolvedOk ? "ready" : "pending");
+            if (!resolvedOk) {
+                Serial.printf("[DEV MQTT] next DNS attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.retryAtMs()),
+                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+            }
             break;
         }
         case DevSmokeAction::ConfigureTime:
@@ -195,11 +242,19 @@ void loop() {
             }
             connectivity.mqttResult(now, connected && subscribed);
             safeStatus("MQTT connect", connected && subscribed);
+            if (!connected || !subscribed) {
+                Serial.printf("[DEV MQTT] next MQTT attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.retryAtMs()),
+                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+            }
             break;
         }
         case DevSmokeAction::None: break;
     }
-    if (transport.isConnected()) transport.poll();
+    if (transport.isConnected()) {
+        transport.poll();
+        processor.processPending();
+    }
     publishHealth(now);
     heartbeat(now);
     delay(10);
