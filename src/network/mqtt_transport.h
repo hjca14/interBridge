@@ -41,6 +41,11 @@ public:
                        MqttQos qos, bool retain) = 0;
   virtual bool subscribe(const std::string &topic, MqttQos qos) = 0;
   virtual void poll() = 0;
+  // Sanitized numeric code for the most recent operation's failure (e.g. the
+  // underlying lwmqtt_err_t/lwmqtt_return_code_t), 0 if unknown/not
+  // applicable. Never a string - callers must not derive payload/identifier
+  // content from it, only a bare number for DEV log correlation.
+  virtual int lastErrorCode() = 0;
 };
 
 class IDeviceTransport {

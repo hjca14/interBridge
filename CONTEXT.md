@@ -647,13 +647,46 @@ this pass:)*
   tradeoff as the in-memory event outbox (section 17). Production should
   eventually back it with NVS the same way `PersistentDedupCache` does.
 - The hypothesis that reusing the same `WiFiClientSecure`/socket across a
-  broken MQTT session is what produced `setSocketOption(): ... Bad file
-  number` after a publish failure is based on documented ESP32 Arduino
-  core behavior and the vendored `256dpi/MQTT` source, not a real-hardware
-  A/B test - see docs/mqtt-dev-smoke-test.md and the PR that introduced
-  the fresh-`WiFiClientSecure`-per-reconnect change. Needs bench
-  confirmation that the error no longer appears under the same
-  few-consecutive-commands repro.
+  broken MQTT session produced `setSocketOption(): ... Bad file number` after
+  a publish failure is now **bench-confirmed**: real hardware runs of the
+  same few-consecutive-commands repro after the fresh-`WiFiClientSecure`-
+  per-reconnect change no longer show that error. The socket-teardown fix
+  itself is validated; it just wasn't the only issue at play (see below).
+- Even with the socket fix, ACCEPTED and the terminal response were still
+  published back-to-back within the same `processPending()` call whenever
+  ACCEPTED succeeded, with no `transport.poll()` in between - two QoS 1
+  publishes in immediate succession, which intermittently made the second
+  one fail on real hardware even without a broken socket. Fixed by always
+  deferring the terminal to the next `processPending()` call/loop
+  iteration, so every call site attempts at most one response publish. This
+  is now **bench-confirmed** too: a subsequent real-hardware run showed the
+  terminal recovering normally on the deferred iteration when nothing failed
+  (no `AWS IoT publish failed` log at all - just an intentional one-loop
+  defer), and recovering ACCEPTED-then-terminal in order when the ACCEPTED
+  publish genuinely failed (`mqtt_err=-9` observed). Diagnostic wording was
+  further split (`TerminalDeferred` / `TerminalQueuedBehindAccepted` /
+  `TerminalPublishFailed` / `TerminalPublished`) so a deferred-but-not-yet-
+  attempted terminal is never logged as "publish failed" - see
+  docs/mqtt-dev-smoke-test.md's outbox section.
+- `DevMqttSmokeState::update()`'s `WaitingForTime` branch could reissue
+  `configTime()` before a previous SNTP attempt (asynchronous, unlike the
+  synchronous DNS lookup) had a chance to complete, once the exponential
+  backoff interval became shorter than a real sync round trip - a plausible
+  explanation for "time sync requested" repeating for a long time on one
+  real boot. A first fix gated this on the caller's
+  `sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS`; real hardware
+  still showed several `time sync requested` lines before sync completed
+  (recovering within 30 s regardless), showing that status is not reliable
+  as the sole guard - it can apparently stay reset/idle for a while after
+  `configTime()` is called. Replaced with a self-contained, bounded,
+  configurable in-flight timer entirely inside `DevMqttSmokeState` (no
+  external status consulted at all) - see docs/mqtt-dev-smoke-test.md > Real
+  bench observation for the full mechanism and its tests. Whether this
+  fully eliminates the repeated log lines on real hardware has not been
+  re-validated yet (only `pio run`/native tests so far for this specific
+  change). The ~78 s of DNS failures on that same boot was not changed - it
+  is consistent with ordinary bounded exponential backoff over a
+  slow/unavailable resolver path, not a code defect that was found.
 
 ## Future Work
 

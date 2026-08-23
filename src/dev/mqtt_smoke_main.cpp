@@ -47,9 +47,15 @@ public:
     void syncStarted() { syncState_.synchronizationStarted(); }
     void syncCompleted(uint32_t nowMs) { syncState_.synchronizationCompleted(nowMs); }
     bool hasValidTime() const override {
-        return syncState_.isTrustworthy(millis(),
-            sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS);
+        return syncState_.isTrustworthy(millis(), syncInProgress());
     }
+    // Used only as part of hasValidTime()'s own settling gate (do not trust
+    // time while a new resync might already be underway). NOT used to gate
+    // ConfigureTime retries: DevMqttSmokeState tracks its own bounded
+    // in-flight timer for that instead, since this status can stay
+    // reset/idle for a while after configTime() is called and so cannot
+    // serve as a reliable "is a previous attempt still running" signal.
+    bool syncInProgress() const { return sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS; }
     int64_t unixTimeSeconds() const override { return static_cast<int64_t>(time(nullptr)); }
 private:
     NtpSyncState syncState_;
@@ -191,15 +197,31 @@ void setup() {
                 Serial.printf("[DEV MQTT] ACCEPTED published seq=%lu\n",
                               static_cast<unsigned long>(event.commandSeq)); break;
             case CommandDiagnosticStage::AcceptedPending:
-                Serial.printf("[DEV MQTT] ACCEPTED pending (publish failed; queued) seq=%lu\n",
+                Serial.printf("[DEV MQTT] ACCEPTED publish failed; still queued seq=%lu\n",
+                              static_cast<unsigned long>(event.commandSeq)); break;
+            case CommandDiagnosticStage::AcceptedPublishFailed:
+                Serial.printf("[DEV MQTT] ACCEPTED publish failed; still queued seq=%lu\n",
                               static_cast<unsigned long>(event.commandSeq)); break;
             case CommandDiagnosticStage::TerminalPublished:
                 // event.safeCode here is the device's own terminal status/error code
                 // (e.g. CAPABILITY_DISABLED), never a transport/publish artifact.
                 Serial.printf("[DEV MQTT] terminal published seq=%lu code=%s\n",
                               static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
-            case CommandDiagnosticStage::TerminalPending:
-                Serial.printf("[DEV MQTT] terminal pending (publish failed; queued) seq=%lu code=%s\n",
+            case CommandDiagnosticStage::TerminalDeferred:
+                // ACCEPTED already published; this is an intentional
+                // one-iteration defer, not a failure - no publish was even
+                // attempted yet for the terminal.
+                Serial.printf("[DEV MQTT] terminal deferred (queued for next iteration) seq=%lu code=%s\n",
+                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
+            case CommandDiagnosticStage::TerminalQueuedBehindAccepted:
+                // ACCEPTED itself failed (see the AcceptedPending line above);
+                // the terminal is only queued behind it, not attempted yet.
+                Serial.printf("[DEV MQTT] terminal queued behind pending ACCEPTED seq=%lu code=%s\n",
+                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
+            case CommandDiagnosticStage::TerminalPublishFailed:
+                // A real publish attempt happened and failed - the transport
+                // layer already logged the sanitized mqtt_err=N for it.
+                Serial.printf("[DEV MQTT] terminal publish failed; still queued seq=%lu code=%s\n",
                               static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
         }
     });

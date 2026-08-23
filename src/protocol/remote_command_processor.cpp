@@ -53,8 +53,25 @@ void RemoteCommandProcessor::drainOutbox() {
   // docs/communication-protocol.md > Duplicate Command Protection > 20.1).
   // At most one publish attempt happens here (it can itself block up to the
   // configured transport timeout) - never a burst of retries in one call.
-  if (!transport_.publish(front.topic, front.payload, front.qos))
+  if (!transport_.publish(front.topic, front.payload, front.qos)) {
+    // A real publish attempt happened here and failed - distinct from
+    // TerminalDeferred/TerminalQueuedBehindAccepted, neither of which ever
+    // attempts a publish at all. Esp32AwsIotTransport::publish() already
+    // logged the sanitized mqtt_err=N for the transport-level failure; this
+    // reports the RemoteCommandProcessor-level outcome (still queued).
+    if (diagnosticCallback_) {
+      diagnosticCallback_({front.isTerminal
+                               ? CommandDiagnosticStage::TerminalPublishFailed
+                               : CommandDiagnosticStage::AcceptedPublishFailed,
+                           front.safeCode, 0, 0, front.commandSeq});
+    }
     return; // Still unreachable - left queued; retry on a later call.
+  }
+  // Keep lastResult() converging to the truth even though the terminal (and,
+  // on an ACCEPTED failure, ACCEPTED itself) is now always published via a
+  // later drain rather than within the original processPayload() call.
+  if (front.isTerminal) lastResult_.terminalPublished = true;
+  else lastResult_.acceptedPublished = true;
   if (diagnosticCallback_) {
     diagnosticCallback_({front.isTerminal
                              ? CommandDiagnosticStage::TerminalPublished
@@ -138,6 +155,13 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
   const std::string terminalPayload = responses.terminal.toJson();
 
   if (responses.hasAccepted) {
+    // At most one response publish attempt per processPending() call/loop
+    // iteration, even for a brand-new command: attempt ACCEPTED only, then
+    // always defer the terminal to a later iteration rather than publishing
+    // it here too. Two back-to-back QoS 1 publishes with no transport.poll()
+    // in between (the real main loop always polls between processPending()
+    // calls) is what produced repeated "terminal response publish failed"
+    // even when ACCEPTED itself succeeded.
     result.acceptedPublished = publishOrQueue(
         topics_.responsesIngest(), responses.accepted.toJson(),
         MqttQos::AtLeastOnce, /*isTerminal=*/false, seq, /*safeCode=*/nullptr);
@@ -147,26 +171,34 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
                                : CommandDiagnosticStage::AcceptedPending,
                            nullptr, 0, 0, seq});
     }
+    // Fail closed for any future physical action: no action beyond what
+    // CommandHandler already performed is taken here regardless of the
+    // ACCEPTED outcome. The terminal result is already known (CommandHandler
+    // is never re-invoked), so it is queued directly - never published in
+    // this same call - preserving ACCEPTED-before-terminal ordering whether
+    // ACCEPTED just published or is itself now queued ahead of it. Neither
+    // case is a publish failure for the terminal itself - it was never
+    // attempted here - so report distinctly *why* it is pending instead of
+    // conflating either with TerminalPublishFailed, which only fires once a
+    // real publish attempt for this entry actually happens and fails.
+    enqueue({topics_.responsesIngest(), terminalPayload, MqttQos::AtLeastOnce,
+             /*isTerminal=*/true, seq, terminalCode});
+    if (diagnosticCallback_) {
+      diagnosticCallback_({result.acceptedPublished
+                               ? CommandDiagnosticStage::TerminalDeferred
+                               : CommandDiagnosticStage::TerminalQueuedBehindAccepted,
+                           terminalCode, 0, 0, seq});
+    }
     if (!result.acceptedPublished) {
-      // Fail closed for any future physical action: until ACCEPTED is
-      // actually confirmed published, no action beyond what CommandHandler
-      // already performed is taken. The terminal result is already known
-      // (CommandHandler is never re-invoked), so queue it directly behind
-      // ACCEPTED in the outbox rather than attempting to publish it now -
-      // that would risk delivering it before ACCEPTED if the connection
-      // recovers between the two publish attempts.
-      enqueue({topics_.responsesIngest(), terminalPayload,
-               MqttQos::AtLeastOnce, /*isTerminal=*/true, seq, terminalCode});
-      if (diagnosticCallback_) {
-        diagnosticCallback_({CommandDiagnosticStage::TerminalPending,
-                             terminalCode, 0, 0, seq});
-      }
       Logger::error(
           "Remote command ACCEPTED response publish failed; queued for retry");
-      return result;
     }
+    return result;
   }
 
+  // No ACCEPTED needed (e.g. a duplicate command replay) - this is the only
+  // response for this call, so a single publish attempt here still respects
+  // the one-publish-per-call rule.
   result.terminalPublished = publishOrQueue(
       topics_.responsesIngest(), terminalPayload, MqttQos::AtLeastOnce,
       /*isTerminal=*/true, seq, terminalCode);
@@ -175,9 +207,12 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
         "Remote command terminal response publish failed; queued for retry");
   }
   if (diagnosticCallback_) {
+    // This path always actually attempts the publish immediately (there is
+    // no ACCEPTED to defer behind), so a failure here is a real
+    // TerminalPublishFailed, never TerminalDeferred/TerminalQueuedBehindAccepted.
     diagnosticCallback_({result.terminalPublished
                              ? CommandDiagnosticStage::TerminalPublished
-                             : CommandDiagnosticStage::TerminalPending,
+                             : CommandDiagnosticStage::TerminalPublishFailed,
                          terminalCode, 0, 0, seq});
   }
   return result;

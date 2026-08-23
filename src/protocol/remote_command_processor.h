@@ -21,14 +21,35 @@ enum class CommandDiagnosticStage {
   Received,
   ValidationPassed,
   Rejected,
+  // ACCEPTED was actually attempted (immediately, in processPayload()) and
+  // published.
   AcceptedPublished,
-  // Publish failed; the response is queued in the outbox for retry after
-  // reconnect. Never a device-side command result - do not confuse with a
+  // ACCEPTED was actually attempted and the publish itself failed; queued
+  // for retry. Never a device-side command result - do not confuse with a
   // terminal status/error code.
   AcceptedPending,
+  // An ACCEPTED entry drained from the outbox was actually attempted again
+  // and failed; still queued for a later retry. (ACCEPTED itself is always
+  // attempted immediately when a command first arrives - see
+  // processPayload() - so this can only happen on a later drain retry.)
+  AcceptedPublishFailed,
+  // The terminal was actually attempted and published - either immediately
+  // (a duplicate command replay with no ACCEPTED to defer behind) or later
+  // via drainOutbox().
   TerminalPublished,
-  // Same as AcceptedPending, but for the terminal response.
-  TerminalPending,
+  // ACCEPTED just published successfully; the terminal is queued for the
+  // next iteration and has NOT been attempted at all yet. Not a failure.
+  TerminalDeferred,
+  // ACCEPTED itself failed/is pending; the terminal is queued behind it and
+  // has NOT been attempted at all yet. Not a failure by itself - the
+  // AcceptedPending event alongside it already reports the real failure.
+  TerminalQueuedBehindAccepted,
+  // The terminal was actually attempted and the publish itself failed;
+  // still queued - either immediately (a duplicate command replay with no
+  // ACCEPTED to defer behind) or later via drainOutbox(). The transport
+  // layer already logs the sanitized mqtt_err=N for the underlying
+  // failure - this reports the RemoteCommandProcessor-level outcome.
+  TerminalPublishFailed,
 };
 struct CommandDiagnostic {
   CommandDiagnosticStage stage;
@@ -41,13 +62,17 @@ struct CommandDiagnostic {
 };
 using CommandDiagnosticCallback = std::function<void(const CommandDiagnostic &)>;
 
-// Bounded, RAM-only outbox capacity. processPending() never starts a new
-// queued command while the outbox is non-empty (see below), so under that
-// invariant at most one command's own pair of responses (ACCEPTED +
-// terminal) can ever be pending at once. kMaxOutboxSize exists as an
-// explicit, logged backstop for that invariant being bypassed (e.g. a
-// direct processPayload() call while responses are already queued) - not as
-// working capacity for multiple commands' worth of delayed responses.
+// Bounded, RAM-only outbox capacity. The terminal response is always
+// deferred here (never published in the same call as ACCEPTED - see
+// processPayload()), so the outbox is populated on essentially every
+// command with ACCEPTED, not only on a publish failure. processPending()
+// never starts a new queued command while the outbox is non-empty (see
+// below), so under that invariant at most one command's own pair of
+// responses (ACCEPTED + terminal) can ever be pending at once.
+// kMaxOutboxSize exists as an explicit, logged backstop for that invariant
+// being bypassed (e.g. a direct processPayload() call while responses are
+// already queued) - not as working capacity for multiple commands' worth of
+// delayed responses.
 constexpr size_t kMaxOutboxSize = 2;
 
 class RemoteCommandProcessor {
@@ -60,15 +85,23 @@ public:
   // command there would publish recursively through the same client and can
   // deadlock its socket/TLS state. Drain commands from the main loop instead.
   //
-  // If an earlier response is still stuck in the outbox (last publish
-  // attempt failed), this attempts to publish only that one response and
-  // returns - it never starts a new command until the outbox is empty. This
-  // is what keeps ACCEPTED/terminal ordering strict across a reconnect, and
-  // it bounds each call to at most one publish attempt (which can itself
-  // block up to the configured transport timeout), never a burst. It never
-  // re-invokes CommandHandler: outbox entries are already-serialized
-  // response payloads.
+  // Every call here attempts at most one response publish, full stop -
+  // whether that is starting a brand-new command (which itself only
+  // attempts ACCEPTED, never the terminal too - see processPayload()) or
+  // draining one item off the outbox. Two back-to-back QoS 1 publishes with
+  // no transport.poll() in between (which happens naturally between separate
+  // processPending() calls in the real main loop) is what caused the second
+  // publish to intermittently fail even when the first one succeeded. If an
+  // earlier response is still stuck in the outbox, this never starts a new
+  // command until the outbox is empty - that is what keeps ACCEPTED/terminal
+  // ordering strict across a reconnect. It never re-invokes CommandHandler:
+  // outbox entries are already-serialized response payloads.
   void processPending();
+  // Starts a new command. Attempts to publish ACCEPTED (if any) at most
+  // once; the terminal response is always deferred to a later
+  // processPending() call - even when ACCEPTED just published successfully
+  // - never attempted within this same call. See processPending()'s
+  // one-publish-per-call contract.
   CommandPublishResult processPayload(const std::string &payload);
   const CommandPublishResult &lastResult() const;
   void setDiagnosticCallback(CommandDiagnosticCallback callback);
