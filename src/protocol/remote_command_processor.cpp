@@ -53,8 +53,20 @@ void RemoteCommandProcessor::drainOutbox() {
   // docs/communication-protocol.md > Duplicate Command Protection > 20.1).
   // At most one publish attempt happens here (it can itself block up to the
   // configured transport timeout) - never a burst of retries in one call.
-  if (!transport_.publish(front.topic, front.payload, front.qos))
+  if (!transport_.publish(front.topic, front.payload, front.qos)) {
+    // A real publish attempt happened here and failed - distinct from
+    // TerminalDeferred/TerminalQueuedBehindAccepted, neither of which ever
+    // attempts a publish at all. Esp32AwsIotTransport::publish() already
+    // logged the sanitized mqtt_err=N for the transport-level failure; this
+    // reports the RemoteCommandProcessor-level outcome (still queued).
+    if (diagnosticCallback_) {
+      diagnosticCallback_({front.isTerminal
+                               ? CommandDiagnosticStage::TerminalPublishFailed
+                               : CommandDiagnosticStage::AcceptedPublishFailed,
+                           front.safeCode, 0, 0, front.commandSeq});
+    }
     return; // Still unreachable - left queued; retry on a later call.
+  }
   // Keep lastResult() converging to the truth even though the terminal (and,
   // on an ACCEPTED failure, ACCEPTED itself) is now always published via a
   // later drain rather than within the original processPayload() call.
@@ -164,11 +176,17 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
     // ACCEPTED outcome. The terminal result is already known (CommandHandler
     // is never re-invoked), so it is queued directly - never published in
     // this same call - preserving ACCEPTED-before-terminal ordering whether
-    // ACCEPTED just published or is itself now queued ahead of it.
+    // ACCEPTED just published or is itself now queued ahead of it. Neither
+    // case is a publish failure for the terminal itself - it was never
+    // attempted here - so report distinctly *why* it is pending instead of
+    // conflating either with TerminalPublishFailed, which only fires once a
+    // real publish attempt for this entry actually happens and fails.
     enqueue({topics_.responsesIngest(), terminalPayload, MqttQos::AtLeastOnce,
              /*isTerminal=*/true, seq, terminalCode});
     if (diagnosticCallback_) {
-      diagnosticCallback_({CommandDiagnosticStage::TerminalPending,
+      diagnosticCallback_({result.acceptedPublished
+                               ? CommandDiagnosticStage::TerminalDeferred
+                               : CommandDiagnosticStage::TerminalQueuedBehindAccepted,
                            terminalCode, 0, 0, seq});
     }
     if (!result.acceptedPublished) {
@@ -189,9 +207,12 @@ RemoteCommandProcessor::processPayload(const std::string &payload) {
         "Remote command terminal response publish failed; queued for retry");
   }
   if (diagnosticCallback_) {
+    // This path always actually attempts the publish immediately (there is
+    // no ACCEPTED to defer behind), so a failure here is a real
+    // TerminalPublishFailed, never TerminalDeferred/TerminalQueuedBehindAccepted.
     diagnosticCallback_({result.terminalPublished
                              ? CommandDiagnosticStage::TerminalPublished
-                             : CommandDiagnosticStage::TerminalPending,
+                             : CommandDiagnosticStage::TerminalPublishFailed,
                          terminalCode, 0, 0, seq});
   }
   return result;

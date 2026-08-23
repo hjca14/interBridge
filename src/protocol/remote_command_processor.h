@@ -21,14 +21,35 @@ enum class CommandDiagnosticStage {
   Received,
   ValidationPassed,
   Rejected,
+  // ACCEPTED was actually attempted (immediately, in processPayload()) and
+  // published.
   AcceptedPublished,
-  // Publish failed; the response is queued in the outbox for retry after
-  // reconnect. Never a device-side command result - do not confuse with a
+  // ACCEPTED was actually attempted and the publish itself failed; queued
+  // for retry. Never a device-side command result - do not confuse with a
   // terminal status/error code.
   AcceptedPending,
+  // An ACCEPTED entry drained from the outbox was actually attempted again
+  // and failed; still queued for a later retry. (ACCEPTED itself is always
+  // attempted immediately when a command first arrives - see
+  // processPayload() - so this can only happen on a later drain retry.)
+  AcceptedPublishFailed,
+  // The terminal was actually attempted and published - either immediately
+  // (a duplicate command replay with no ACCEPTED to defer behind) or later
+  // via drainOutbox().
   TerminalPublished,
-  // Same as AcceptedPending, but for the terminal response.
-  TerminalPending,
+  // ACCEPTED just published successfully; the terminal is queued for the
+  // next iteration and has NOT been attempted at all yet. Not a failure.
+  TerminalDeferred,
+  // ACCEPTED itself failed/is pending; the terminal is queued behind it and
+  // has NOT been attempted at all yet. Not a failure by itself - the
+  // AcceptedPending event alongside it already reports the real failure.
+  TerminalQueuedBehindAccepted,
+  // The terminal was actually attempted and the publish itself failed;
+  // still queued - either immediately (a duplicate command replay with no
+  // ACCEPTED to defer behind) or later via drainOutbox(). The transport
+  // layer already logs the sanitized mqtt_err=N for the underlying
+  // failure - this reports the RemoteCommandProcessor-level outcome.
+  TerminalPublishFailed,
 };
 struct CommandDiagnostic {
   CommandDiagnosticStage stage;

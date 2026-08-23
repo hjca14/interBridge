@@ -658,20 +658,35 @@ this pass:)*
   publishes in immediate succession, which intermittently made the second
   one fail on real hardware even without a broken socket. Fixed by always
   deferring the terminal to the next `processPending()` call/loop
-  iteration, so every call site attempts at most one response publish.
-  Confirmed via native tests (`test_no_single_call_attempts_two_response_publishes`
-  and others in `test/test_remote_command_processor/test_main.cpp`); not yet
-  re-validated on real hardware after this specific change.
+  iteration, so every call site attempts at most one response publish. This
+  is now **bench-confirmed** too: a subsequent real-hardware run showed the
+  terminal recovering normally on the deferred iteration when nothing failed
+  (no `AWS IoT publish failed` log at all - just an intentional one-loop
+  defer), and recovering ACCEPTED-then-terminal in order when the ACCEPTED
+  publish genuinely failed (`mqtt_err=-9` observed). Diagnostic wording was
+  further split (`TerminalDeferred` / `TerminalQueuedBehindAccepted` /
+  `TerminalPublishFailed` / `TerminalPublished`) so a deferred-but-not-yet-
+  attempted terminal is never logged as "publish failed" - see
+  docs/mqtt-dev-smoke-test.md's outbox section.
 - `DevMqttSmokeState::update()`'s `WaitingForTime` branch could reissue
   `configTime()` before a previous SNTP attempt (asynchronous, unlike the
   synchronous DNS lookup) had a chance to complete, once the exponential
   backoff interval became shorter than a real sync round trip - a plausible
   explanation for "time sync requested" repeating for a long time on one
-  real boot. Fixed with a `timeSyncInProgress` guard (see
-  docs/mqtt-dev-smoke-test.md > Real bench observation). The ~78 s of DNS
-  failures on that same boot was not changed - it is consistent with
-  ordinary bounded exponential backoff over a slow/unavailable resolver
-  path, not a code defect that was found.
+  real boot. A first fix gated this on the caller's
+  `sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS`; real hardware
+  still showed several `time sync requested` lines before sync completed
+  (recovering within 30 s regardless), showing that status is not reliable
+  as the sole guard - it can apparently stay reset/idle for a while after
+  `configTime()` is called. Replaced with a self-contained, bounded,
+  configurable in-flight timer entirely inside `DevMqttSmokeState` (no
+  external status consulted at all) - see docs/mqtt-dev-smoke-test.md > Real
+  bench observation for the full mechanism and its tests. Whether this
+  fully eliminates the repeated log lines on real hardware has not been
+  re-validated yet (only `pio run`/native tests so far for this specific
+  change). The ~78 s of DNS failures on that same boot was not changed - it
+  is consistent with ordinary bounded exponential backoff over a
+  slow/unavailable resolver path, not a code defect that was found.
 
 ## Future Work
 

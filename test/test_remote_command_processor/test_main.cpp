@@ -194,6 +194,96 @@ void test_terminal_diagnostic_reports_safe_capability_code_without_ids() {
   TEST_ASSERT_EQUAL(std::string::npos, terminalCodes[0].find(kCommandId));
 }
 
+// Scenario 1: ACCEPTED publishes normally. The terminal is only deferred to
+// the next iteration - never attempted, never a failure. No log line may
+// describe this as anything failing.
+void test_diagnostic_accepted_success_defers_terminal_without_error() {
+  Fixture fixture;
+  bool sawAcceptedPublished = false, sawTerminalDeferred = false, sawWrongStage = false;
+  fixture.processor.setDiagnosticCallback(
+      [&](const CommandDiagnostic &diagnostic) {
+        if (diagnostic.stage == CommandDiagnosticStage::AcceptedPublished)
+          sawAcceptedPublished = true;
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalDeferred)
+          sawTerminalDeferred = true;
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalPublishFailed ||
+            diagnostic.stage == CommandDiagnosticStage::TerminalQueuedBehindAccepted)
+          sawWrongStage = true;
+      });
+
+  fixture.processor.processPayload(commandJson());
+
+  TEST_ASSERT_TRUE(sawAcceptedPublished);
+  TEST_ASSERT_TRUE(sawTerminalDeferred);
+  TEST_ASSERT_FALSE(sawWrongStage);
+  // Nothing failed at all - no log line should have been emitted.
+  TEST_ASSERT_TRUE(capturedLogs.empty());
+}
+
+// Scenario 2: ACCEPTED itself fails to publish. The terminal is queued
+// behind it, still never attempted - its own diagnostic stage must not
+// claim a publish failure; only ACCEPTED's real failure is logged, and that
+// log never mentions the terminal at all.
+void test_diagnostic_accepted_failure_queues_terminal_behind_it() {
+  Fixture fixture;
+  fixture.transport.armPublishFailure(1);
+  bool sawAcceptedPending = false, sawTerminalQueuedBehindAccepted = false, sawWrongStage = false;
+  fixture.processor.setDiagnosticCallback(
+      [&](const CommandDiagnostic &diagnostic) {
+        if (diagnostic.stage == CommandDiagnosticStage::AcceptedPending)
+          sawAcceptedPending = true;
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalQueuedBehindAccepted)
+          sawTerminalQueuedBehindAccepted = true;
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalPublishFailed ||
+            diagnostic.stage == CommandDiagnosticStage::TerminalDeferred)
+          sawWrongStage = true;
+      });
+
+  fixture.processor.processPayload(commandJson());
+
+  TEST_ASSERT_TRUE(sawAcceptedPending);
+  TEST_ASSERT_TRUE(sawTerminalQueuedBehindAccepted);
+  TEST_ASSERT_FALSE(sawWrongStage);
+  bool sawAcceptedFailureLog = false;
+  for (const std::string &line : capturedLogs) {
+    if (line.find("ACCEPTED") != std::string::npos &&
+        line.find("failed") != std::string::npos)
+      sawAcceptedFailureLog = true;
+    // The real ACCEPTED failure log must never talk about "terminal" - that
+    // would misattribute the failure.
+    TEST_ASSERT_EQUAL(std::string::npos, line.find("terminal"));
+  }
+  TEST_ASSERT_TRUE(sawAcceptedFailureLog);
+}
+
+// Scenario 3: the terminal is actually attempted (during drain) and that
+// attempt fails - this is the only case allowed to report a real terminal
+// publish failure.
+void test_diagnostic_terminal_drain_failure_reports_still_queued() {
+  Fixture fixture;
+  // Call #1 = ACCEPTED (succeeds). Call #2 = the deferred terminal's first
+  // drain attempt (fails).
+  fixture.transport.armPublishFailureOnCall(2);
+  bool sawTerminalPublishFailed = false, sawWrongStage = false;
+  fixture.processor.setDiagnosticCallback(
+      [&](const CommandDiagnostic &diagnostic) {
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalPublishFailed)
+          sawTerminalPublishFailed = true;
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalQueuedBehindAccepted)
+          sawWrongStage = true;
+      });
+
+  fixture.processor.processPayload(commandJson()); // ACCEPTED ok, terminal deferred
+  fixture.processor.processPending(); // drain attempt hits the armed failure
+
+  TEST_ASSERT_TRUE(sawTerminalPublishFailed);
+  TEST_ASSERT_FALSE(sawWrongStage);
+  TEST_ASSERT_EQUAL(1, fixture.processor.pendingResponseCount());
+}
+
+// Scenario 4 (terminal actually published) is already covered by
+// test_terminal_diagnostic_reports_safe_capability_code_without_ids above.
+
 void test_duplicate_publishes_only_stored_terminal_response() {
   Fixture fixture;
 
@@ -686,6 +776,9 @@ int main(int argc, char **argv) {
   UNITY_BEGIN();
   RUN_TEST(test_valid_open_door_publishes_accepted_then_capability_disabled);
   RUN_TEST(test_terminal_diagnostic_reports_safe_capability_code_without_ids);
+  RUN_TEST(test_diagnostic_accepted_success_defers_terminal_without_error);
+  RUN_TEST(test_diagnostic_accepted_failure_queues_terminal_behind_it);
+  RUN_TEST(test_diagnostic_terminal_drain_failure_reports_still_queued);
   RUN_TEST(test_duplicate_publishes_only_stored_terminal_response);
   RUN_TEST(test_deduplication_survives_handler_and_cache_reconstruction);
   RUN_TEST(test_strict_parser_rejects_invalid_contract_payloads);

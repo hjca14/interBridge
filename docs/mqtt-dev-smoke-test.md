@@ -61,26 +61,48 @@ recursively publish while the MQTT/TLS client is dispatching an inbound packet.
 TLS stream operations use the configured one-second timeout, while the complete
 AWS IoT TLS handshake has its own ten-second limit.
 
-If a response publish fails, it is queued in a small bounded RAM outbox
-(`RemoteCommandProcessor`, `kMaxOutboxSize = 2`) instead of being dropped, and the
-harness explicitly tears the MQTT/TLS session down (`transport.disconnect()`) as
-soon as it observes the session invalidated, even if Wi-Fi and NTP time remain
-fine - a publish/subscribe/poll failure alone is now treated as an untrustworthy
-session. `Esp32AwsIotTransport` also allocates a fresh `WiFiClientSecure` on every
-reconnect rather than reusing the previous socket/TLS object. Each main-loop
-iteration attempts to publish at most one queued response (never a burst - a
-single publish can itself block up to the configured timeout); the outbox drains
-oldest-first, ACCEPTED before its terminal response, once the harness reconnects
-and resubscribes, and a retry never re-invokes `CommandHandler`. It never evicts
-an already-pending response to make room for a new one - `kMaxOutboxSize` is a
-backstop for the ordinary "never start a new command while the outbox is
-non-empty" invariant being violated, not working capacity for several commands.
-Log lines add a local `seq` counter to correlate a command's ACCEPTED/terminal
-lines without ever logging `command_id`. The outbox is RAM-only: a reboot loses
-any response still queued at that moment (the command itself was already handled
-exactly once; only its delivery confirmation to the backend is at risk, and the
-backend must treat a republished ACCEPTED/terminal for the same `command_id`
-idempotently per
+A valid command publishes ACCEPTED immediately, but its terminal response is
+always deferred to the next main-loop iteration - never attempted in the same
+call, even when ACCEPTED itself just published successfully. Two back-to-back
+QoS 1 publishes with no `transport.poll()` in between (which happens naturally
+between separate loop iterations) is what caused the terminal publish to fail
+intermittently on real hardware even when ACCEPTED succeeded. Any response that
+fails to publish (immediately or on a later drain) is queued in a small bounded
+RAM outbox (`RemoteCommandProcessor`, `kMaxOutboxSize = 2`) instead of being
+dropped, and the harness explicitly tears the MQTT/TLS session down
+(`transport.disconnect()`) as soon as it observes the session invalidated, even
+if Wi-Fi and NTP time remain fine - a publish/subscribe/poll failure alone is
+now treated as an untrustworthy session. `Esp32AwsIotTransport` also allocates a
+fresh `WiFiClientSecure` on every reconnect rather than reusing the previous
+socket/TLS object. Each main-loop iteration attempts to publish at most one
+response - starting a brand-new command, or draining one queued item - never a
+burst; the outbox drains oldest-first, ACCEPTED before its terminal response,
+once the harness reconnects and resubscribes, and a retry never re-invokes
+`CommandHandler`. It never evicts an already-pending response to make room for a
+new one - `kMaxOutboxSize` is a backstop for the ordinary "never start a new
+command while the outbox is non-empty" invariant being violated, not working
+capacity for several commands.
+
+Diagnostic log lines distinguish exactly why a terminal response is pending -
+never using "publish failed" wording for a response that was simply deferred
+and never attempted:
+
+```text
+terminal deferred (queued for next iteration) seq=N code=...   ACCEPTED just published; terminal not attempted yet
+terminal queued behind pending ACCEPTED seq=N code=...         ACCEPTED itself failed; terminal not attempted yet
+terminal publish failed; still queued seq=N code=...           a real publish attempt for the terminal happened and failed
+terminal published seq=N code=...                              the terminal actually published
+```
+
+The transport layer's own `AWS IoT publish failed; ... (mqtt_err=N)` log line
+remains the evidence of an actual MQTT-level failure; the lines above report
+the `RemoteCommandProcessor`-level outcome and never repeat that wording for a
+response that was only deferred, not attempted. Log lines add a local `seq`
+counter to correlate a command's ACCEPTED/terminal lines without ever logging
+`command_id`. The outbox is RAM-only: a reboot loses any response still queued
+at that moment (the command itself was already handled exactly once; only its
+delivery confirmation to the backend is at risk, and the backend must treat a
+republished ACCEPTED/terminal for the same `command_id` idempotently per
 `docs/communication-protocol.md` section 20.1).
 
 The local heartbeat reports current state plus free/minimum heap and remaining
@@ -193,18 +215,46 @@ this PR does not otherwise touch DNS/NTP:
   (starting at 1 s) became shorter than a real SNTP round trip, this could
   call `configTime()` again before the prior attempt ever completed,
   restarting it and starving synchronization indefinitely - a plausible
-  explanation for "time sync requested" repeating for a long time. Fixed
-  with a non-blocking guard: `update()` gained a `timeSyncInProgress`
-  parameter (default `false`, so existing callers/tests are unaffected);
-  `mqtt_smoke_main.cpp`'s `NtpClock` now exposes `syncInProgress()`
-  (`sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS`) and passes it
-  in. While true, `ConfigureTime` is never reissued even past the backoff
-  deadline; once it clears (success or failure), the already-elapsed
-  deadline fires immediately - no extra wait is imposed by having deferred
-  it. No sleep was added. See
-  `test_time_sync_in_progress_defers_reissuing_configure_time` in
+  explanation for "time sync requested" repeating for a long time.
+
+  A first fix gated this on a caller-supplied `sntp_get_sync_status() ==
+  SNTP_SYNC_STATUS_IN_PROGRESS` signal. A real-hardware re-test still showed
+  several `time sync requested` lines before sync completed (recovering
+  within 30 s regardless) - that status evidently can stay reset/idle for a
+  while after `configTime()` is called, so it cannot serve as the sole
+  guard on its own. The fix does not rely on it anymore: `DevMqttSmokeState`
+  now tracks a single ConfigureTime attempt as in flight itself, entirely
+  with its own state:
+
+  - the moment `update()` issues `ConfigureTime`, it marks the attempt in
+    flight and records a bounded, configurable deadline
+    (`ntpAttemptTimeoutMs`, constructor parameter, default 15 s);
+  - while in flight, `ConfigureTime` is never reissued, even past the
+    ordinary backoff deadline, regardless of what any external status
+    reports;
+  - the attempt is cleared the moment `timeValid` becomes true (the real
+    completion signal, driven by the caller's own sync-complete callback
+    via `NtpClock::syncCompleted()`), letting the state machine continue
+    into `WaitingForMqtt` immediately;
+  - if `timeValid` never becomes true before the attempt's own timeout
+    elapses, it is abandoned and exactly one fresh retry is allowed once the
+    ordinary backoff deadline has also been reached - the timeout does not
+    bypass that floor;
+  - the timeout deadline reuses the same wrap-safe `deadlineReached()`
+    comparison as the rest of the state machine; no sleep, busy wait, or
+    wall-clock read was introduced.
+
+  `NtpClock::syncInProgress()` (the `sntp_get_sync_status()` wrapper) is
+  still used, but only for `hasValidTime()`'s own pre-existing settling gate
+  (Phase 2D clock correction, below) - not to gate `ConfigureTime` retries.
+  See `test_ntp_attempt_marks_in_flight_and_suppresses_reissue_until_timeout`,
+  `test_ntp_sync_completion_clears_in_flight_and_continues_to_mqtt`,
+  `test_ntp_attempt_timeout_allows_exactly_one_fresh_retry`,
+  `test_ntp_attempt_timeout_is_wrap_safe`, and
+  `test_ntp_attempt_in_flight_does_not_reissue_across_many_rapid_updates` in
   `test/test_dev_mqtt_state/test_main.cpp`. This does not by itself explain
-  why SNTP never completed on that boot (that remains an unconfirmed
-  network/environment hypothesis, not a diagnosed root cause) - it only
-  removes a plausible self-inflicted way the firmware could have prevented
-  its own retry from ever succeeding.
+  why SNTP took as long as it did to complete on the observed boot (that
+  remains an unconfirmed network/environment hypothesis, not a diagnosed
+  root cause) - it only removes a self-inflicted way the firmware could
+  have kept restarting its own retry before it ever had a chance to
+  succeed.

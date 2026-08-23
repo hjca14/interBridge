@@ -462,6 +462,14 @@ its real status - it never re-invokes `CommandHandler` or the dedup cache. The
 outbox is RAM-only and does not survive reboot, matching the event outbox's
 documented in-memory-during-development posture (section 17 of the protocol doc).
 
+`CommandDiagnosticStage` distinguishes exactly why a terminal is still pending -
+`TerminalDeferred` (ACCEPTED just published; not attempted yet, not a failure),
+`TerminalQueuedBehindAccepted` (ACCEPTED itself failed; not attempted yet, not a
+failure - `AcceptedPending` alongside it already reports the real failure), and
+`TerminalPublishFailed` (a real publish attempt happened and failed). None of
+the first two are ever worded as a publish failure; only the third is, matching
+what actually happened.
+
 `CommandHandler::handle()` computes ACCEPTED and the terminal result synchronously,
 before ACCEPTED is even attempted - safe only because `DoorOpenCapability` stays
 `Disabled` and no physical action is taken. A future capability that actually
