@@ -538,11 +538,17 @@ void test_multiple_consecutive_commands_do_not_interleave_responses() {
       strstr(fixture.transport.publishedMessages()[1].payload.c_str(),
              "CAPABILITY_DISABLED"));
 
-  // Only now does the second, previously queued command get processed.
+  // Only now does the second, previously queued command get processed - and
+  // it too only publishes its own ACCEPTED in this call, deferring its
+  // terminal to yet another iteration (the same one-publish-per-call rule
+  // applies to every command, not just the first).
   fixture.processor.processPending();
-  TEST_ASSERT_EQUAL(4, fixture.transport.publishedMessages().size());
+  TEST_ASSERT_EQUAL(3, fixture.transport.publishedMessages().size());
   TEST_ASSERT_NOT_NULL(strstr(
       fixture.transport.publishedMessages()[2].payload.c_str(), "ACCEPTED"));
+
+  fixture.processor.processPending();
+  TEST_ASSERT_EQUAL(4, fixture.transport.publishedMessages().size());
   TEST_ASSERT_NOT_NULL(
       strstr(fixture.transport.publishedMessages()[3].payload.c_str(),
              "CAPABILITY_DISABLED"));
