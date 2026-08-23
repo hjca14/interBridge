@@ -10,8 +10,6 @@
 #include <time.h>
 #include <esp_sntp.h>
 #include <esp_system.h>
-#include <esp_task_wdt.h>
-#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include "interbridge_dev_secrets.h"
@@ -39,7 +37,6 @@ constexpr uint16_t kMqttKeepAliveSeconds = 300;
 constexpr uint16_t kMqttTimeoutMs = 1000;
 constexpr uint32_t kSerialWaitMs = 1500;
 constexpr uint32_t kHeartbeatMs = 15000;
-constexpr uint32_t kWatchdogSeconds = 20;
 // DEV backend considers a device stale after 120s. Publishing halfway through
 // that window leaves one missed-report margin without using the 15s log cadence.
 constexpr uint32_t kDevHealthIntervalMs = 60u * 1000u;
@@ -96,7 +93,6 @@ DevMqttSmokeState connectivity;
 uint32_t heartbeatAt = 0;
 bool subscribed = false;
 HealthReporter healthReporter(kDevHealthIntervalMs);
-Preferences diagnostics;
 DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
 
 const char* resetReasonName(esp_reset_reason_t reason) {
@@ -170,15 +166,9 @@ void setup() {
     while (!Serial && !DevMqttSmokeState::deadlineReached(millis(), serialDeadline)) delay(10);
     Serial.println("[DEV MQTT] production-path harness; physical actions disabled");
     Serial.println("[DEV MQTT] local configuration loaded into transient DEV memory (values not logged)");
-    diagnostics.begin("diagnostics", false);
-    const uint32_t bootCount = diagnostics.getUInt("boots", 0) + 1;
-    diagnostics.putUInt("boots", bootCount);
-    diagnostics.end();
-    Serial.printf("[DEV MQTT] boot count=%lu previous_reset=%s wifi_config=present\n",
-                  static_cast<unsigned long>(bootCount), resetReasonName(esp_reset_reason()));
+    Serial.printf("[DEV MQTT] previous_reset=%s wifi_config=present\n",
+                  resetReasonName(esp_reset_reason()));
     WiFi.onEvent(onWifiEvent);
-    esp_task_wdt_init(kWatchdogSeconds, true);
-    esp_task_wdt_add(nullptr);
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb(onTimeSynchronized);
@@ -215,11 +205,8 @@ void loop() {
     }
     switch (action) {
         case DevSmokeAction::ConnectWifi:
-            // Abort the expired driver attempt before starting exactly one new
-            // attempt. This also recovers a wedged station interface.
-            WiFi.disconnect(true, false);
-            WiFi.mode(WIFI_OFF);
-            delay(50);
+            // The state machine authorizes exactly one begin call per retry;
+            // leave interface recovery policy to the Wi-Fi driver for now.
             WiFi.mode(WIFI_STA);
             WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
             Serial.printf("[DEV MQTT] Wi-Fi connect requested; next_attempt_ms=%lu delay_ms=%lu\n",
@@ -270,9 +257,5 @@ void loop() {
     }
     publishHealth(now);
     heartbeat(now);
-    // This heartbeat is reached only after MQTT polling, callbacks and all
-    // socket operations returned. A stuck operation therefore cannot leave a
-    // stale `online` heartbeat indefinitely; the task watchdog resets it.
-    esp_task_wdt_reset();
     delay(10);
 }

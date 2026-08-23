@@ -23,12 +23,12 @@ public:
     tls_.setCACert(ca.c_str());
     tls_.setCertificate(cert.c_str());
     tls_.setPrivateKey(key.c_str());
-    // WiFiClientSecure otherwise inherits a long/default stream timeout.  All
-    // TLS reads and writes must return so the loop watchdog can be serviced.
+    // WiFiClientSecure otherwise inherits a long/default stream timeout. Keep
+    // individual TLS reads and writes bounded so the main loop remains live.
     tls_.setTimeout(timeout);
     // TLS negotiation can legitimately take several seconds on a congested
-    // link. Keep it bounded below the 20-second loop watchdog without applying
-    // the shorter stream timeout to the complete AWS IoT handshake.
+    // link. Keep it bounded without applying the shorter stream timeout to the
+    // complete AWS IoT handshake.
     tls_.setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
     mqtt_.begin(endpoint.c_str(), port, tls_);
     mqtt_.setOptions(keepAlive, true, timeout);

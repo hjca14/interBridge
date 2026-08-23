@@ -59,17 +59,16 @@ MQTT receive callbacks only validate and enqueue commands. The main loop drains
 that bounded queue after `MQTTClient::loop()` returns, so command responses never
 recursively publish while the MQTT/TLS client is dispatching an inbound packet.
 TLS stream operations use the configured one-second timeout, while the complete
-AWS IoT TLS handshake has its own ten-second limit. A task watchdog is fed only
-after the complete loop (including network work) returns.
+AWS IoT TLS handshake has its own ten-second limit.
 
 The local heartbeat reports current state plus free/minimum heap and remaining
-loop-task stack. Boot diagnostics report the previous reset reason, persistent
-boot count, and only whether Wi-Fi configuration is present. Wi-Fi driver events
-include disconnect reason codes. Each expired Wi-Fi attempt is explicitly torn
-down before one new `WiFi.begin()`, with capped backoff and the next deadline
-logged. External network outages never trigger a timed restart: retries continue
-indefinitely, while a call genuinely stuck inside the local network stack is
-recovered by the watchdog.
+loop-task stack. Boot diagnostics report the previous reset reason and only
+whether Wi-Fi configuration is present. Wi-Fi driver events include disconnect
+reason codes. The state machine authorizes one `WiFi.begin()` per attempt, with
+capped backoff and the next deadline logged;
+it deliberately leaves the interface running between retries so bench testing can
+observe the driver's normal, non-aggressive recovery behavior. External network
+outages never trigger a timed restart.
 
 ## Local credentials and build
 
