@@ -143,21 +143,44 @@ void test_ntp_attempt_timeout_allows_exactly_one_fresh_retry() {
 
 // The flight timeout deadline reuses the same wrap-safe deadlineReached()
 // comparison as the rest of the state machine.
+//
+// deadlineReached() only gives the intuitively-correct answer when the two
+// timestamps being compared are already "close" to each other on the 32-bit
+// circle (within ~2^31) - jumping nowMs from a small value straight to one
+// near the wrap while comparing it against an unrelated small deadline
+// (e.g. the constructor's default retryAtMs_ = 0) is indistinguishable from
+// going backward in time and is misinterpreted accordingly. That is a
+// property of the wraparound scheme itself (millis() in reality only ever
+// advances by small increments), not something to work around: the fix is
+// to keep every timestamp in this test consistently near the wrap instead
+// of jumping from small bootstrap values.
 void test_ntp_attempt_timeout_is_wrap_safe() {
-    DevMqttSmokeState state(10, 40, 20);
+    // A much larger backoff ceiling than the flight timeout, so the
+    // ordinary backoff deadline stays comfortably in the future relative to
+    // the flight timeout - keeps this test isolated to only the flight
+    // timeout's own wrap-safety, without a coincidentally-also-elapsed
+    // backoff deadline immediately re-arming a new attempt in the same call.
+    DevMqttSmokeState state(1000, 4000, 20);
     const uint32_t nearWrap = 0xFFFFFFF0u; // 16 before millis() would wrap to 0
-    state.update(nearWrap, false, false, false);
+    // wifiConnected=true from the very first call skips the WaitingForWifi
+    // retry check (which would otherwise compare nearWrap against the
+    // constructor's small default retryAtMs_ = 0 - an unrelated corner this
+    // test isn't about) and lets enter() seed retryAtMs_ directly from
+    // nearWrap instead.
     state.update(nearWrap, true, false, false);
     state.dnsResult(nearWrap, true);
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConfigureTime),
                       static_cast<int>(state.update(nearWrap, true, false, false)));
     TEST_ASSERT_TRUE(state.ntpAttemptInFlight());
 
-    // Flight deadline (nearWrap + 20) wraps past 0xFFFFFFFF.
+    // Flight deadline (nearWrap + 20) wraps past 0xFFFFFFFF to 4; the
+    // ordinary backoff deadline (nearWrap + 1000) also wraps, to 984 - far
+    // enough past 4 that it plays no part in what this test checks.
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
                       static_cast<int>(state.update(nearWrap + 19, true, false, false)));
     TEST_ASSERT_TRUE(state.ntpAttemptInFlight());
-    state.update(nearWrap + 20, true, false, false);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(nearWrap + 20, true, false, false)));
     TEST_ASSERT_FALSE(state.ntpAttemptInFlight());
 }
 
