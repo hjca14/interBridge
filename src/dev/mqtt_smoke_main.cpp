@@ -114,10 +114,30 @@ const char* resetReasonName(esp_reset_reason_t reason) {
     }
 }
 
+// Names only the specific SDK-defined reason codes observed on real
+// hardware, referencing esp_wifi_types.h's own named constants directly -
+// not a hand-copied duplicate of the whole wifi_err_reason_t enum (which
+// would drift against future core versions). Anything else stays
+// numeric-only in the log line already printed alongside this.
+const char* wifiDisconnectReasonName(uint8_t reason) {
+    switch (reason) {
+        case WIFI_REASON_NO_AP_FOUND: return "no_ap_found";
+        case WIFI_REASON_TIMEOUT: return "timeout";
+        default: return nullptr;
+    }
+}
+
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
-        Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u\n",
-                      static_cast<unsigned>(info.wifi_sta_disconnected.reason));
+        const uint8_t reason = info.wifi_sta_disconnected.reason;
+        const char* name = wifiDisconnectReasonName(reason);
+        if (name) {
+            Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u (%s)\n",
+                          static_cast<unsigned>(reason), name);
+        } else {
+            Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u\n",
+                          static_cast<unsigned>(reason));
+        }
     } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
         Serial.println("[DEV MQTT] wifi event=connected");
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
@@ -280,6 +300,31 @@ void loop() {
             Serial.println("[DEV MQTT] time sync requested");
             break;
         case DevSmokeAction::ConnectMqtt: {
+            // DNS preflight: a Wi-Fi association surviving does not prove
+            // the resolver is actually working (see CONTEXT.md's real-
+            // hardware finding - a device stayed WL_CONNECTED for ~110 min
+            // then lost DNS/TLS entirely). Resolve explicitly, once, before
+            // ever attempting the heavier TLS/socket connect; never trust a
+            // previous resolution as ongoing proof. The transport's own TLS
+            // client still does its own internal resolution inside
+            // transport.connect() below (out of our control, and not
+            // reimplemented here) - this preflight is an additional, cheap,
+            // explicit check so a DNS-specific failure is attributed
+            // correctly instead of surfacing only as an opaque MQTT connect
+            // failure.
+            const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
+            IPAddress preflightResolved;
+            const bool dnsOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, preflightResolved) == 1;
+            Serial.printf("[DEV MQTT] network preflight dns=%s\n", dnsOk ? "ok" : "failed");
+            if (!dnsOk) {
+                connectivity.networkPreflightFailed(now);
+                Serial.printf("[DEV MQTT] connectivity_failures=%lu next DNS attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
+                              static_cast<unsigned long>(connectivity.retryAtMs()),
+                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+                break;
+            }
+
             const bool connected = clockSource.hasValidTime() &&
                 transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
             if (connected) {
@@ -296,12 +341,30 @@ void loop() {
             connectivity.mqttResult(now, connected && subscribed);
             safeStatus("MQTT connect", connected && subscribed);
             if (!connected || !subscribed) {
-                Serial.printf("[DEV MQTT] next MQTT attempt at_ms=%lu delay_ms=%lu\n",
+                Serial.printf("[DEV MQTT] connectivity_failures=%lu next MQTT attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
                               static_cast<unsigned long>(connectivity.retryAtMs()),
                               static_cast<unsigned long>(connectivity.retryAtMs() - now));
             }
             break;
         }
+        case DevSmokeAction::RecoverWifi:
+            // Authorized only after several consecutive DNS/TLS connectivity
+            // failures with Wi-Fi already associated (see
+            // DevMqttSmokeState::recordConnectivityFailure()) - a
+            // conservative, cooldown-limited escalation, never a periodic
+            // reboot and never ESP.restart().
+            Serial.println("[DEV MQTT] wifi recovery requested");
+            if (transport.isConnected()) transport.disconnect();
+            subscribed = false;
+            // wifioff=false keeps the radio on; eraseap=false keeps the
+            // stored Wi-Fi credentials - only the current association is
+            // dropped. The ordinary ConnectWifi/backoff flow (unchanged)
+            // re-associates from here.
+            WiFi.disconnect(false, false);
+            Serial.printf("[DEV MQTT] wifi recovery cooldown until_ms=%lu\n",
+                          static_cast<unsigned long>(connectivity.wifiRecoveryCooldownUntilMs()));
+            break;
         case DevSmokeAction::None: break;
     }
     if (transport.isConnected()) {

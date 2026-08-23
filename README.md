@@ -129,6 +129,18 @@ The first controlled device test validated build/upload, USB CDC, 2.4 GHz
 Wi-Fi, MQTT/mTLS on port 8883 with an individual X.509 certificate, QoS 1
 command subscription, QoS 0 health, safe `OPEN_DOOR` rejection and response,
 and cold-boot reconnection. Transient DNS failures recovered through retry.
+A later real-hardware run stayed online ~110 minutes, then lost the MQTT/TLS
+session and DNS started failing (Wi-Fi itself stayed associated) - the
+symptoms point at a local Wi-Fi/DNS-path issue, not AWS, though the exact
+cause of that local degradation was not diagnosed. The DEV harness now
+performs an explicit DNS preflight before every MQTT (re)connection attempt
+and, after several consecutive DNS/TLS connectivity failures, a
+conservative, cooldown-limited Wi-Fi interface recovery (never
+`ESP.restart()`) - see [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)'s
+"Real bench observation: MQTT/TLS lost after ~110 minutes online". This is
+covered by native tests and compiles for both `esp32-c3`/`esp32-c3-dev-mqtt`,
+but has **not** been re-validated on real hardware yet, and local Wi-Fi
+reliability itself should not be considered fixed by this change alone.
 Access-point loss and return while the board stays powered has **not** yet been
 validated.
 

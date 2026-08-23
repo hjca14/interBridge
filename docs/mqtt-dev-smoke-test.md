@@ -137,7 +137,11 @@ outages never trigger a timed restart.
    provisioning action. Also exercise invalid clock, expiry, oversize, wrong-topic,
    duplicate, publish-failure, disconnect/reconnect, and one resubscribe per connection.
 6. In a future bench session, interrupt and restore the access point while the
-   board remains powered; that specific recovery scenario is not yet validated.
+   board remains powered, and separately block DNS/the AWS IoT endpoint at the
+   router/firewall while Wi-Fi stays associated - see "Real bench observation:
+   MQTT/TLS lost after ~110 minutes online" below for the network preflight
+   and Wi-Fi recovery ladder this should now exercise. Neither scenario has
+   been re-validated on real hardware since that change.
 
 The local header is ignored by Git. Selecting this environment without it fails
 at preprocessing with a clear error. The default `esp32-c3` environment neither
@@ -258,3 +262,96 @@ this PR does not otherwise touch DNS/NTP:
   root cause) - it only removes a self-inflicted way the firmware could
   have kept restarting its own retry before it ever had a chance to
   succeed.
+
+## Real bench observation: MQTT/TLS lost after ~110 minutes online
+
+A real bench device stayed online for roughly 110 minutes, then lost the
+MQTT/TLS session (`WiFiClientSecure connect(): start_ssl_client: -1`, `MQTT
+connect: failed`) and stayed disconnected for over an hour under the existing
+300 s-capped backoff - no crash, no heap leak observed. After the serial
+monitor was reattached: Wi-Fi disconnect reasons 201 (`no_ap_found`) and 39
+(`timeout`) appeared, Wi-Fi then reconnected and got an IP, the first DNS
+check that cycle succeeded, the first TLS connect after that failed with
+socket `errno 113`, and subsequent MQTT attempts then failed repeatedly in
+`hostByName()` - while the state machine's logged stage stayed `mqtt` the
+whole time, never explicitly returning to `dns`. **This does not establish
+AWS as the cause** - the symptoms (no AP found, association timeout, a
+socket-level TLS failure, then repeated resolver failures) point at a local
+Wi-Fi/DNS-path issue, and this section describes what was implemented in
+response, not a diagnosed root cause for why the local network/resolver
+degraded in the first place. It also does not claim local Wi-Fi is "fixed" -
+only that the firmware now detects and reacts to this class of failure
+instead of silently staying wedged in the `mqtt` stage.
+
+Two gaps were found and addressed, both in `DevMqttSmokeState` and its
+`mqtt_smoke_main.cpp` caller only - no protocol, AWS, credential, app,
+command, or hardware behavior was touched:
+
+- **DNS was never re-validated once past the initial bootstrap.** DNS was
+  only ever resolved once, before the first NTP sync; every MQTT
+  (re)connection attempt after that went straight to
+  `transport.connect()`, whose TLS client does its own hostname resolution
+  internally with no way for the state machine to distinguish "DNS is
+  broken" from "TLS/socket is broken" - a DNS failure there just looked like
+  an ordinary failed `ConnectMqtt`, retried forever with the *MQTT* stage's
+  backoff while the machine's own logged stage never said `dns`. Fixed: every
+  `ConnectMqtt` action now performs an explicit, sanitized DNS preflight
+  (`WiFi.hostByName()` on the already-configured endpoint, endpoint/IP never
+  logged) *before* attempting `transport.connect()`. On failure,
+  `transport.connect()` is not called at all;
+  `DevMqttSmokeState::networkPreflightFailed()` transitions the stage back to
+  `WaitingForDns` and the DNS stage's own backoff takes over, exactly like
+  the initial bootstrap. `timeValid` staying true means the pass back through
+  `WaitingForTime` never reissues `ConfigureTime` (same guard as above). This
+  does not eliminate the transport's own internal resolution inside
+  `transport.connect()` (out of this firmware's control) - the preflight is
+  an additional, cheap, explicit check, not a replacement for it, and it
+  calls `hostByName()` at most once per attempt cycle itself.
+- **No autonomous recovery existed for "Wi-Fi says connected, but DNS/TLS
+  doesn't actually work" for an extended period.** `DevMqttSmokeState` now
+  counts consecutive DNS-preflight/bootstrap and TLS/socket connectivity
+  failures (never response-publish failures - those already have their own
+  outbox/session-invalidation flow, see the outbox section above and
+  `docs/architecture.md`). After a conservative, configurable threshold
+  (`wifiRecoveryThreshold`, default **3**) of consecutive failures, exactly
+  one Wi-Fi interface recovery is authorized: the caller tears the transport
+  down and calls `WiFi.disconnect(false, false)` - radio stays on, stored
+  credentials are not erased - and the existing, unchanged
+  `ConnectWifi`/backoff flow re-associates from there, which itself requires
+  a fresh DNS preflight before any further TLS attempt (never jumps straight
+  back to `ConnectMqtt`). A configurable cooldown
+  (`wifiRecoveryCooldownMs`, default **10 minutes**) bounds how often this
+  escalation can fire, so a long-running local network/ISP outage does not
+  keep bouncing the radio; the ordinary per-stage backoff keeps retrying on
+  its own during a cooldown. A full MQTT connect **and** subscribe success
+  clears the failure counter and any active cooldown. Never `ESP.restart()`,
+  never a tight `WiFi.begin()` loop, no sleeps. See
+  `test_network_preflight_failure_returns_to_dns_without_reexecuting_ntp`,
+  `test_repeated_connectivity_failures_trigger_wifi_recovery_then_respect_cooldown`,
+  `test_full_mqtt_success_resets_connectivity_counters_and_recovery_state`,
+  `test_wifi_recovery_cooldown_deadline_is_wrap_safe`, and
+  `test_connectivity_counter_is_untouched_by_a_normal_successful_cycle` in
+  `test/test_dev_mqtt_state/test_main.cpp`.
+
+Diagnostic log additions (all sanitized - never SSID, endpoint, IP, payload,
+topic, `device_id`, certificate, private key, password, or other credential):
+`network preflight dns=ok|failed`, a `connectivity_failures=N` counter
+alongside the existing next-attempt lines, `wifi recovery requested`, `wifi
+recovery cooldown until_ms=N`, and named reason codes for the two Wi-Fi
+disconnect reasons observed on this bench boot (`reason=201 (no_ap_found)`,
+`reason=39 (timeout)`, from `esp_wifi_types.h`'s own
+`WIFI_REASON_NO_AP_FOUND`/`WIFI_REASON_TIMEOUT` constants - not a hand-copied
+duplicate of the whole reason enum; any other reason code stays numeric-only
+as before). `Esp32AwsIotTransport::connect()`'s own failure log now also
+carries the sanitized `mqtt_err=N` code, matching `publish()`'s existing one.
+
+This has been validated by native tests and by compiling both
+`esp32-c3`/`esp32-c3-dev-mqtt` - **it has not been re-tested on real
+hardware yet**. The next bench session should reproduce a DNS/TLS outage
+with Wi-Fi still associated (e.g. block the device's DNS server or the AWS
+IoT endpoint at the router) and confirm: the preflight fails and logs
+`network preflight dns=failed`; the stage log shows a transition back to
+`dns`; after the configured threshold, `wifi recovery requested` appears
+exactly once, followed by a normal `ConnectWifi`/`ResolveDns`/... cascade;
+and a further outage within the cooldown window does not produce a second
+`wifi recovery requested` line.

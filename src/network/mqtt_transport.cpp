@@ -197,7 +197,13 @@ bool Esp32AwsIotTransport::connect(const std::string &clientId) {
     return false;
   }
   if (!client_->connect(clientId)) {
-    Logger::warn("AWS IoT MQTT connection failed");
+    // Sanitized numeric code only (never endpoint/identity content) - the
+    // same lwmqtt_err_t accessor used by publish() failures.
+    char message[64];
+    std::snprintf(message, sizeof(message),
+                  "AWS IoT MQTT connection failed (mqtt_err=%d)",
+                  client_->lastErrorCode());
+    Logger::warn(message);
     return false;
   }
   sessionValid_ = true;
