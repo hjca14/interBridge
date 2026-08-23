@@ -2,6 +2,7 @@
 
 #include "../core/logger.h"
 #include <cctype>
+#include <cstdio>
 
 #ifdef ARDUINO
 #include <MQTT.h>
@@ -80,6 +81,9 @@ public:
     if (tls_)
       mqtt_.loop();
   }
+  // MQTTClient::lastError() (lwmqtt_err_t) - a bare numeric code, never a
+  // string derived from payload/topic content.
+  int lastErrorCode() override { return static_cast<int>(mqtt_.lastError()); }
 
 private:
   // Best-effort clean MQTT-level disconnect (no-op if the client already
@@ -119,6 +123,7 @@ public:
   }
   bool subscribe(const std::string &, MqttQos) override { return false; }
   void poll() override {}
+  int lastErrorCode() override { return 0; }
 };
 #endif
 bool endsWith(const std::string &value, const std::string &suffix) {
@@ -213,7 +218,14 @@ bool Esp32AwsIotTransport::publish(const std::string &topic,
     return false;
   const bool ok = client_->publish(topic, payload, qos, retain);
   if (!ok) {
-    Logger::warn("AWS IoT publish failed; session marked invalid");
+    // Sanitized numeric code only (never topic/payload content) so DEV logs
+    // can distinguish e.g. a network write failure from a PUBACK timeout
+    // without exposing anything identifying.
+    char message[80];
+    std::snprintf(message, sizeof(message),
+                  "AWS IoT publish failed; session marked invalid (mqtt_err=%d)",
+                  client_->lastErrorCode());
+    Logger::warn(message);
     sessionValid_ = false;
   }
   return ok;

@@ -25,7 +25,8 @@ void DevMqttSmokeState::scheduleRetry(uint32_t nowMs) {
     actionIssued_ = false;
 }
 
-DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, bool timeValid, bool mqttConnected) {
+DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, bool timeValid, bool mqttConnected,
+                                         bool timeSyncInProgress) {
     if (!wifiConnected) {
         if (state_ != DevSmokeState::WaitingForWifi) enter(DevSmokeState::WaitingForWifi, nowMs);
         if (!actionIssued_ && deadlineReached(nowMs, retryAtMs_)) {
@@ -46,7 +47,15 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
     }
     if (state_ == DevSmokeState::WaitingForTime) {
         if (timeValid) enter(DevSmokeState::WaitingForMqtt, nowMs);
-        else if (!actionIssued_ && deadlineReached(nowMs, retryAtMs_)) {
+        else if (timeSyncInProgress) {
+            // A previous ConfigureTime action's SNTP attempt may still be in
+            // flight - never restart it by reissuing configTime() before it
+            // has a chance to complete or fail, even if the backoff deadline
+            // has elapsed. The deadline is left untouched, so the very next
+            // update() once this is no longer reported in progress retries
+            // immediately without an extra imposed wait.
+            return DevSmokeAction::None;
+        } else if (!actionIssued_ && deadlineReached(nowMs, retryAtMs_)) {
             actionIssued_ = true;
             scheduleRetry(nowMs);
             return DevSmokeAction::ConfigureTime;

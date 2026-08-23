@@ -47,9 +47,12 @@ public:
     void syncStarted() { syncState_.synchronizationStarted(); }
     void syncCompleted(uint32_t nowMs) { syncState_.synchronizationCompleted(nowMs); }
     bool hasValidTime() const override {
-        return syncState_.isTrustworthy(millis(),
-            sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS);
+        return syncState_.isTrustworthy(millis(), syncInProgress());
     }
+    // Exposed so the connectivity state machine can avoid reissuing
+    // configTime() while a previous attempt may still be in flight - see
+    // DevMqttSmokeState::update()'s timeSyncInProgress parameter.
+    bool syncInProgress() const { return sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS; }
     int64_t unixTimeSeconds() const override { return static_cast<int64_t>(time(nullptr)); }
 private:
     NtpSyncState syncState_;
@@ -224,7 +227,8 @@ void loop() {
     if (!transport.isConnected()) subscribed = false;
 
     const DevSmokeAction action = connectivity.update(
-        now, wifiConnected, clockSource.hasValidTime(), transport.isConnected());
+        now, wifiConnected, clockSource.hasValidTime(), transport.isConnected(),
+        clockSource.syncInProgress());
     if (connectivity.state() != lastLoggedState) {
         Serial.printf("[DEV MQTT] state %s -> %s\n", stateName(lastLoggedState), stateName(connectivity.state()));
         lastLoggedState = connectivity.state();

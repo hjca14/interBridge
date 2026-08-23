@@ -647,13 +647,31 @@ this pass:)*
   tradeoff as the in-memory event outbox (section 17). Production should
   eventually back it with NVS the same way `PersistentDedupCache` does.
 - The hypothesis that reusing the same `WiFiClientSecure`/socket across a
-  broken MQTT session is what produced `setSocketOption(): ... Bad file
-  number` after a publish failure is based on documented ESP32 Arduino
-  core behavior and the vendored `256dpi/MQTT` source, not a real-hardware
-  A/B test - see docs/mqtt-dev-smoke-test.md and the PR that introduced
-  the fresh-`WiFiClientSecure`-per-reconnect change. Needs bench
-  confirmation that the error no longer appears under the same
-  few-consecutive-commands repro.
+  broken MQTT session produced `setSocketOption(): ... Bad file number` after
+  a publish failure is now **bench-confirmed**: real hardware runs of the
+  same few-consecutive-commands repro after the fresh-`WiFiClientSecure`-
+  per-reconnect change no longer show that error. The socket-teardown fix
+  itself is validated; it just wasn't the only issue at play (see below).
+- Even with the socket fix, ACCEPTED and the terminal response were still
+  published back-to-back within the same `processPending()` call whenever
+  ACCEPTED succeeded, with no `transport.poll()` in between - two QoS 1
+  publishes in immediate succession, which intermittently made the second
+  one fail on real hardware even without a broken socket. Fixed by always
+  deferring the terminal to the next `processPending()` call/loop
+  iteration, so every call site attempts at most one response publish.
+  Confirmed via native tests (`test_no_single_call_attempts_two_response_publishes`
+  and others in `test/test_remote_command_processor/test_main.cpp`); not yet
+  re-validated on real hardware after this specific change.
+- `DevMqttSmokeState::update()`'s `WaitingForTime` branch could reissue
+  `configTime()` before a previous SNTP attempt (asynchronous, unlike the
+  synchronous DNS lookup) had a chance to complete, once the exponential
+  backoff interval became shorter than a real sync round trip - a plausible
+  explanation for "time sync requested" repeating for a long time on one
+  real boot. Fixed with a `timeSyncInProgress` guard (see
+  docs/mqtt-dev-smoke-test.md > Real bench observation). The ~78 s of DNS
+  failures on that same boot was not changed - it is consistent with
+  ordinary bounded exponential backoff over a slow/unavailable resolver
+  path, not a code defect that was found.
 
 ## Future Work
 

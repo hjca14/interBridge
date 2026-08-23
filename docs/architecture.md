@@ -430,27 +430,37 @@ assuming the caller already did so or that the last session is safe to reuse. Th
 ESP32 adapter additionally allocates a fresh `WiFiClientSecure` per connection
 attempt instead of reusing the same socket/TLS object across a broken session -
 reusing it is what produced the `setSocketOption(): ... Bad file number` pattern
-observed after a publish failure on real hardware.
+observed after a publish failure on real hardware. `IMqttClient::lastErrorCode()`
+exposes the underlying client's own numeric failure code (256dpi/MQTT's
+`lwmqtt_err_t` on ESP32, always `0` for the native-only stub); `publish()` logs it
+alongside the existing failure message - a bare sanitized number, never
+topic/payload/identifier content.
 
 `RemoteCommandProcessor` holds a small bounded (`kMaxOutboxSize = 2`) in-RAM outbox
-for ACCEPTED/terminal responses that failed to publish. `processPending()` never
-starts a new queued command while the outbox is non-empty, so under that invariant
-at most one command's own ACCEPTED+terminal pair is ever pending - `kMaxOutboxSize`
-is an explicit, logged backstop for that invariant being bypassed (e.g. a direct
-`processPayload()` call), not working capacity for several commands' worth of
-responses. Each `processPending()` call attempts to publish only the item at the
-front of the outbox, at most once, then returns - publishing several queued
-responses in one call was rejected because a single publish can itself block up to
-the configured transport timeout. On success the item is popped; on failure it
-stays queued and the normal invalidate/reconnect/backoff flow handles the retry on
-a later call. Reaching capacity never evicts an already-pending entry (that could
-silently drop a promised ACCEPTED while keeping only its terminal); the new
-response is rejected and logged instead. Draining only republishes
-already-serialized bytes, including the response's own sanitized terminal code, so
-a retried terminal still reports its real status - it never re-invokes
-`CommandHandler` or the dedup cache. The outbox is RAM-only and does not survive
-reboot, matching the event outbox's documented in-memory-during-development
-posture (section 17 of the protocol doc).
+for pending ACCEPTED/terminal responses. Every call site attempts at most one
+response publish - full stop. A brand-new command (`processPayload()`) attempts to
+publish ACCEPTED once; the terminal is always deferred to a later
+`processPending()` call, even when ACCEPTED itself just published successfully -
+it is never attempted a second time in the same call. Two back-to-back QoS 1
+publishes with no `transport.poll()` in between (which happens naturally between
+separate `processPending()` calls in the real main loop) is what produced
+intermittent "terminal response publish failed" even when ACCEPTED itself
+succeeded under a few consecutive commands on real hardware. `processPending()`
+never starts a new queued command while the outbox is non-empty, so under that
+invariant at most one command's own ACCEPTED+terminal pair is ever pending -
+`kMaxOutboxSize` is an explicit, logged backstop for that invariant being bypassed
+(e.g. a direct `processPayload()` call), not working capacity for several
+commands' worth of responses. When the outbox has an item, `processPending()`
+attempts to publish only the item at the front, at most once, then returns; on
+success the item is popped, on failure it stays queued and the normal
+invalidate/reconnect/backoff flow handles the retry on a later call. Reaching
+capacity never evicts an already-pending entry (that could silently drop a
+promised ACCEPTED while keeping only its terminal); the new response is rejected
+and logged instead. Draining only republishes already-serialized bytes, including
+the response's own sanitized terminal code, so a retried terminal still reports
+its real status - it never re-invokes `CommandHandler` or the dedup cache. The
+outbox is RAM-only and does not survive reboot, matching the event outbox's
+documented in-memory-during-development posture (section 17 of the protocol doc).
 
 `CommandHandler::handle()` computes ACCEPTED and the terminal result synchronously,
 before ACCEPTED is even attempted - safe only because `DoorOpenCapability` stays

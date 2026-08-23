@@ -165,3 +165,46 @@ is not in progress. `CommandHandler` continues to compare signed 64-bit Unix epo
 or signed 32-bit storage. Expiry remains strict (`now > expires_at`) with no grace
 period; the existing five-second allowance applies only to a slightly future
 `issued_at`.
+
+## Real bench observation: DNS/NTP retry timing
+
+A real bench boot logged DNS failing repeatedly for roughly 78 seconds despite
+Wi-Fi already being up, then `time sync requested` repeating until the serial
+monitor disconnected; a subsequent reboot connected normally. Two different
+findings came out of investigating this, and only one produced a code change -
+this PR does not otherwise touch DNS/NTP:
+
+- **DNS**: `ResolveDns` calls the blocking `WiFi.hostByName()` and immediately
+  reports the boolean result back through `dnsResult()`, which schedules the
+  next bounded exponential retry (`DevMqttSmokeState::scheduleRetry()`) only
+  on that reported failure. There is no code path that could reissue a DNS
+  attempt while a previous one is still outstanding - each attempt is
+  synchronous and always reports before the next is scheduled. ~78 s is
+  consistent with several exponential-backoff DNS retries (roughly 1, 2, 4,
+  8, 16, 32 s) over a genuinely slow/unavailable resolver path after
+  association, not a code defect. No change was made here - inventing a fix
+  without evidence of a bug would just add risk.
+- **NTP**: unlike DNS, an SNTP synchronization attempt is asynchronous -
+  `configTime()` kicks it off and completion arrives later via
+  `sntp_set_time_sync_notification_cb()`. `DevMqttSmokeState::update()`'s
+  `WaitingForTime` branch only checked `timeValid` and the backoff deadline
+  before reissuing `ConfigureTime` - it had no way to know whether a
+  previous attempt might still be in flight. Once the backoff interval
+  (starting at 1 s) became shorter than a real SNTP round trip, this could
+  call `configTime()` again before the prior attempt ever completed,
+  restarting it and starving synchronization indefinitely - a plausible
+  explanation for "time sync requested" repeating for a long time. Fixed
+  with a non-blocking guard: `update()` gained a `timeSyncInProgress`
+  parameter (default `false`, so existing callers/tests are unaffected);
+  `mqtt_smoke_main.cpp`'s `NtpClock` now exposes `syncInProgress()`
+  (`sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS`) and passes it
+  in. While true, `ConfigureTime` is never reissued even past the backoff
+  deadline; once it clears (success or failure), the already-elapsed
+  deadline fires immediately - no extra wait is imposed by having deferred
+  it. No sleep was added. See
+  `test_time_sync_in_progress_defers_reissuing_configure_time` in
+  `test/test_dev_mqtt_state/test_main.cpp`. This does not by itself explain
+  why SNTP never completed on that boot (that remains an unconfirmed
+  network/environment hypothesis, not a diagnosed root cause) - it only
+  removes a plausible self-inflicted way the firmware could have prevented
+  its own retry from ever succeeding.

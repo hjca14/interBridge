@@ -76,6 +76,34 @@ private:
   IDedupCache &inner_;
 };
 
+// Wraps a real IDeviceTransport and counts publish() calls, so a test can
+// prove no single RemoteCommandProcessor call path (processPayload() for a
+// new command, or processPending() draining the outbox) ever attempts more
+// than one response publish.
+class CountingTransport : public IDeviceTransport {
+public:
+  explicit CountingTransport(IDeviceTransport &inner) : inner_(inner) {}
+  bool connect(const std::string &clientId) override {
+    return inner_.connect(clientId);
+  }
+  void disconnect() override { inner_.disconnect(); }
+  bool isConnected() const override { return inner_.isConnected(); }
+  bool publish(const std::string &topic, const std::string &payload,
+              MqttQos qos, bool retain = false) override {
+    ++publishCalls;
+    return inner_.publish(topic, payload, qos, retain);
+  }
+  bool subscribe(const std::string &topic, MqttQos qos,
+                 MqttMessageCallback callback) override {
+    return inner_.subscribe(topic, qos, std::move(callback));
+  }
+  void poll() override { inner_.poll(); }
+  int publishCalls = 0;
+
+private:
+  IDeviceTransport &inner_;
+};
+
 struct Fixture {
   Fixture()
       : intercom(hardware), cache(store),
@@ -113,6 +141,10 @@ void setUp() {
 
 void tearDown() { Logger::setSink(nullptr); }
 
+// Normal command, no failures: the first call publishes only ACCEPTED and
+// defers the terminal; the next call (next loop iteration, with a
+// transport.poll() in between in the real main loop) publishes only the
+// terminal. Never both in the same call.
 void test_valid_open_door_publishes_accepted_then_capability_disabled() {
   Fixture fixture;
 
@@ -120,10 +152,16 @@ void test_valid_open_door_publishes_accepted_then_capability_disabled() {
 
   TEST_ASSERT_TRUE(result.parsed);
   TEST_ASSERT_TRUE(result.acceptedPublished);
-  TEST_ASSERT_TRUE(result.terminalPublished);
-  TEST_ASSERT_EQUAL(2, fixture.transport.publishedMessages().size());
+  TEST_ASSERT_FALSE(result.terminalPublished); // deferred to the next iteration
+  TEST_ASSERT_EQUAL(1, fixture.transport.publishedMessages().size());
+  TEST_ASSERT_EQUAL(1, fixture.processor.pendingResponseCount());
   TEST_ASSERT_NOT_NULL(strstr(
       fixture.transport.publishedMessages()[0].payload.c_str(), "ACCEPTED"));
+
+  fixture.processor.processPending(); // next iteration publishes the terminal
+
+  TEST_ASSERT_EQUAL(0, fixture.processor.pendingResponseCount());
+  TEST_ASSERT_EQUAL(2, fixture.transport.publishedMessages().size());
   TEST_ASSERT_NOT_NULL(strstr(
       fixture.transport.publishedMessages()[1].payload.c_str(), "REJECTED"));
   TEST_ASSERT_NOT_NULL(
@@ -148,6 +186,7 @@ void test_terminal_diagnostic_reports_safe_capability_code_without_ids() {
       });
 
   fixture.processor.processPayload(commandJson());
+  fixture.processor.processPending(); // drains the deferred terminal
 
   TEST_ASSERT_EQUAL(1, terminalCodes.size());
   TEST_ASSERT_EQUAL_STRING("CAPABILITY_DISABLED", terminalCodes[0].c_str());
@@ -158,7 +197,11 @@ void test_terminal_diagnostic_reports_safe_capability_code_without_ids() {
 void test_duplicate_publishes_only_stored_terminal_response() {
   Fixture fixture;
 
-  fixture.processor.processPayload(commandJson());
+  fixture.processor.processPayload(commandJson()); // publishes ACCEPTED, defers terminal
+  fixture.processor.processPending(); // drains the first command's terminal
+  TEST_ASSERT_EQUAL(0, fixture.processor.pendingResponseCount());
+  TEST_ASSERT_EQUAL(2, fixture.transport.publishedMessages().size());
+
   CommandPublishResult duplicate =
       fixture.processor.processPayload(commandJson());
 
@@ -321,13 +364,17 @@ void test_accepted_publish_failure_queues_both_responses_one_publish_per_call() 
              "CAPABILITY_DISABLED"));
 }
 
-// Reproduces the field log where ACCEPTED publishes fine but "terminal
-// response publish failed" follows: only the terminal response is queued;
-// ACCEPTED is never resent. Also verifies the diagnostic callback reports
-// the retried terminal's real device-side code (CAPABILITY_DISABLED), never
-// a transport artifact and never nullptr.
-void test_terminal_publish_failure_queues_only_terminal_and_drains() {
+// Reproduces the seq=3/4/7 field logs: ACCEPTED publishes fine, and the
+// terminal - now always deferred to the next iteration rather than
+// attempted immediately after ACCEPTED - fails on its own (first) drain
+// attempt. Only the terminal is ever queued/retried; ACCEPTED is never
+// resent. Also verifies the diagnostic callback reports the retried
+// terminal's real device-side code (CAPABILITY_DISABLED), never a transport
+// artifact and never nullptr.
+void test_terminal_publish_failure_recovers_only_terminal() {
   Fixture fixture;
+  // Call #1 = ACCEPTED (succeeds). Call #2 = the deferred terminal's first
+  // drain attempt (fails).
   fixture.transport.armPublishFailureOnCall(2);
   std::vector<std::string> publishedTerminalCodes;
   fixture.processor.setDiagnosticCallback(
@@ -340,11 +387,19 @@ void test_terminal_publish_failure_queues_only_terminal_and_drains() {
 
   CommandPublishResult first = fixture.processor.processPayload(commandJson());
   TEST_ASSERT_TRUE(first.acceptedPublished);
-  TEST_ASSERT_FALSE(first.terminalPublished);
+  TEST_ASSERT_FALSE(first.terminalPublished); // deferred, not attempted yet
   TEST_ASSERT_EQUAL(1, fixture.transport.publishedMessages().size());
   TEST_ASSERT_EQUAL(1, fixture.processor.pendingResponseCount());
   TEST_ASSERT_EQUAL(0, publishedTerminalCodes.size());
 
+  // First drain attempt hits the armed failure (call #2): terminal stays
+  // queued, ACCEPTED is not touched again.
+  fixture.processor.processPending();
+  TEST_ASSERT_EQUAL(1, fixture.processor.pendingResponseCount());
+  TEST_ASSERT_EQUAL(1, fixture.transport.publishedMessages().size());
+  TEST_ASSERT_EQUAL(0, publishedTerminalCodes.size());
+
+  // Second drain attempt succeeds (no more armed failures).
   fixture.processor.processPending();
 
   TEST_ASSERT_EQUAL(0, fixture.processor.pendingResponseCount());
@@ -358,6 +413,39 @@ void test_terminal_publish_failure_queues_only_terminal_and_drains() {
   TEST_ASSERT_EQUAL(1, publishedTerminalCodes.size());
   TEST_ASSERT_EQUAL_STRING("CAPABILITY_DISABLED",
                            publishedTerminalCodes[0].c_str());
+}
+
+// Proves the exact bug from the field logs cannot recur: no RemoteCommandProcessor
+// call path - a brand-new command in processPending()/processPayload(), or
+// draining the outbox - ever issues more than one transport.publish() call.
+// A CountingTransport wraps the real FakeDeviceTransport so a failure/success
+// armed on the fake cannot mask a second, unwanted publish attempt.
+void test_no_single_call_attempts_two_response_publishes() {
+  ObservingHardware hardware;
+  Intercom intercom(hardware);
+  FakeClock clock;
+  clock.setUnixTimeSeconds(1000);
+  MemoryStore store;
+  PersistentDedupCache cache(store);
+  FakeSystemControl systemControl;
+  CommandHandler handler(kDeviceId, clock, cache, intercom, systemControl);
+  MqttTopics topics(devMqttTopicsConfig(kDeviceId));
+  FakeDeviceTransport realTransport;
+  realTransport.connect(kDeviceId);
+  CountingTransport transport(realTransport);
+  RemoteCommandProcessor processor(kDeviceId, transport, handler, topics);
+
+  transport.publishCalls = 0;
+  processor.processPayload(commandJson()); // new command: ACCEPTED only
+  TEST_ASSERT_EQUAL(1, transport.publishCalls);
+
+  transport.publishCalls = 0;
+  processor.processPending(); // drains the deferred terminal: one attempt
+  TEST_ASSERT_EQUAL(1, transport.publishCalls);
+
+  transport.publishCalls = 0;
+  processor.processPending(); // outbox already empty and no new command
+  TEST_ASSERT_EQUAL(0, transport.publishCalls);
 }
 
 void test_reconnect_and_resubscribe_drains_outbox_in_order() {
@@ -541,7 +629,8 @@ void test_exact_topic_qos_callback_and_resubscription() {
   // Delivery is the MQTT callback context: publishing here would recursively
   // enter the same client and previously could wedge its TLS socket.
   TEST_ASSERT_EQUAL(0, fixture.transport.publishedMessages().size());
-  fixture.processor.processPending();
+  fixture.processor.processPending(); // publishes ACCEPTED, defers terminal
+  fixture.processor.processPending(); // next iteration drains the terminal
   TEST_ASSERT_TRUE(fixture.processor.lastResult().terminalPublished);
   TEST_ASSERT_EQUAL_STRING(
       "interbridge/ib-0123456789abcdef0123456789abcdef/commands",
@@ -601,7 +690,8 @@ int main(int argc, char **argv) {
   RUN_TEST(test_physical_fields_are_rejected);
   RUN_TEST(test_publish_failures_are_observable);
   RUN_TEST(test_accepted_publish_failure_queues_both_responses_one_publish_per_call);
-  RUN_TEST(test_terminal_publish_failure_queues_only_terminal_and_drains);
+  RUN_TEST(test_terminal_publish_failure_recovers_only_terminal);
+  RUN_TEST(test_no_single_call_attempts_two_response_publishes);
   RUN_TEST(test_reconnect_and_resubscribe_drains_outbox_in_order);
   RUN_TEST(test_outbox_retry_never_reexecutes_command_handler);
   RUN_TEST(test_multiple_consecutive_commands_do_not_interleave_responses);

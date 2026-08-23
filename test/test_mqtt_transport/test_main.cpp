@@ -1,12 +1,24 @@
 #include <unity.h>
 
+#include <string>
+#include <vector>
+
+#include "../../src/core/logger.h"
 #include "../../src/network/mqtt_transport.h"
 #include "../../src/storage/memory_store.h"
 
 using namespace interbridge;
 
-void setUp() {}
-void tearDown() {}
+namespace {
+std::vector<std::string> capturedLogs;
+void captureLog(const char *line) { capturedLogs.emplace_back(line); }
+} // namespace
+
+void setUp() {
+  capturedLogs.clear();
+  Logger::setSink(captureLog);
+}
+void tearDown() { Logger::setSink(nullptr); }
 
 namespace {
 class FakeMqttClient : public IMqttClient {
@@ -54,11 +66,13 @@ public:
     // 256dpi/MQTT library).
     if (pollBreaksConnection) isConnected = false;
   }
+  int lastErrorCode() override { return lastErrorCodeValue; }
   bool configureResult = true, connectResult = true, publishResult = true,
        subscribeResult = true, isConnected = false, pollBreaksConnection = false;
   bool publishedRetain = true;
   int polls = 0;
   int disconnectCalls = 0;
+  int lastErrorCodeValue = 0;
   uint16_t configuredKeepAlive = 0, configuredTimeout = 0;
   MqttQos publishedQos = MqttQos::AtMostOnce,
           subscribedQos = MqttQos::AtMostOnce;
@@ -140,6 +154,32 @@ void test_real_transport_qos_retain_subscribe_failure_and_disconnect() {
   TEST_ASSERT_FALSE(mqtt.publishedRetain);
   transport.disconnect();
   TEST_ASSERT_FALSE(transport.isConnected());
+}
+
+void test_publish_failure_logs_sanitized_numeric_error_code() {
+  MemoryStore store;
+  DeviceCredentialStore credentials(store);
+  credentials.saveCertificate("CERT");
+  credentials.savePrivateKey("KEY");
+  FakeMqttClient mqtt;
+  Esp32AwsIotTransport transport(validConfig(), credentials, mqtt);
+  TEST_ASSERT_TRUE(transport.connect(kValidId));
+
+  mqtt.publishResult = false;
+  mqtt.lastErrorCodeValue = -7; // arbitrary sentinel, e.g. LWMQTT_NETWORK_TIMEOUT-shaped
+  TEST_ASSERT_FALSE(
+      transport.publish("interbridge/ib-secret-device/commands",
+                        "{\"command_id\":\"secretid\"}", MqttQos::AtLeastOnce));
+
+  bool sawCode = false;
+  for (const std::string &line : capturedLogs) {
+    if (line.find("mqtt_err=-7") != std::string::npos) sawCode = true;
+    // Never the topic/payload/identifiers, only the bare numeric code.
+    TEST_ASSERT_EQUAL(std::string::npos, line.find("secret-device"));
+    TEST_ASSERT_EQUAL(std::string::npos, line.find("secretid"));
+    TEST_ASSERT_EQUAL(std::string::npos, line.find("command_id"));
+  }
+  TEST_ASSERT_TRUE(sawCode);
 }
 
 void test_publish_failure_marks_transport_invalid_even_if_client_still_reports_connected() {
@@ -282,6 +322,7 @@ int main(int argc, char **argv) {
   RUN_TEST(test_real_transport_configures_mtls_and_exact_client_id);
   RUN_TEST(test_real_transport_rejects_invalid_or_missing_configuration);
   RUN_TEST(test_real_transport_qos_retain_subscribe_failure_and_disconnect);
+  RUN_TEST(test_publish_failure_logs_sanitized_numeric_error_code);
   RUN_TEST(test_publish_failure_marks_transport_invalid_even_if_client_still_reports_connected);
   RUN_TEST(test_subscribe_failure_marks_transport_invalid);
   RUN_TEST(test_poll_detects_broken_session);

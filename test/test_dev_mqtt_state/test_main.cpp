@@ -60,6 +60,26 @@ void test_backoff_is_capped_and_deadline_wrap_is_safe() {
     TEST_ASSERT_TRUE(DevMqttSmokeState::deadlineReached(0x00000006u, 0x00000005u));
 }
 
+void test_time_sync_in_progress_defers_reissuing_configure_time() {
+    DevMqttSmokeState state(10, 40);
+    state.update(0, false, false, false);
+    state.update(1, true, false, false);
+    state.dnsResult(1, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConfigureTime),
+                      static_cast<int>(state.update(1, true, false, false)));
+    // The backoff deadline (t=11) is reached, but a previous SNTP attempt is
+    // still reported in progress - must not restart it.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(11, true, false, false, true)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(15, true, false, false, true)));
+    // Once no longer in progress and still not time-valid, the already-
+    // elapsed deadline fires immediately - no extra wait was imposed just
+    // because it was deferred.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConfigureTime),
+                      static_cast<int>(state.update(16, true, false, false, false)));
+}
+
 void test_observation_only_update_does_not_change_online_state() {
     DevMqttSmokeState state;
     state.update(0, false, false, false);
@@ -77,6 +97,7 @@ int main(int, char**) {
     RUN_TEST(test_dns_and_mqtt_failures_back_off_and_recover);
     RUN_TEST(test_wifi_loss_requires_all_gates_again);
     RUN_TEST(test_backoff_is_capped_and_deadline_wrap_is_safe);
+    RUN_TEST(test_time_sync_in_progress_defers_reissuing_configure_time);
     RUN_TEST(test_observation_only_update_does_not_change_online_state);
     return UNITY_END();
 }
