@@ -142,7 +142,11 @@ covered by native tests and compiles for both `esp32-c3`/`esp32-c3-dev-mqtt`,
 but has **not** been re-validated on real hardware yet, and local Wi-Fi
 reliability itself should not be considered fixed by this change alone.
 Access-point loss and return while the board stays powered has **not** yet been
-validated.
+validated. A follow-up fix closed a `WiFi.disconnect()` async race in that
+recovery cascade (the state machine now waits for a real disconnect signal
+before re-associating, instead of possibly resuming DNS/MQTT over the stale
+association) - see [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)'s
+"Follow-up fix" subsection.
 
 
 ## Phase 2D MQTT command transport

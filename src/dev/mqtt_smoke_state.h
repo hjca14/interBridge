@@ -45,9 +45,19 @@ public:
     // May return RecoverWifi instead of the state's ordinary next action if
     // enough consecutive connectivity failures have accumulated - see
     // networkPreflightFailed()/mqttResult(). The caller must tear its
-    // transport down, call WiFi.disconnect() without erasing credentials,
-    // and then let the ordinary ConnectWifi/backoff flow (unchanged) bring
-    // the interface back up.
+    // transport down and call WiFi.disconnect() without erasing credentials
+    // in response.
+    //
+    // WiFi.disconnect() is asynchronous: the caller's very next wifiConnected
+    // read can still report true for a tick or more after RecoverWifi was
+    // issued. After RecoverWifi, this class waits for wifiConnected to
+    // actually report false before letting the ordinary
+    // ConnectWifi/ResolveDns/.../ConnectMqtt cascade proceed - while still
+    // (falsely) connected, update() returns None and the state does not
+    // advance past WaitingForWifi, so DNS/MQTT can never be reattempted over
+    // the stale association and ConnectWifi (WiFi.begin()) is guaranteed to
+    // actually fire once the disconnect takes effect. See
+    // awaitingWifiRecoveryDisconnect().
     DevSmokeAction update(uint32_t nowMs, bool wifiConnected, bool timeValid, bool mqttConnected);
     // Explicit DNS resolution during the initial WaitingForDns bootstrap
     // stage (before NTP). success=false counts as a connectivity failure -
@@ -82,6 +92,9 @@ public:
     uint32_t consecutiveConnectivityFailures() const;
     bool wifiRecoveryCooldownActive() const;
     uint32_t wifiRecoveryCooldownUntilMs() const;
+    // True from the moment RecoverWifi is issued until update() actually
+    // observes wifiConnected==false - see update()'s contract above.
+    bool awaitingWifiRecoveryDisconnect() const;
 
     static bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs);
 
@@ -106,6 +119,7 @@ private:
     bool wifiRecoveryCooldownActive_ = false;
     uint32_t wifiRecoveryCooldownUntilMs_ = 0;
     bool wifiRecoveryRequested_ = false;
+    bool awaitingWifiRecoveryDisconnect_ = false;
 };
 
 } // namespace interbridge

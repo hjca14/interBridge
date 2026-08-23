@@ -355,3 +355,45 @@ IoT endpoint at the router) and confirm: the preflight fails and logs
 exactly once, followed by a normal `ConnectWifi`/`ResolveDns`/... cascade;
 and a further outage within the cooldown window does not produce a second
 `wifi recovery requested` line.
+
+### Follow-up fix: `WiFi.disconnect()` async race in the recovery cascade
+
+Code review (before this landed on real hardware) identified a race in the
+Wi-Fi interface recovery above: `WiFi.disconnect(false, false)` is
+asynchronous on the Arduino core, so the caller's very next `wifiConnected`
+read can still report `true` for a tick or more after `RecoverWifi` was
+issued. `DevMqttSmokeState::update()` immediately transitioned to
+`WaitingForWifi` when `RecoverWifi` fired; if the following call still saw
+`wifiConnected=true`, the ordinary `WaitingForWifi -> WaitingForDns` step
+would fire and the state machine could resume DNS/MQTT over the same stale
+association, without `ConnectWifi` (`WiFi.begin()`) ever executing - silently
+defeating the "force re-association" guarantee the whole recovery ladder
+exists for.
+
+Fixed with an explicit `awaitingWifiRecoveryDisconnect_` flag (exposed as
+`awaitingWifiRecoveryDisconnect()`), set the moment `RecoverWifi` is issued.
+While it is set and `update()` still observes `wifiConnected=true`, it
+returns `None` immediately and the state stays at `WaitingForWifi` - the
+cascade is not allowed to advance. Only once `update()` observes
+`wifiConnected=false` does it clear the flag and fall through to the
+ordinary `!wifiConnected` handling, which issues `ConnectWifi` once the
+backoff deadline (already primed when `RecoverWifi` was issued) is reached.
+From there the normal `ConnectWifi -> ResolveDns -> ... -> ConnectMqtt`
+cascade proceeds unchanged. No sleeps, no busy-wait, no `ESP.restart()`;
+credentials, cooldown/backoff, and wraparound safety are all unaffected.
+`mqtt_smoke_main.cpp`'s `RecoverWifi` case handler needed no changes - the
+gate is entirely internal to `DevMqttSmokeState`.
+
+See `test_wifi_recovery_waits_for_real_disconnect_before_resuming_cascade`
+(the dedicated regression test: `RecoverWifi` fires, a still-connected read
+is ignored with `None` and no state advance, then a `wifiConnected=false`
+read releases the ordinary `ConnectWifi`/... cascade) and the updated
+`test_repeated_connectivity_failures_trigger_wifi_recovery_then_respect_cooldown`
+and `test_wifi_recovery_cooldown_deadline_is_wrap_safe` (both now simulate
+the disconnect explicitly instead of assuming it took effect immediately)
+in `test/test_dev_mqtt_state/test_main.cpp`. This has been validated by
+native tests (via a real local MSVC compile-and-run of
+`test_dev_mqtt_state`, 16/16 passing) and by compiling both
+`esp32-c3`/`esp32-c3-dev-mqtt` - **it has not been re-tested on real
+hardware yet**, since the original 110-minute-outage recovery ladder itself
+hadn't been bench-validated when this race was found.

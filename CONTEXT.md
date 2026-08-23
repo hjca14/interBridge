@@ -716,6 +716,20 @@ this pass:)*
   docs/mqtt-dev-smoke-test.md > "Real bench observation: MQTT/TLS lost after
   ~110 minutes online". Validated by native tests and both firmware builds
   compiling; **not yet re-validated on real hardware**.
+- Code review on the above (before it reached real hardware) found that
+  `WiFi.disconnect(false, false)` is asynchronous: the caller's very next
+  `wifiConnected` read can still (falsely) report `true`, and the recovery
+  cascade could resume DNS/MQTT over the stale association without
+  `ConnectWifi`/`WiFi.begin()` ever firing. Fixed with an explicit
+  `awaitingWifiRecoveryDisconnect_` flag in `DevMqttSmokeState`: while set
+  and `wifiConnected` still reads `true`, `update()` returns `None` and the
+  state stays at `WaitingForWifi`; only once a real `wifiConnected=false` is
+  observed does the ordinary `ConnectWifi`/`ResolveDns`/... cascade resume.
+  No caller (`mqtt_smoke_main.cpp`) changes needed. See
+  docs/mqtt-dev-smoke-test.md > "Follow-up fix: `WiFi.disconnect()` async
+  race in the recovery cascade". Validated by a real local MSVC
+  compile-and-run of `test_dev_mqtt_state` (16/16) and both firmware builds
+  compiling; **not yet re-validated on real hardware**.
 
 ## Future Work
 

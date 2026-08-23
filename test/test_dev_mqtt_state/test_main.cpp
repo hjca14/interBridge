@@ -279,29 +279,94 @@ void test_repeated_connectivity_failures_trigger_wifi_recovery_then_respect_cool
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::RecoverWifi),
                       static_cast<int>(state.update(31, true, true, false)));
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForWifi), static_cast<int>(state.state()));
+    TEST_ASSERT_TRUE(state.awaitingWifiRecoveryDisconnect());
+
+    // WiFi.disconnect() is asynchronous: wifiConnected can still read true
+    // for a tick or more. Until the real disconnect is observed, the
+    // cascade must not advance past WaitingForWifi - it must not jump
+    // straight to ResolveDns/ConnectMqtt over the stale association.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(32, true, true, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForWifi), static_cast<int>(state.state()));
+    TEST_ASSERT_TRUE(state.awaitingWifiRecoveryDisconnect());
+
+    // Only once wifiConnected genuinely reports false does the ordinary
+    // ConnectWifi (WiFi.begin()) cascade fire - the forced re-association
+    // this recovery exists for.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(40, false, true, false)));
+    TEST_ASSERT_FALSE(state.awaitingWifiRecoveryDisconnect());
 
     // Recovery requires the ordinary cascade again - never jumps straight
     // back into WaitingForMqtt/ConnectMqtt.
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ResolveDns),
-                      static_cast<int>(state.update(32, true, true, false)));
-    state.dnsResult(32, true);
+                      static_cast<int>(state.update(45, true, true, false)));
+    state.dnsResult(45, true);
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
-                      static_cast<int>(state.update(32, true, true, false)));
+                      static_cast<int>(state.update(45, true, true, false)));
 
     // Three more failures while still inside the 1000ms cooldown (armed at
     // t=31, so active through t=1031) must not trigger a second recovery,
     // no matter how many accumulate - the ordinary backoff keeps retrying.
-    state.mqttResult(32, false);
+    state.mqttResult(45, false);
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
-                      static_cast<int>(state.update(42, true, true, false)));
-    state.mqttResult(42, false);
+                      static_cast<int>(state.update(60, true, true, false)));
+    state.mqttResult(60, false);
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
-                      static_cast<int>(state.update(62, true, true, false)));
-    state.mqttResult(62, false); // 3rd failure of this new run, still cooling down
+                      static_cast<int>(state.update(100, true, true, false)));
+    state.mqttResult(100, false); // 3rd failure of this new run, still cooling down
     TEST_ASSERT_EQUAL(0, state.consecutiveConnectivityFailures());
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
-                      static_cast<int>(state.update(62, true, true, false)));
+                      static_cast<int>(state.update(100, true, true, false)));
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForMqtt), static_cast<int>(state.state()));
+}
+
+// Explicit regression test for the WiFi.disconnect() async race: after
+// RecoverWifi is issued, wifiConnected can still (falsely) read true for a
+// tick or more, and the cascade must never advance past WaitingForWifi
+// during that window - it must wait for the real disconnect signal before
+// letting ConnectWifi (WiFi.begin()) fire, and only then resume the
+// ordinary ResolveDns/.../ConnectMqtt flow.
+void test_wifi_recovery_waits_for_real_disconnect_before_resuming_cascade() {
+    DevMqttSmokeState state(10, 40, 1000, /*wifiRecoveryThreshold=*/1, /*wifiRecoveryCooldownMs=*/1000);
+    state.update(0, false, false, false);
+    state.update(1, true, false, false);
+    state.dnsResult(1, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
+                      static_cast<int>(state.update(1, true, true, false)));
+
+    // 1. A single failure reaches the (deliberately low, for this test)
+    // threshold and RecoverWifi is issued.
+    state.mqttResult(1, false);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::RecoverWifi),
+                      static_cast<int>(state.update(1, true, true, false)));
+    TEST_ASSERT_TRUE(state.awaitingWifiRecoveryDisconnect());
+
+    // 2. WiFi.disconnect() is asynchronous - simulate the very next read
+    // still (falsely) reporting connected. The action must be None and the
+    // state must not advance to WaitingForDns/ResolveDns or ConnectMqtt.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(2, true, true, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForWifi), static_cast<int>(state.state()));
+    // 3. The same false-positive read can repeat for more than one tick.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(3, true, true, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForWifi), static_cast<int>(state.state()));
+
+    // 4/5. Once wifiConnected genuinely reports false, the ordinary
+    // ConnectWifi (WiFi.begin()) cascade fires - the forced re-association
+    // this recovery exists for.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(4, false, true, false)));
+    TEST_ASSERT_FALSE(state.awaitingWifiRecoveryDisconnect());
+
+    // 6. WiFi/DNS/time return and the ordinary flow resumes normally,
+    // eventually reaching ConnectMqtt again.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ResolveDns),
+                      static_cast<int>(state.update(5, true, true, false)));
+    state.dnsResult(5, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
+                      static_cast<int>(state.update(5, true, true, false)));
 }
 
 // A full MQTT connect+subscribe success is the strongest possible health
@@ -350,16 +415,23 @@ void test_wifi_recovery_cooldown_deadline_is_wrap_safe() {
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::RecoverWifi),
                       static_cast<int>(state.update(nearWrap, true, true, false)));
 
+    // The disconnect must be observed (wifiConnected=false) before the
+    // cascade is allowed to resume - see
+    // test_wifi_recovery_waits_for_real_disconnect_before_resuming_cascade.
+    // This also exercises that gate's own deadline math right at the wrap.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(nearWrap + 1, false, true, false)));
+
     // Re-bootstrap to WaitingForMqtt again while still inside the wrapped
     // cooldown window.
-    state.update(nearWrap + 1, true, false, false);
-    state.dnsResult(nearWrap + 1, true);
+    state.update(nearWrap + 2, true, false, false);
+    state.dnsResult(nearWrap + 2, true);
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
-                      static_cast<int>(state.update(nearWrap + 1, true, true, false)));
-    state.mqttResult(nearWrap + 1, false); // another failure, still cooling down
+                      static_cast<int>(state.update(nearWrap + 2, true, true, false)));
+    state.mqttResult(nearWrap + 2, false); // another failure, still cooling down
     TEST_ASSERT_TRUE(state.wifiRecoveryCooldownActive());
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
-                      static_cast<int>(state.update(nearWrap + 1, true, true, false)));
+                      static_cast<int>(state.update(nearWrap + 2, true, true, false)));
 
     // Past the wrapped cooldown deadline (4), a fresh failure is authorized
     // to recover again.
@@ -411,6 +483,7 @@ int main(int, char**) {
     RUN_TEST(test_ntp_attempt_in_flight_does_not_reissue_across_many_rapid_updates);
     RUN_TEST(test_network_preflight_failure_returns_to_dns_without_reexecuting_ntp);
     RUN_TEST(test_repeated_connectivity_failures_trigger_wifi_recovery_then_respect_cooldown);
+    RUN_TEST(test_wifi_recovery_waits_for_real_disconnect_before_resuming_cascade);
     RUN_TEST(test_full_mqtt_success_resets_connectivity_counters_and_recovery_state);
     RUN_TEST(test_wifi_recovery_cooldown_deadline_is_wrap_safe);
     RUN_TEST(test_connectivity_counter_is_untouched_by_a_normal_successful_cycle);
