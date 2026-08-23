@@ -1,7 +1,6 @@
 #include "mqtt_transport.h"
 
 #include "../core/logger.h"
-#include <algorithm>
 #include <cctype>
 
 #ifdef ARDUINO
@@ -12,6 +11,8 @@
 namespace interbridge {
 namespace {
 #ifdef ARDUINO
+constexpr uint32_t kTlsHandshakeTimeoutSeconds = 10;
+
 class ArduinoMqttClient final : public IMqttClient {
 public:
   ArduinoMqttClient() : mqtt_(9216) {}
@@ -25,7 +26,10 @@ public:
     // WiFiClientSecure otherwise inherits a long/default stream timeout.  All
     // TLS reads and writes must return so the loop watchdog can be serviced.
     tls_.setTimeout(timeout);
-    tls_.setHandshakeTimeout(std::max<uint16_t>(1, (timeout + 999) / 1000));
+    // TLS negotiation can legitimately take several seconds on a congested
+    // link. Keep it bounded below the 20-second loop watchdog without applying
+    // the shorter stream timeout to the complete AWS IoT handshake.
+    tls_.setHandshakeTimeout(kTlsHandshakeTimeoutSeconds);
     mqtt_.begin(endpoint.c_str(), port, tls_);
     mqtt_.setOptions(keepAlive, true, timeout);
     return true;

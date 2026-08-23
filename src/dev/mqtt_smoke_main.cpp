@@ -39,7 +39,6 @@ constexpr uint16_t kMqttKeepAliveSeconds = 300;
 constexpr uint16_t kMqttTimeoutMs = 1000;
 constexpr uint32_t kSerialWaitMs = 1500;
 constexpr uint32_t kHeartbeatMs = 15000;
-constexpr uint32_t kNetworkRecoveryRestartMs = 10u * 60u * 1000u;
 constexpr uint32_t kWatchdogSeconds = 20;
 // DEV backend considers a device stale after 120s. Publishing halfway through
 // that window leaves one missed-report margin without using the 15s log cadence.
@@ -98,7 +97,6 @@ uint32_t heartbeatAt = 0;
 bool subscribed = false;
 HealthReporter healthReporter(kDevHealthIntervalMs);
 Preferences diagnostics;
-uint32_t networkUnavailableSince = 0;
 DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
 
 const char* resetReasonName(esp_reset_reason_t reason) {
@@ -272,18 +270,6 @@ void loop() {
     }
     publishHealth(now);
     heartbeat(now);
-    const bool fullyOnline = connectivity.state() == DevSmokeState::Online &&
-                             wifiConnected && transport.isConnected();
-    if (fullyOnline) {
-        networkUnavailableSince = 0;
-    } else {
-        if (networkUnavailableSince == 0) networkUnavailableSince = now;
-        if (now - networkUnavailableSince >= kNetworkRecoveryRestartMs) {
-            Serial.println("[DEV MQTT] network recovery exhausted; controlled restart");
-            Serial.flush();
-            ESP.restart();
-        }
-    }
     // This heartbeat is reached only after MQTT polling, callbacks and all
     // socket operations returned. A stuck operation therefore cannot leave a
     // stale `online` heartbeat indefinitely; the task watchdog resets it.
