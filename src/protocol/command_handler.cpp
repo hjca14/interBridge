@@ -56,7 +56,8 @@ std::optional<ProtocolErrorCode> CommandHandler::checkTimeSafety(const DeviceCom
     if (!command.hasIssuedAt || !command.hasExpiresAt) {
         return ProtocolErrorCode::InvalidTimestamp;
     }
-    if (command.expiresAtUnixSeconds <= command.issuedAtUnixSeconds) {
+    if (command.issuedAtUnixSeconds < 0 ||
+        command.expiresAtUnixSeconds <= command.issuedAtUnixSeconds) {
         return ProtocolErrorCode::InvalidTimestamp;
     }
     int64_t validityWindow = command.expiresAtUnixSeconds - command.issuedAtUnixSeconds;
@@ -65,6 +66,11 @@ std::optional<ProtocolErrorCode> CommandHandler::checkTimeSafety(const DeviceCom
     }
 
     int64_t now = clock_.unixTimeSeconds();
+    // A synchronization transition may begin between the first gate and the
+    // wall-clock sample. Never validate a sensitive command across that edge.
+    if (!clock_.hasValidTime() || now < 0) {
+        return ProtocolErrorCode::ClockNotTrustworthy;
+    }
     if (command.issuedAtUnixSeconds > now + kClockSkewToleranceSeconds) {
         return ProtocolErrorCode::InvalidTimestamp;
     }
@@ -92,6 +98,10 @@ CommandResponses CommandHandler::handle(const DeviceCommand& command) {
                     command, buildResponse(command, CommandStatus::Rejected, ProtocolErrorCode::CommandNotAllowed)));
             }
             CommandResponses responses;
+            const int64_t now = clock_.unixTimeSeconds();
+            responses.timeValidationPassed = true;
+            responses.ageSeconds = now - command.issuedAtUnixSeconds;
+            responses.remainingSeconds = command.expiresAtUnixSeconds - now;
             responses.accepted = buildResponse(command, CommandStatus::Accepted, std::nullopt);
             responses.hasAccepted = true;
             responses.terminal = recordAndReturn(

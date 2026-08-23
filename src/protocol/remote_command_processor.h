@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <functional>
 
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
@@ -14,6 +15,15 @@ struct CommandPublishResult {
   bool terminalPublished = false;
 };
 
+enum class CommandDiagnosticStage { Received, ValidationPassed, Rejected, AcceptedPublished, TerminalPublished };
+struct CommandDiagnostic {
+  CommandDiagnosticStage stage;
+  const char *safeCode = nullptr;
+  int64_t ageSeconds = 0;
+  int64_t remainingSeconds = 0;
+};
+using CommandDiagnosticCallback = std::function<void(const CommandDiagnostic &)>;
+
 class RemoteCommandProcessor {
 public:
   RemoteCommandProcessor(std::string deviceId, IDeviceTransport &transport,
@@ -22,6 +32,7 @@ public:
   bool subscribe();
   CommandPublishResult processPayload(const std::string &payload);
   const CommandPublishResult &lastResult() const;
+  void setDiagnosticCallback(CommandDiagnosticCallback callback);
 
 private:
   std::string deviceId_;
@@ -29,6 +40,7 @@ private:
   CommandHandler &handler_;
   MqttTopics topics_;
   CommandPublishResult lastResult_;
+  CommandDiagnosticCallback diagnosticCallback_;
 };
 
 } // namespace interbridge

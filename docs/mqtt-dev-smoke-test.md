@@ -32,6 +32,23 @@ For local `device_id`, the harness subscribes only to
 Command responses use QoS 1. ClientId is exactly `device_id`. No mirror or diagnostic topic exists.
 The harness does not access Shadow or Jobs.
 
+The harness publishes the protocol `HealthReport` to the centralized
+`MqttTopics::healthIngest()` Basic Ingest route at QoS 0 once after each successful
+connection/subscription and every 60 seconds thereafter. The DEV backend uses
+`FRESH_SECONDS=120`, so this cadence refreshes `last_seen_at` halfway through the
+freshness window and tolerates one missed periodic report without changing the
+backend threshold. A
+failed attempt is not retried in the tight loop, preventing a reconnect/publish
+storm: it waits until the next 60-second cadence. This produces up to 1,440 periodic
+messages/device/day (plus reconnects), increasing DEV broker, rule, Lambda, and
+storage traffic relative to an hourly report, but remaining four times lower than
+reusing the 15-second local-status cadence (5,760 messages/device/day). Production
+keeps its independently configurable cadence for explicit freshness/cost review;
+the DEV override must not silently become the production default.
+Only measurements available on the ESP32 are emitted: firmware version, safe idle
+intercom state (the DEV hardware never changes it), wrap-safe uptime, RSSI, and free
+heap, in addition to required protocol/device fields.
+
 The maintained `256dpi/MQTT` client is used because it integrates with
 `WiFiClientSecure`, supports MQTT 3.1.1, QoS 0 and QoS 1 publication and QoS 1 subscribe,
 retained-message selection, clean sessions, and configurable keepalive/buffer.
@@ -49,7 +66,12 @@ clean session, no Last Will, and `retain=false` for every publish.
    a multiline raw string inside a `#define`.
 3. Run `pio run -e esp32-c3-dev-mqtt` and flash that environment explicitly.
 4. Attach the serial monitor. Logs contain operation status and credential
-   presence only, never secret values or command payloads.
+   presence only, never secret values or command payloads. The 15-second
+   `local_status` line remains local and is separate from `health publish: ok/failed`.
+   Temporary Phase 2D diagnostics log command receipt, safe rejection codes and
+   publish stages. For a valid timestamp they log only `age_s` and `remaining_s`,
+   never absolute timestamps or complete identifiers; remove these two differences
+   after the DEV clock investigation is closed.
 5. Send a protocol-v1 command on that exact device's commands topic and verify a
    protocol-v1 `ACCEPTED` followed by `REJECTED/CAPABILITY_DISABLED`. Verify no
    `COMPLETED`, `DOOR_OPENED`, DTMF, GPIO, relay, pulse, key, restart, or remote
@@ -94,3 +116,15 @@ NVS, Fleet Provisioning, Secure Boot, Flash Encryption, intercom hardware,
 Phase 1E Basic Ingest persistence, or the final custom PCB. A bounded serial
 wait preserves headless operation; a credential-free 15-second heartbeat helps
 late-attached monitors without logging SSID, endpoint, identity, PEM, or payload.
+
+## Phase 2D clock correction
+
+The earlier harness treated any `time()` value above a constant as synchronized.
+That is unsafe because an RTC value can look plausible while a new SNTP attempt is
+still pending. The DEV clock now becomes trustworthy only after the ESP SNTP
+completion callback, a short transition/settling gate, and confirmation that SNTP
+is not in progress. `CommandHandler` continues to compare signed 64-bit Unix epoch
+**seconds** directly: it never uses `millis()`, timezone conversion, milliseconds,
+or signed 32-bit storage. Expiry remains strict (`now > expires_at`) with no grace
+period; the existing five-second allowance applies only to a slightly future
+`issued_at`.

@@ -109,6 +109,24 @@ void test_valid_open_door_publishes_accepted_then_capability_disabled() {
   TEST_ASSERT_EQUAL(0, fixture.systemControl.restartCount());
 }
 
+void test_terminal_diagnostic_reports_safe_capability_code_without_ids() {
+  Fixture fixture;
+  std::vector<std::string> terminalCodes;
+  fixture.processor.setDiagnosticCallback(
+      [&terminalCodes](const CommandDiagnostic &diagnostic) {
+        if (diagnostic.stage == CommandDiagnosticStage::TerminalPublished) {
+          terminalCodes.emplace_back(diagnostic.safeCode);
+        }
+      });
+
+  fixture.processor.processPayload(commandJson());
+
+  TEST_ASSERT_EQUAL(1, terminalCodes.size());
+  TEST_ASSERT_EQUAL_STRING("CAPABILITY_DISABLED", terminalCodes[0].c_str());
+  TEST_ASSERT_EQUAL(std::string::npos, terminalCodes[0].find(kDeviceId));
+  TEST_ASSERT_EQUAL(std::string::npos, terminalCodes[0].find(kCommandId));
+}
+
 void test_duplicate_publishes_only_stored_terminal_response() {
   Fixture fixture;
 
@@ -298,6 +316,7 @@ int main(int argc, char **argv) {
   (void)argv;
   UNITY_BEGIN();
   RUN_TEST(test_valid_open_door_publishes_accepted_then_capability_disabled);
+  RUN_TEST(test_terminal_diagnostic_reports_safe_capability_code_without_ids);
   RUN_TEST(test_duplicate_publishes_only_stored_terminal_response);
   RUN_TEST(test_deduplication_survives_handler_and_cache_reconstruction);
   RUN_TEST(test_strict_parser_rejects_invalid_contract_payloads);

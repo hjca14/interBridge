@@ -114,6 +114,28 @@ void test_open_door_rejected_when_expired() {
     TEST_ASSERT_EQUAL(0, hw.doorCallCount);
 }
 
+void test_open_door_is_valid_exactly_at_expiry_boundary() {
+    MockHardware hw; Intercom intercom(hw); FakeClock clock;
+    clock.setUnixTimeSeconds(1786467630LL);
+    InMemoryDedupCache cache; FakeSystemControl sysControl;
+    CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
+    auto response = handler.handle(makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "boundary",
+                                               1786467600LL, 1786467630LL));
+    TEST_ASSERT_TRUE(response.hasAccepted);
+}
+
+void test_epoch_seconds_above_signed_32_bit_do_not_overflow() {
+    MockHardware hw; Intercom intercom(hw); FakeClock clock;
+    clock.setUnixTimeSeconds(2200000010LL);
+    InMemoryDedupCache cache; FakeSystemControl sysControl;
+    CommandHandler handler("ib-test", clock, cache, intercom, sysControl);
+    auto response = handler.handle(makeCommand(CommandType::OpenDoor, "OPEN_DOOR", "epoch64",
+                                               2200000000LL, 2200000030LL));
+    TEST_ASSERT_TRUE(response.hasAccepted);
+    TEST_ASSERT_EQUAL_INT64(10, response.ageSeconds);
+    TEST_ASSERT_EQUAL_INT64(20, response.remainingSeconds);
+}
+
 void test_open_door_rejected_when_validity_window_exceeds_maximum() {
     MockHardware hw;
     Intercom intercom(hw);
@@ -313,6 +335,8 @@ int main(int argc, char** argv) {
     RUN_TEST(test_open_door_does_not_call_failing_hardware_when_capability_disabled);
     RUN_TEST(test_open_door_rejected_when_clock_not_trustworthy);
     RUN_TEST(test_open_door_rejected_when_expired);
+    RUN_TEST(test_open_door_is_valid_exactly_at_expiry_boundary);
+    RUN_TEST(test_epoch_seconds_above_signed_32_bit_do_not_overflow);
     RUN_TEST(test_open_door_rejected_when_validity_window_exceeds_maximum);
     RUN_TEST(test_open_door_accepts_exact_thirty_second_window);
     RUN_TEST(test_open_door_rejects_thirty_one_second_window);
