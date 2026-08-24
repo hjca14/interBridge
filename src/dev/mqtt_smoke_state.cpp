@@ -4,9 +4,11 @@
 
 namespace interbridge {
 
-DevMqttSmokeState::DevMqttSmokeState(uint32_t initialRetryMs, uint32_t maxRetryMs, uint32_t ntpAttemptTimeoutMs)
+DevMqttSmokeState::DevMqttSmokeState(uint32_t initialRetryMs, uint32_t maxRetryMs, uint32_t ntpAttemptTimeoutMs,
+                                     uint32_t wifiRecoveryThreshold, uint32_t wifiRecoveryCooldownMs)
     : state_(DevSmokeState::WaitingForWifi), initialRetryMs_(initialRetryMs), maxRetryMs_(maxRetryMs),
-      ntpAttemptTimeoutMs_(ntpAttemptTimeoutMs), retryDelayMs_(initialRetryMs), retryAtMs_(0), actionIssued_(false) {}
+      ntpAttemptTimeoutMs_(ntpAttemptTimeoutMs), retryDelayMs_(initialRetryMs), retryAtMs_(0), actionIssued_(false),
+      wifiRecoveryThreshold_(wifiRecoveryThreshold), wifiRecoveryCooldownMs_(wifiRecoveryCooldownMs) {}
 
 bool DevMqttSmokeState::deadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
     return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
@@ -25,7 +27,58 @@ void DevMqttSmokeState::scheduleRetry(uint32_t nowMs) {
     actionIssued_ = false;
 }
 
+void DevMqttSmokeState::recordConnectivityFailure(uint32_t nowMs) {
+    ++consecutiveConnectivityFailures_;
+    if (consecutiveConnectivityFailures_ < wifiRecoveryThreshold_) return;
+    // Reset immediately so a still-broken interface needs a full fresh run
+    // of failures (not just one more) before the cooldown check below is
+    // even consulted again.
+    consecutiveConnectivityFailures_ = 0;
+    if (wifiRecoveryCooldownActive_ && !deadlineReached(nowMs, wifiRecoveryCooldownUntilMs_)) {
+        // Still cooling down from a recent recovery - never escalate again
+        // before it elapses, no matter how many more failures accumulate.
+        // The ordinary per-stage backoff (DNS/MQTT) keeps retrying on its
+        // own in the meantime.
+        return;
+    }
+    wifiRecoveryCooldownActive_ = true;
+    wifiRecoveryCooldownUntilMs_ = nowMs + wifiRecoveryCooldownMs_;
+    wifiRecoveryRequested_ = true;
+}
+
 DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, bool timeValid, bool mqttConnected) {
+    if (wifiRecoveryRequested_) {
+        // Preempts the normal per-stage cascade below: a stronger recovery
+        // was authorized by recordConnectivityFailure(), so force a full
+        // Wi-Fi re-association regardless of the current stage. The caller
+        // must tear the transport down and call WiFi.disconnect() (without
+        // erasing credentials) in response; the ordinary ConnectWifi/backoff
+        // flow then brings the interface back up unchanged - but only once
+        // the disconnect has actually taken effect, see below.
+        wifiRecoveryRequested_ = false;
+        enter(DevSmokeState::WaitingForWifi, nowMs);
+        ntpAttemptInFlight_ = false;
+        awaitingWifiRecoveryDisconnect_ = true;
+        return DevSmokeAction::RecoverWifi;
+    }
+
+    if (awaitingWifiRecoveryDisconnect_) {
+        if (wifiConnected) {
+            // WiFi.disconnect() is asynchronous - the caller's own next
+            // wifiConnected read can still report true for a tick or more.
+            // Never let the cascade below advance past WaitingForWifi (e.g.
+            // straight into WaitingForDns) over what may still be the same
+            // stale association RecoverWifi was meant to drop - that would
+            // silently skip ConnectWifi/WiFi.begin() entirely and defeat the
+            // "force re-association" guarantee. Wait for the real signal.
+            return DevSmokeAction::None;
+        }
+        // The disconnect has taken effect - release into the ordinary
+        // !wifiConnected handling below, which issues ConnectWifi once its
+        // backoff deadline (already primed by enter() above) is reached.
+        awaitingWifiRecoveryDisconnect_ = false;
+    }
+
     if (!wifiConnected) {
         if (state_ != DevSmokeState::WaitingForWifi) {
             enter(DevSmokeState::WaitingForWifi, nowMs);
@@ -100,19 +153,48 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
 
 void DevMqttSmokeState::dnsResult(uint32_t nowMs, bool success) {
     if (state_ != DevSmokeState::WaitingForDns) return;
-    if (success) enter(DevSmokeState::WaitingForTime, nowMs);
-    else scheduleRetry(nowMs);
+    if (success) {
+        enter(DevSmokeState::WaitingForTime, nowMs);
+    } else {
+        scheduleRetry(nowMs);
+        recordConnectivityFailure(nowMs);
+    }
+}
+
+void DevMqttSmokeState::networkPreflightFailed(uint32_t nowMs) {
+    if (state_ != DevSmokeState::WaitingForMqtt) return;
+    // WaitingForTime's own "if (timeValid) ... enter(WaitingForMqtt)" guard
+    // means a still-valid clock is never re-synchronized just because this
+    // route happens to pass back through WaitingForTime on its way to
+    // WaitingForMqtt again - NTP is only ever restarted if timeValid is
+    // itself no longer true.
+    enter(DevSmokeState::WaitingForDns, nowMs);
+    recordConnectivityFailure(nowMs);
 }
 
 void DevMqttSmokeState::mqttResult(uint32_t nowMs, bool success) {
     if (state_ != DevSmokeState::WaitingForMqtt) return;
-    if (success) enter(DevSmokeState::Online, nowMs);
-    else scheduleRetry(nowMs);
+    if (success) {
+        enter(DevSmokeState::Online, nowMs);
+        // A full connect+subscribe is the strongest possible signal that
+        // the interface/DNS/TLS path is healthy end to end.
+        consecutiveConnectivityFailures_ = 0;
+        wifiRecoveryCooldownActive_ = false;
+        wifiRecoveryRequested_ = false;
+        awaitingWifiRecoveryDisconnect_ = false;
+    } else {
+        scheduleRetry(nowMs);
+        recordConnectivityFailure(nowMs);
+    }
 }
 
 DevSmokeState DevMqttSmokeState::state() const { return state_; }
 uint32_t DevMqttSmokeState::retryDelayMs() const { return retryDelayMs_; }
 uint32_t DevMqttSmokeState::retryAtMs() const { return retryAtMs_; }
 bool DevMqttSmokeState::ntpAttemptInFlight() const { return ntpAttemptInFlight_; }
+uint32_t DevMqttSmokeState::consecutiveConnectivityFailures() const { return consecutiveConnectivityFailures_; }
+bool DevMqttSmokeState::wifiRecoveryCooldownActive() const { return wifiRecoveryCooldownActive_; }
+uint32_t DevMqttSmokeState::wifiRecoveryCooldownUntilMs() const { return wifiRecoveryCooldownUntilMs_; }
+bool DevMqttSmokeState::awaitingWifiRecoveryDisconnect() const { return awaitingWifiRecoveryDisconnect_; }
 
 } // namespace interbridge

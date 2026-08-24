@@ -687,6 +687,49 @@ this pass:)*
   change). The ~78 s of DNS failures on that same boot was not changed - it
   is consistent with ordinary bounded exponential backoff over a
   slow/unavailable resolver path, not a code defect that was found.
+- A real bench device stayed online ~110 minutes, then lost MQTT/TLS
+  (`start_ssl_client: -1`) and stayed disconnected over an hour; after
+  reattaching the monitor, Wi-Fi reasons 201 (`no_ap_found`)/39 (`timeout`)
+  appeared, Wi-Fi/IP/first-DNS recovered, but the first TLS connect failed
+  with socket `errno 113` and later attempts failed repeatedly in
+  `hostByName()` while the state machine's stage stayed `mqtt`, never
+  returning to `dns`. **Not attributed to AWS** - the symptoms point at a
+  local Wi-Fi/DNS-path issue, and the exact cause of that local degradation
+  was not diagnosed; **local Wi-Fi is not claimed to be "fixed"** by the
+  response below. Two gaps addressed, both in `DevMqttSmokeState`/
+  `mqtt_smoke_main.cpp` only: (1) DNS was only ever resolved once before the
+  initial NTP sync - every later `ConnectMqtt` went straight to
+  `transport.connect()`, whose TLS client resolves internally with no way
+  for the state machine to attribute a DNS-specific failure or return to the
+  `dns` stage; fixed with an explicit sanitized DNS preflight before every
+  `ConnectMqtt`, falling back to `WaitingForDns` (that stage's own backoff)
+  on failure via the new `networkPreflightFailed()`. (2) there was no
+  autonomous recovery for "Wi-Fi says connected but DNS/TLS doesn't actually
+  work" over an extended period; `DevMqttSmokeState` now counts consecutive
+  DNS-preflight/TLS connectivity failures (never publish failures - those
+  already have their own outbox flow) and authorizes one conservative,
+  cooldown-limited (`wifiRecoveryThreshold`=3, `wifiRecoveryCooldownMs`=10
+  min, both configurable) `WiFi.disconnect(false, false)` (radio on,
+  credentials kept) + re-association via the existing unchanged
+  `ConnectWifi`/backoff flow, never `ESP.restart()`. Full detail, wire-format
+  of the new sanitized log lines, and the native test list are in
+  docs/mqtt-dev-smoke-test.md > "Real bench observation: MQTT/TLS lost after
+  ~110 minutes online". Validated by native tests and both firmware builds
+  compiling; **not yet re-validated on real hardware**.
+- Code review on the above (before it reached real hardware) found that
+  `WiFi.disconnect(false, false)` is asynchronous: the caller's very next
+  `wifiConnected` read can still (falsely) report `true`, and the recovery
+  cascade could resume DNS/MQTT over the stale association without
+  `ConnectWifi`/`WiFi.begin()` ever firing. Fixed with an explicit
+  `awaitingWifiRecoveryDisconnect_` flag in `DevMqttSmokeState`: while set
+  and `wifiConnected` still reads `true`, `update()` returns `None` and the
+  state stays at `WaitingForWifi`; only once a real `wifiConnected=false` is
+  observed does the ordinary `ConnectWifi`/`ResolveDns`/... cascade resume.
+  No caller (`mqtt_smoke_main.cpp`) changes needed. See
+  docs/mqtt-dev-smoke-test.md > "Follow-up fix: `WiFi.disconnect()` async
+  race in the recovery cascade". Validated by a real local MSVC
+  compile-and-run of `test_dev_mqtt_state` (16/16) and both firmware builds
+  compiling; **not yet re-validated on real hardware**.
 
 ## Future Work
 
