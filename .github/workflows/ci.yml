@@ -54,3 +54,9 @@ jobs:
 
       - name: Compile DEV MQTT smoke firmware
         run: pio run -e esp32-c3-dev-mqtt
+
+      - name: Compile Si3050 clock probe generator (ESP32-C3)
+        run: pio run -e esp32-c3-si3050-clock-probe
+
+      - name: Compile Si3050 clock probe meter (ESP32 DevKitV1)
+        run: pio run -e esp32dev-si3050-clock-meter
