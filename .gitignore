@@ -11,6 +11,14 @@
 *.pdb
 .venv/
 
+# Auto-generated, per-environment ESP-IDF build configuration cache
+# (PlatformIO's `framework = espidf` support writes these at the project
+# root) - explicitly marked "DO NOT EDIT" by ESP-IDF itself, and fully
+# regenerable from platformio.ini + board/component defaults. See
+# src/CMakeLists.txt and docs/si3050-clock-probe.md for why this
+# environment exists.
+sdkconfig.*
+
 # Local-only credentials for the guarded DEV MQTT smoke firmware.
 include/interbridge_dev_secrets.h
 

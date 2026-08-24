@@ -60,3 +60,6 @@ jobs:
 
       - name: Compile Si3050 clock probe meter (ESP32 DevKitV1)
         run: pio run -e esp32dev-si3050-clock-meter
+
+      - name: Compile Si3050 clock probe generator (IDF native TDM driver)
+        run: pio run -e esp32-c3-si3050-clock-probe-idf5

@@ -867,6 +867,47 @@ this pass:)*
   team decision. **This PR stays as investigation/documentation - it does
   not claim the ESP32-C3 delivers the Si3050's target clock on this
   toolchain, and does not decide on an external oscillator.**
+- **Follow-up (new, isolated environment): tried the modern, native
+  ESP-IDF I2S TDM driver (`driver/i2s_tdm.h`) instead of the legacy one,
+  and found a genuine ESP32-C3 hardware limit, not just a driver
+  limit.** New `esp32-c3-si3050-clock-probe-idf5` PlatformIO environment
+  (`framework = espidf`, does not touch `esp32-c3`,
+  `esp32-c3-dev-mqtt`, the meter, or any other environment's
+  platform/framework). A real download confirmed this pulls in
+  **ESP-IDF 6.0.1** (`framework-espidf/version.txt` and
+  `esp_idf_version.h`, not "5.x" as earlier speculated before the
+  package existed locally) and that `driver/i2s_tdm.h` genuinely exists
+  and compiles for ESP32-C3 (`SOC_I2S_SUPPORTS_TDM=1`). Discovered that
+  `build_src_filter` has no effect for `framework = espidf` - the first
+  build attempt globbed and tried to compile all of `src/`, including
+  Arduino-only files, and failed; fixed with a new `src/CMakeLists.txt`
+  (`idf_component_register(SRCS "dev/si3050_clock_probe_generator_idf5_
+  main.cpp" ...)`), confirmed inert for every Arduino-framework
+  environment by rebuilding all of them and comparing binary sizes
+  (byte-identical). **Critical finding, from the downloaded package's own
+  official example comment and its actual enforcing driver source**:
+  ESP32-C3's I2S TDM hardware caps a frame at 128 bits total
+  (`I2S_LL_SLOT_FRAME_BIT_MAX=128` in
+  `components/esp_hal_i2s/esp32c3/include/hal/i2s_ll.h`), enforced by
+  `i2s_channel_init_tdm_mode()` itself
+  (`components/esp_driver_i2s/i2s_tdm.c`, returns `ESP_ERR_INVALID_ARG`
+  if `total_slot * slot_bits > 128`) - the requested 16 slots x 16 bits =
+  256 bits/frame is exactly 2x that ceiling, a genuine silicon
+  limitation independent of which I2S driver is used.
+  `src/dev/si3050_clock_probe_generator_idf5_main.cpp` (new, dedicated
+  `app_main()` entry point, not an adapted Arduino `setup()`/`loop()`)
+  still requests the literal target geometry via the modern API exactly
+  as specified, with every `esp_err_t` checked and never a frequency
+  claim without external measurement (reuses the existing, natively
+  tested `configuredTdmRatio()`/`configuredBclkHz()` - no new pure math
+  needed). Compiles and links successfully
+  (`pio run -e esp32-c3-si3050-clock-probe-idf5`). Per explicit
+  instruction, no workaround for the 128-bit ceiling (e.g. 8 slots x 16
+  bits, the realistic max) was implemented, and no oscillator decision
+  was made - both left open. **`i2s_channel_init_tdm_mode()` is predicted
+  to fail with `ESP_ERR_INVALID_ARG` based on this source evidence, but
+  this has NOT been confirmed by flashing real hardware in this
+  session.**
 
 ## Future Work
 

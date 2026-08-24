@@ -4,14 +4,19 @@ This document describes a bench-only experiment to validate two narrow
 questions before any real Si3050 hardware exists:
 
 1. Can an ESP32-C3 generate the Si3050's target PCM clocks (PCLK =
-   2.048 MHz, FSYNC = 8 kHz, ratio 256) in hardware? **Not with this
-   toolchain, as tested.** Two real bench tests (the original TDM
-   configuration, then an additional `i2s_set_clk()` adjustment)
-   measured an identical ~1.024 MHz/~16 kHz/~64:1 output instead, and
-   the framework version installed here does not vendor the newer,
-   better-specified I2S driver that might do better - see "Real bench
-   observation: generator does not reach the target ratio" below for the
-   full investigation and the alternatives left for a future decision.
+   2.048 MHz, FSYNC = 8 kHz, ratio 256) in hardware? **Not with the
+   legacy driver, as tested; likely not at all on this chip, per its own
+   downloaded driver source.** Two real bench tests of the legacy
+   `driver/i2s.h` (the original TDM configuration, then an additional
+   `i2s_set_clk()` adjustment) measured an identical ~1.024 MHz/~16 kHz/
+   ~64:1 output instead of the target - see "Real bench observation:
+   generator does not reach the target ratio" below. A follow-up
+   investigation downloaded a real ESP-IDF 6.0.1 toolchain and confirmed,
+   from the modern native TDM driver's own enforcing source code, that
+   ESP32-C3's I2S TDM hardware has a genuine 128-bit-per-frame ceiling -
+   half of the 256 bits/frame the target ratio needs - see "IDF native
+   TDM driver investigation" below. This is a real hardware limit, not
+   fixable by switching drivers alone.
 2. Can a second board measure those clocks by hardware pulse counting and
    report believable frequencies/ratio back over serial? **Yes** - a real
    bench retest confirmed the PCNT meter (after its own bring-up fix,
@@ -35,22 +40,36 @@ oscilloscope or logic analyzer. No firmware here ever prints an absolute
 
 ## Isolation from the rest of the firmware
 
-Two new PlatformIO environments, each built from an exclusive
-`build_src_filter` (`-<*>` then only the specific files listed below), so
-neither can ever compile `main.cpp`, the DEV MQTT smoke harness,
-provisioning, or any other firmware path alongside it:
+Three PlatformIO environments, none of which can ever compile `main.cpp`,
+the DEV MQTT smoke harness, provisioning, or any other firmware path
+alongside it:
 
-- `esp32-c3-si3050-clock-probe` - generator, compiles only
+- `esp32-c3-si3050-clock-probe` - legacy-driver generator, compiles only
   `src/dev/si3050_clock_probe_generator_main.cpp`.
 - `esp32dev-si3050-clock-meter` - meter, compiles only
-  `src/dev/si3050_clock_probe_meter_main.cpp` and
-  `src/dev/si3050_clock_probe_math.cpp`.
+  `src/dev/si3050_clock_probe_meter_main.cpp`,
+  `src/dev/si3050_clock_probe_math.cpp`, and
+  `src/dev/si3050_clock_probe_meter_bringup.cpp`.
+- `esp32-c3-si3050-clock-probe-idf5` - native-IDF-driver generator,
+  compiles only `src/dev/si3050_clock_probe_generator_idf5_main.cpp`.
 
-Neither environment depends on Wi-Fi. Neither touches
+The first two (both `framework = arduino`) use an exclusive
+`build_src_filter` (`-<*>` then only the specific files above) for
+isolation. The third (`framework = espidf`) cannot use
+`build_src_filter` at all - PlatformIO ignores it for ESP-IDF projects -
+so it is isolated instead via `src/CMakeLists.txt`, a new file that lists
+only that one source file for the ESP-IDF "main" component; see "IDF
+native TDM driver investigation" below for why that file was needed and
+confirmation (by rebuilding every other environment and comparing binary
+sizes) that it does not affect any Arduino-framework environment.
+
+None of the three environments depends on Wi-Fi. None touches
 `Si3050Controller`, `Esp32PcmClock` (which remains an untouched stub), or
 any GPIO/relay/RGDT/SPI/reset logic for a real Si3050. `esp32-c3` and
-`esp32-c3-dev-mqtt` are unaffected - both new probe source files are
-explicitly excluded from their `build_src_filter`s (and from `native`'s).
+`esp32-c3-dev-mqtt` are unaffected - all three probe source files are
+explicitly excluded from their `build_src_filter`s (and from `native`'s),
+and neither uses `framework = espidf` or is otherwise touched by this
+PR's toolchain investigation.
 
 ## Wiring
 
@@ -169,8 +188,14 @@ edge, which cannot keep up with 2.048 MHz.
 ## Build / flash / monitor
 
 ```bash
-# Generator (flash to the ESP32-C3)
+# Legacy-driver generator (flash to the ESP32-C3)
 pio run -e esp32-c3-si3050-clock-probe -t upload
+pio device monitor -b 115200
+
+# Native-IDF-TDM-driver generator (flash to the SAME ESP32-C3 instead -
+# only one generator firmware runs at a time; re-flash to switch between
+# them)
+pio run -e esp32-c3-si3050-clock-probe-idf5 -t upload
 pio device monitor -b 115200
 
 # Meter (flash to the ESP32 DevKitV1, on its own USB port)
@@ -188,13 +213,31 @@ commands run in-session and their results.
 
 ## Expected output
 
-Generator, once at startup - reports what was *requested*, never a
-frequency claim (see "Real bench observation" below):
+Legacy-driver generator, once at startup - reports what was *requested*,
+never a frequency claim (see "Real bench observation" below):
 
 ```text
 [SI3050 CLOCK PROBE] requested_sample_rate_hz=8000 requested_total_chan=16 requested_bits_per_sample=16 requested_ratio=256 requested_pclk_hz=2048000 started=true
 [SI3050 CLOCK PROBE] note: the line above reports what was requested from the I2S driver, not a measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies
 ```
+
+Native-IDF-TDM-driver generator, once at startup - same reporting
+pattern, same disclaimer. Given `total_slots x bits_per_sample = 256`
+exceeds the ESP32-C3's documented 128-bit TDM frame limit (see "IDF
+native TDM driver investigation" below), `started=false` is the
+*predicted* outcome, unconfirmed until a real bench boot:
+
+```text
+[SI3050 CLOCK PROBE IDF5] requested_sample_rate_hz=8000 requested_total_slots=16 requested_bits_per_sample=16 requested_ratio=256 requested_pclk_hz=2048000 started=false
+[SI3050 CLOCK PROBE IDF5] note: the line above reports what was requested, not a measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies
+[SI3050 CLOCK PROBE IDF5] i2s_new_channel=0 i2s_channel_init_tdm_mode=258 i2s_channel_enable=-1
+```
+
+(`258` = `0x102` = `ESP_ERR_INVALID_ARG`, per this exact downloaded
+package's `components/esp_common/include/esp_err.h` - not guessed. The
+important part to check on a real boot is that
+`i2s_channel_init_tdm_mode` is non-zero/non-`ESP_OK` and
+`started=false`, confirming or contradicting the prediction above.)
 
 Meter, roughly once per second - this is an **actual real bench
 measurement** of the current generator configuration (see "Real bench
@@ -407,11 +450,14 @@ exact lines.
 
 Per explicit instruction not to implement a workaround/approximation:
 
-1. **Move off the legacy compatibility driver.** Confirmed blocked at
-   this exact framework version (see above) - requires a newer
-   Arduino-ESP32 core (ESP-IDF >= 5.0-based) or building against ESP-IDF
-   directly. A toolchain/framework version decision, not a firmware code
-   change.
+1. **Move off the legacy compatibility driver.** Confirmed blocked for
+   the Arduino-framework environments at this exact framework version
+   (see above) - requires a newer Arduino-ESP32 core (ESP-IDF >= 5.0-
+   based) or building against ESP-IDF directly. **Attempted as a
+   follow-up, in a new, isolated `esp32-c3-si3050-clock-probe-idf5`
+   environment** - see "IDF native TDM driver investigation" below. This
+   did not simply resolve the mismatch: it surfaced a deeper, hardware-
+   level constraint that applies regardless of driver.
 2. **Reconsider the target geometry.** Decide whether the Si3050
    bring-up work actually requires this exact 2.048 MHz/8 kHz/256:1
    relationship from *this specific* ESP32-C3 peripheral on *this
@@ -423,6 +469,152 @@ Per explicit instruction not to implement a workaround/approximation:
 the ESP32-C3 (on this toolchain) delivers the clock the Si3050 needs, and
 it does not decide on an external oscillator or any other hardware
 change - those remain open decisions for the team.
+
+## IDF native TDM driver investigation
+
+A third, isolated environment,
+`esp32-c3-si3050-clock-probe-idf5`, attempts the exact same target
+geometry (16 TDM slots, 16 bits/sample, PCM-short framing) using the
+modern, native ESP-IDF I2S TDM driver (`driver/i2s_tdm.h`) instead of the
+legacy `driver/i2s.h` the first attempt used. **It does not migrate
+`esp32-c3`, `esp32-c3-dev-mqtt`, the meter, or anything else in this
+repository off Arduino/ESP-IDF 4.4.7** - it is a separate, `framework =
+espidf` PlatformIO environment that only affects this one bench entry
+point.
+
+### Confirmed toolchain (downloaded and inspected for real, not assumed)
+
+- `~/.platformio/packages/framework-espidf/version.txt` and
+  `components/esp_common/include/esp_idf_version.h`
+  (`ESP_IDF_VERSION_MAJOR/MINOR/PATCH`) both confirm this package is
+  **ESP-IDF 6.0.1** - not "5.x" as earlier (incorrect) documentation in
+  this repository speculated before this package was actually
+  downloaded.
+- `components/esp_driver_i2s/include/driver/i2s_tdm.h` (plus
+  `i2s_std.h`, `i2s_pdm.h`, `i2s_common.h`, and the `.c` implementation
+  files) genuinely exist in this downloaded package - confirmed by
+  listing the files, not by trusting online documentation.
+- `components/soc/esp32c3/include/soc/soc_caps.h` reports
+  `SOC_I2S_SUPPORTS_TDM=1` for ESP32-C3 in this package too, and
+  `driver/i2s_tdm.h` itself is guarded by `#if SOC_I2S_SUPPORTS_TDM`, so
+  it is genuinely compiled in for this target.
+- A real build of `esp32-c3-si3050-clock-probe-idf5` (see "Verification"
+  below) compiles and links successfully against this exact API -
+  `pio run` for this environment is itself a minimal, real, reproducible
+  use of the new driver, not just a header include check.
+
+### Environment isolation: `build_src_filter` does not apply to `framework = espidf`
+
+The first attempt to build this environment (before `src/CMakeLists.txt`
+existed) failed loudly and informatively:
+
+```text
+Warning: the 'src_filter' option cannot be used with ESP-IDF. Select source files to build in the project CMakeLists.txt file.
+...
+src/aws/device_shadow.cpp:4:10: fatal error: ArduinoJson.h: No such file or directory
+src/dev/mqtt_smoke_main.cpp:2:2: error: #error "mqtt_smoke_main.cpp is only for INTERBRIDGE_DEV_MQTT_SMOKE"
+```
+
+PlatformIO's `build_src_filter` (the isolation mechanism every other
+bench environment in this file uses) has no effect for `framework =
+espidf`: without an explicit `src/CMakeLists.txt`, PlatformIO
+auto-generates one that globs and compiles *every* file under `src/` as
+the "main" IDF component - including Arduino-only production files.
+Fixed by adding `src/CMakeLists.txt` (new file, at the project source
+root, alongside this shared `src/` directory) with an explicit
+`idf_component_register(SRCS "dev/si3050_clock_probe_generator_idf5_main.cpp"
+INCLUDE_DIRS ".")` - the ESP-IDF-native equivalent of `build_src_filter`
+isolation. This file only takes effect for `framework = espidf` builds;
+Arduino-framework environments (which use SCons, not CMake) and the
+native test environment do not read it at all - confirmed by rebuilding
+`esp32-c3`, `esp32-c3-dev-mqtt`, `esp32-c3-si3050-clock-probe`, and
+`esp32dev-si3050-clock-meter` afterward and getting byte-identical binary
+sizes to before this file existed (see "Verification" below).
+
+### The critical finding: 16x16 exceeds this chip's TDM hardware limit, not just the legacy driver's
+
+This was found in the downloaded package's own official example and its
+own enforcing source code - not online documentation:
+
+- `examples/peripherals/i2s/i2s_basic/i2s_tdm/main/i2s_tdm_example_main.c`
+  states directly: *"For the target that not support full data
+  bit-width in multiple slots (e.g. ESP32C3, ESP32S3, ESP32C6) ... the
+  number of bit clock can't exceed 128 in one frame ... TDM mode can
+  only support 32 bit-width data upto 4 slots, 16 bit-width data upto 8
+  slots and 8 bit-width data upto 16 slots."*
+- `components/esp_hal_i2s/esp32c3/include/hal/i2s_ll.h` defines
+  `#define I2S_LL_SLOT_FRAME_BIT_MAX 128 // Up-to 128 bits in one frame`
+  for ESP32-C3 specifically (other targets, e.g. esp32s3/esp32p4/esp32h2,
+  define this as 512 - ESP32-C3's TDM hardware is genuinely more
+  limited).
+- `components/esp_driver_i2s/i2s_tdm.c`'s `i2s_channel_init_tdm_mode()`
+  enforces this directly: `ESP_RETURN_ON_FALSE(handle->total_slot *
+  slot_bits <= I2S_LL_SLOT_FRAME_BIT_MAX, ESP_ERR_INVALID_ARG, TAG,
+  "total slots(%lu) * slot_bit_width(%lu) exceeds the maximum %d", ...)`.
+
+**16 slots x 16 bits = 256 bits/frame is exactly 2x this chip's 128-bit
+hardware ceiling.** This is a genuine ESP32-C3 silicon/TDM-hardware
+limitation, confirmed from the actual enforcing driver source code, not
+a legacy-driver quirk or a documentation gap - it would apply to *any*
+driver on this exact chip, including the legacy one the first attempt
+used (which likely explains that attempt's unpredictable ~64:1 result:
+it was asking for a configuration the hardware cannot honor, and the
+legacy driver has no equivalent validation to reject it cleanly).
+
+### What was implemented
+
+`src/dev/si3050_clock_probe_generator_idf5_main.cpp` - a dedicated
+ESP-IDF `app_main()` entry point (not an adapted Arduino
+`setup()`/`loop()`) that requests the **exact literal target geometry**
+via the modern API, exactly as specified: `i2s_new_channel()` for a
+master TX channel, then `i2s_channel_init_tdm_mode()` with
+`I2S_TDM_PCM_SHORT_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+I2S_SLOT_MODE_MONO, <all 16 slots>)` and `total_slot=16` explicitly, BCLK
+on GPIO0, WS on GPIO1, sample rate 8000 Hz - then `i2s_channel_enable()`.
+`I2S_TDM_PCM_SHORT_SLOT_DEFAULT_CONFIG` (`driver/i2s_tdm.h`) sets
+`ws_width=1, ws_pol=true`: a single-BCLK-wide frame sync pulse, the
+modern API's documented equivalent of the legacy driver's
+`I2S_COMM_FORMAT_STAND_PCM_SHORT`, matching the Si3050's FSYNC
+requirement the same way. Every call's `esp_err_t` is checked; nothing
+is assumed to succeed.
+
+**Given the finding above, `i2s_channel_init_tdm_mode()` is *predicted*
+to return `ESP_ERR_INVALID_ARG`** - this is a prediction from reading the
+exact enforcing source code, not yet confirmed by running on real
+hardware in this session (no flashing was done - see "Verification"
+below). The physical retest that will confirm or contradict this
+prediction is left to the next bench session, per instruction.
+
+Startup diagnostics follow the same pattern as the legacy probe: report
+only what was *requested* (`requested_sample_rate_hz`,
+`requested_total_slots`, `requested_bits_per_sample`, `requested_ratio`,
+`requested_pclk_hz`, `started=true/false`, plus each call's `esp_err_t`
+on failure) and never claim a real frequency - **only
+`esp32dev-si3050-clock-meter`'s physical measurement validates actual
+frequency**, for this environment exactly as for the legacy one. The
+`requested_ratio`/`requested_pclk_hz` values reuse the same, already
+natively-tested `configuredTdmRatio()`/`configuredBclkHz()`
+(`src/dev/si3050_clock_probe_generator_config.h`) as the legacy
+generator, rather than duplicating that arithmetic - no new pure math
+was needed this round, so no new native tests were added.
+
+### What was deliberately NOT done
+
+- **No workaround for the 128-bit ceiling.** The realistic maximum
+  achievable via TDM on ESP32-C3 (per the same source evidence) is a
+  128-bit frame - e.g. 8 slots x 16 bits, or 4 slots x 32 bits (both
+  ratio 128, not the target 256). Neither is implemented here; this PR
+  configures and reports on the literal requested 16x16 geometry only,
+  as specified, and leaves adopting a reduced-ratio alternative as an
+  explicit decision for later, not something silently substituted in
+  this firmware.
+- **No decision on an external oscillator or any other hardware change.**
+- **No touching of `esp32-c3-si3050-clock-probe` (the legacy Arduino
+  probe)** beyond what earlier PRs already did - it remains in the repo
+  only as a record of its own real measurement (~1.024 MHz/~16 kHz/~64:1)
+  and is not presented as a solution.
+- **No LEDC, RMT, bit-banging, delay-based approximation, or private/
+  undocumented registers.**
 
 ## Tests
 
@@ -455,11 +647,17 @@ and as pure multiplication for other inputs (including zero). These
 functions compute what the generator *requests* and logs - they say
 nothing about what the hardware actually produces; see "Real bench
 observation: generator does not reach the target ratio" above.
+`src/dev/si3050_clock_probe_generator_idf5_main.cpp` reuses these same
+two functions (rather than duplicating the ratio/BCLK arithmetic a
+second time) for its own `requested_ratio`/`requested_pclk_hz` logging -
+no new pure math was introduced for the IDF5 investigation, so no new
+native tests were needed for it.
 
 Grep-verified (not itself a compiled test, since it is a structural/
 negative property): neither `si3050_clock_probe_math.{h,cpp}`,
 `si3050_clock_probe_generator_main.cpp`,
 `si3050_clock_probe_generator_config.h`,
+`si3050_clock_probe_generator_idf5_main.cpp`,
 `si3050_clock_probe_meter_main.cpp`, nor
 `si3050_clock_probe_meter_bringup.{h,cpp}` references Wi-Fi, MQTT,
 `IHardwareIO`, `setDoorOutput`, or any door-actuation symbol. See the PR
@@ -482,6 +680,18 @@ description for the exact command and its (empty) result.
   including the two alternatives left for a future team decision. This
   PR does not claim the ESP32-C3 delivers the Si3050's target clock on
   this toolchain.
+- **The IDF native TDM driver attempt (`esp32-c3-si3050-clock-probe-idf5`)
+  has NOT been flashed or tested on real hardware in this session** -
+  only `pio run` (compile-only, confirmed real and successful) verifies
+  it. Its `i2s_channel_init_tdm_mode()` call is *predicted* to fail with
+  `ESP_ERR_INVALID_ARG`, based on reading this exact downloaded driver's
+  own enforcing source code (`I2S_LL_SLOT_FRAME_BIT_MAX=128` for
+  ESP32-C3), not on having run it - see "IDF native TDM driver
+  investigation" above. The physical retest that will confirm or
+  contradict this prediction is left for after review, per instruction.
+  Only `esp32dev-si3050-clock-meter`'s physical measurement can validate
+  any generator's real output - neither generator's own startup log
+  proves anything about actual frequencies.
 - The atomic ISR-excluded sample in the meter still allows a handful of
   PCLK edges to go uncounted during the brief critical section on every
   window boundary (interrupts, including the overflow ISR, are disabled
