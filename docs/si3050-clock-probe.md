@@ -4,10 +4,14 @@ This document describes a bench-only experiment to validate two narrow
 questions before any real Si3050 hardware exists:
 
 1. Can an ESP32-C3 generate the Si3050's target PCM clocks (PCLK =
-   2.048 MHz, FSYNC = 8 kHz, ratio 256) in hardware? **Open as of the
-   latest real bench test** - see "Real bench observation: generator
-   does not reach the target ratio" below; this is still being
-   investigated, not confirmed.
+   2.048 MHz, FSYNC = 8 kHz, ratio 256) in hardware? **Not with this
+   toolchain, as tested.** Two real bench tests (the original TDM
+   configuration, then an additional `i2s_set_clk()` adjustment)
+   measured an identical ~1.024 MHz/~16 kHz/~64:1 output instead, and
+   the framework version installed here does not vendor the newer,
+   better-specified I2S driver that might do better - see "Real bench
+   observation: generator does not reach the target ratio" below for the
+   full investigation and the alternatives left for a future decision.
 2. Can a second board measure those clocks by hardware pulse counting and
    report believable frequencies/ratio back over serial? **Yes** - a real
    bench retest confirmed the PCNT meter (after its own bring-up fix,
@@ -88,16 +92,19 @@ modes) as a hardware TDM master:
   `tx_desc_auto_clear = true` plus an initial `i2s_zero_dma_buffer()` call
   keep the peripheral emitting continuous silence rather than pausing on
   an empty TX buffer.
-- After `i2s_set_pin()`, an explicit `i2s_set_clk(i2s_num, rate, bits_cfg,
-  ch)` call re-applies the same total_chan/bits_per_sample via the
-  driver's dedicated clock-configuration entry point - see "Real bench
-  observation" below for why this was added and why it remains
-  unconfirmed.
+
+Only `i2s_driver_install()` + `i2s_set_pin()` are used - an additional
+`i2s_set_clk()` call was tried and removed after a real bench retest
+showed it does not change the output; see "Real bench observation"
+below.
 
 This configuration was designed against the framework version actually
 installed in this repo (`framework-arduinoespressif32`
-3.20017.241212+sha.dcc1105b, ESP-IDF 5.x legacy I2S driver), confirmed
-before writing any code that the exposed API surface *could* express it:
+3.20017.241212+sha.dcc1105b, built on ESP-IDF 4.4.7 - see "Toolchain
+investigation" below for exactly how that was confirmed - using its
+legacy `driver/i2s.h`, the only I2S driver this framework version has),
+confirmed before writing any code that the exposed API surface *could*
+express it:
 `soc/esp32c3/include/soc/soc_caps.h` reports `SOC_I2S_SUPPORTS_TDM=1` for
 ESP32-C3, and the vendored `driver/i2s.h`/`hal/i2s_types.h` expose the
 `i2s_config_t` TDM fields (`chan_mask`, `total_chan`) and
@@ -306,9 +313,7 @@ ratio    ~= 63.996
 precompiled `tools/sdk/esp32c3/lib/libdriver.a` in this PlatformIO
 package - there is no `.c` source for the legacy I2S driver in this
 repository's toolchain to read the actual clock-divider computation.
-Everything below is from the installed **headers only**, which is why
-this section documents a blocker and a best-effort attempt rather than a
-confirmed fix:
+Everything in this subsection is from the installed **headers only**:
 
 - `hal/i2s_hal.h`'s `i2s_hal_config_t` has a `total_chan` field (Total
   number of I2S channels) **and a separate `active_chan` field** (I2S
@@ -320,7 +325,7 @@ confirmed fix:
   i2s_channel_t ch)` (`driver/i2s.h`) is documented with a `ch` parameter
   described as accepting "`I2S_CHANNEL_MONO`, `I2S_CHANNEL_STEREO` or
   specific channel in TDM mode" - i.e. this function, not
-  `i2s_driver_install()` alone, appears to be the documented way to
+  `i2s_driver_install()` alone, appeared to be the documented way to
   (re)apply the TDM channel bitmask specifically for clock configuration.
   The generator's original code never called it.
 - At the register level (`hal/esp32c3/include/hal/i2s_ll.h`),
@@ -332,21 +337,61 @@ confirmed fix:
   (`i2s_ll_tx_set_clk()`/`i2s_hal_tx_clock_config()`), which is exactly
   where the source is unavailable.
 
-**Attempted, driver-justified adjustment** (not a guessed/invented
-configuration - it requests the same `total_chan=16`/`bits_per_sample=16`
-already set, via the driver's own dedicated clock API): added an explicit
+**Attempted and REJECTED: the `i2s_set_clk()` adjustment did not change
+the output.** Based on the header evidence above, an explicit
 `i2s_set_clk(kI2sPort, kConfig.fsyncHz, bitsCfg, chan_mask_as_channel_t)`
-call after `i2s_set_pin()` in
-`src/dev/si3050_clock_probe_generator_main.cpp`, checked like every other
-step. **This is unconfirmed** - it has not been re-tested on real
-hardware in this session, and given the exact ~1/4 ratio and ~2x FSYNC
-already observed do not match any single, simple, headers-only-derivable
-formula with full confidence, it may not resolve the discrepancy.
+call was added after `i2s_set_pin()` - not a guessed/invented
+configuration, it requested the exact same `total_chan=16`/
+`bits_per_sample=16` already set, via the driver's own dedicated clock
+API. **A physical retest reflashed the generator twice with this change
+and measured an identical result both times**:
+
+```text
+pclk_hz  ~= 1,024,100
+fsync_hz ~= 16,003
+ratio    ~= 63.99
+```
+
+Indistinguishable from the original measurement above. This call has
+been **removed** from `src/dev/si3050_clock_probe_generator_main.cpp` -
+it is not a fix, does not change the real signal, and must not be
+reintroduced or presented as a solution without new evidence.
+
+### Toolchain investigation: is the newer, native TDM driver available here?
+
+Checked directly rather than assumed from online documentation:
+
+- `esp_common/include/esp_idf_version.h` in this installed framework
+  reports `ESP_IDF_VERSION_MAJOR=4`, `ESP_IDF_VERSION_MINOR=4`,
+  `ESP_IDF_VERSION_PATCH=7` - this Arduino-ESP32 core
+  (`framework-arduinoespressif32` 3.20017.241212+sha.dcc1105b) is built
+  on **ESP-IDF 4.4.7**. The newer, better-specified I2S driver
+  (`driver/i2s_std.h`, `driver/i2s_tdm.h`, `driver/i2s_pdm.h`, the
+  `esp_driver_i2s` component) was introduced in **ESP-IDF 5.0** and does
+  not exist in the 4.4.x line at all.
+- A recursive search of every chip's SDK directory in this installed
+  framework package (`tools/sdk/*/include/**`, all chips, not only
+  esp32c3) for `i2s_tdm*`, `i2s_std*`, `i2s_pdm*`, `i2s_common*`, and any
+  `esp_driver_i2s*` file found **none** - the only I2S driver header
+  present anywhere in this package, for any chip, is the legacy
+  `driver/i2s.h` already in use.
+- `esp32-c3-si3050-clock-probe` therefore cannot compile even a minimal
+  use of the newer driver in this framework version - there is nothing
+  to `#include`.
+
+**Conclusion: this is genuinely a toolchain/framework-version blocker,
+not a vendoring omission or something fixable in firmware code alone.**
+Reaching the newer, native TDM driver would require a newer
+Arduino-ESP32 core release built on ESP-IDF >= 5.0 (if/when PlatformIO's
+`espressif32` platform offers one) or building against ESP-IDF directly
+- both toolchain decisions, out of this firmware change's scope. Per
+explicit instruction, no further attempt was made with the legacy
+driver, private/undocumented registers, LEDC, RMT, bit-banging, or delay
+loops.
 
 ### What the generator now logs
 
-Startup diagnostics were expanded per this investigation - see "Expected
-output" below for the exact lines. They report what was *requested*
+Startup diagnostics report what was *requested*
 (`requested_sample_rate_hz`, `requested_total_chan`,
 `requested_bits_per_sample`, `requested_ratio`, `requested_pclk_hz`) and
 whether the driver *accepted* that request (`started=true/false`, plus
@@ -355,33 +400,29 @@ each call's `esp_err_t` on failure) - never a frequency claim. The
 `configuredTdmRatio()`/`configuredBclkHz()`
 (`src/dev/si3050_clock_probe_generator_config.h`, natively tested) so the
 log can never silently drift from the actual `total_chan`/`bits_per_sample`
-values used to configure the driver.
+values used to configure the driver. See "Expected output" below for the
+exact lines.
 
 ### Minimal alternatives for a future decision (none implemented here)
 
-Per the explicit instruction not to implement a workaround/approximation
-without documented justification, none of the following were
-implemented - they are presented for a future decision once the
-`i2s_set_clk()` attempt above has been re-tested on real hardware:
+Per explicit instruction not to implement a workaround/approximation:
 
-1. **Re-test first.** The `i2s_set_clk()` addition is a real,
-   driver-documented candidate that was not present in the configuration
-   that produced the ratio-64 measurement - it needs its own bench run
-   before concluding anything further is needed.
-2. **Move off the legacy compatibility driver.** This framework version
-   only vendors `driver/i2s.h` (the legacy compatibility shim); it does
-   not vendor the newer, natively-documented `driver/i2s_std.h`/
-   `driver/i2s_tdm.h` components that ESP-IDF 5.x ships for direct,
-   better-specified TDM control. Building against ESP-IDF directly (or a
-   newer Arduino-ESP32 core release, if one vendors these headers) may
-   expose the missing control surface - this is a toolchain/framework
-   version decision, not a firmware code change.
-3. **Reconsider the target geometry.** If neither of the above closes
-   the gap, decide whether the Si3050 bring-up work actually requires
-   this exact 2.048 MHz/8 kHz/256:1 relationship from *this specific*
-   ESP32-C3 peripheral, or whether an external clock generator/oscillator
+1. **Move off the legacy compatibility driver.** Confirmed blocked at
+   this exact framework version (see above) - requires a newer
+   Arduino-ESP32 core (ESP-IDF >= 5.0-based) or building against ESP-IDF
+   directly. A toolchain/framework version decision, not a firmware code
+   change.
+2. **Reconsider the target geometry.** Decide whether the Si3050
+   bring-up work actually requires this exact 2.048 MHz/8 kHz/256:1
+   relationship from *this specific* ESP32-C3 peripheral on *this
+   specific* toolchain, or whether an external clock generator/oscillator
    for the Si3050's PCM interface is the more realistic path for Rev A -
    a hardware decision, out of this firmware's scope.
+
+**This PR stays as investigation and documentation.** It does not claim
+the ESP32-C3 (on this toolchain) delivers the clock the Si3050 needs, and
+it does not decide on an external oscillator or any other hardware
+change - those remain open decisions for the team.
 
 ## Tests
 
@@ -430,13 +471,17 @@ description for the exact command and its (empty) result.
   physical retest with all three wires connected printed `pcnt
   configured` and reported a real, stable signal) - see "Real bench
   observation: PCNT bring-up order bug" above.
-- **The generator does not yet reach the target PCLK/FSYNC/ratio on real
-  hardware**, and the `i2s_set_clk()` addition attempted in response is
-  itself unconfirmed - only native tests and `pio run` (compile-only)
-  verify it compiles in this session, not a fresh bench boot. See "Real
-  bench observation: generator does not reach the target ratio" above,
-  including the minimal alternatives presented for a future decision if
-  a retest still does not close the gap.
+- **The generator does not reach the target PCLK/FSYNC/ratio on real
+  hardware, confirmed by two separate physical retests** (the original
+  TDM configuration, and an additional `i2s_set_clk()` adjustment that
+  was flashed twice and measured an identical, still-wrong result both
+  times - since removed from the code). The installed framework's I2S
+  driver (ESP-IDF 4.4.7-based) is confirmed, not assumed, to lack the
+  newer native TDM driver that might resolve this - see "Real bench
+  observation: generator does not reach the target ratio" above,
+  including the two alternatives left for a future team decision. This
+  PR does not claim the ESP32-C3 delivers the Si3050's target clock on
+  this toolchain.
 - The atomic ISR-excluded sample in the meter still allows a handful of
   PCLK edges to go uncounted during the brief critical section on every
   window boundary (interrupts, including the overflow ISR, are disabled

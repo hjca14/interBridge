@@ -837,21 +837,36 @@ this pass:)*
   mode") appears to be the driver's dedicated way to (re)apply the TDM
   channel count for clock configuration - `i2s_driver_install()` alone
   may not fully resolve it. Added an explicit, driver-justified (not
-  invented) `i2s_set_clk()` call requesting the same
-  total_chan=16/bits=16 via that dedicated API
-  (`src/dev/si3050_clock_probe_generator_main.cpp`), plus expanded
-  sanitized diagnostics that report only what was *requested*
-  (`requested_*` fields, computed via the new, natively-tested
-  `configuredTdmRatio()`/`configuredBclkHz()` in
-  `src/dev/si3050_clock_probe_generator_config.h`) and never claim a real
-  frequency without external measurement. Per explicit instruction, no
-  palliative/approximate workaround (bit-banging, `delay()`,
-  `digitalWrite()`, LEDC, RMT) was implemented; three minimal alternatives
-  for a future decision are documented in docs/si3050-clock-probe.md's
-  "Real bench observation: generator does not reach the target ratio" if
-  a retest of the `i2s_set_clk()` attempt still does not close the gap.
-  **This attempted fix is unconfirmed - not re-tested on real hardware in
-  this session.**
+  invented) `i2s_set_clk()` call requesting the same total_chan=16/
+  bits=16 via that dedicated API, plus expanded sanitized diagnostics
+  that report only what was *requested* (`requested_*` fields, computed
+  via the new, natively-tested `configuredTdmRatio()`/`configuredBclkHz()`
+  in `src/dev/si3050_clock_probe_generator_config.h`) and never claim a
+  real frequency without external measurement.
+- **Follow-up (same experiment): the `i2s_set_clk()` attempt was
+  physically retested twice and FAILED - removed.** Both reflashes of
+  the generator measured an identical, still-wrong result
+  (`pclk_hz~=1,024,100`, `fsync_hz~=16,003`, `ratio~=63.99`) to the
+  original measurement above - the call changed nothing and has been
+  removed from `src/dev/si3050_clock_probe_generator_main.cpp`; it must
+  not be reintroduced or presented as a fix. Separately confirmed (not
+  assumed from online docs) that this installed framework
+  (`framework-arduinoespressif32` 3.20017.241212+sha.dcc1105b) is built
+  on **ESP-IDF 4.4.7** (`esp_idf_version.h`), and that none of the newer
+  native TDM driver headers (`driver/i2s_std.h`, `driver/i2s_tdm.h`,
+  `driver/i2s_pdm.h`, any `esp_driver_i2s` component) exist anywhere in
+  this framework package for any chip - only the legacy `driver/i2s.h`
+  already in use. This is a genuine toolchain/framework-version blocker,
+  not something fixable in firmware code alone; per explicit instruction,
+  no further attempt was made with the legacy driver, private registers,
+  LEDC, RMT, bit-banging, or delay loops. Two minimal alternatives (move
+  to an ESP-IDF >= 5.0-based core, or reconsider whether this exact
+  2.048 MHz/8 kHz/256:1 relationship must come from this specific
+  peripheral) are documented in docs/si3050-clock-probe.md's "Real bench
+  observation: generator does not reach the target ratio" for a future
+  team decision. **This PR stays as investigation/documentation - it does
+  not claim the ESP32-C3 delivers the Si3050's target clock on this
+  toolchain, and does not decide on an external oscillator.**
 
 ## Future Work
 
