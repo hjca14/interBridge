@@ -40,7 +40,17 @@ src/
 │
 ├── intercom/           Intercom business logic (electrically agnostic).
 │   ├── line_detector.h/.cpp  Off-hook/on-hook edge detection over IHardwareIO.
-│   └── intercom.h/.cpp       Intercom facade; door output reports real success/failure.
+│   ├── intercom.h/.cpp       Intercom facade; door output reports real success/failure.
+│   └── si3050/         Phase 3A Si3050 DAA foundation (Rev A hardware, not
+│       │                yet built/validated) - see docs/si3050-bringup.md.
+│       ├── si3050_pins.h            Rev A pin map + compile-time collision checks.
+│       ├── si3050_config.h/timing.h PCLK/FSYNC targets + datasheet-derived timing formulas.
+│       ├── si3050_bus.h/.cpp        ISi3050Bus (SPI + CS) + Esp32/fake.
+│       ├── si3050_pcm_clock.h/.cpp  IPcmClock (PCLK/FSYNC) + Esp32/fake.
+│       ├── si3050_reset.h/.cpp      ISi3050Reset (/RESET) + Esp32/fake.
+│       ├── si3050_delay.h/.cpp      IDelayProvider (injectable bring-up wait) + Esp32/fake.
+│       ├── si3050_controller.h/.cpp Si3050Controller: electrical bring-up sequence, gates SPI.
+│       └── ring_detector.h/.cpp     ISi3050RingInput (/RGDT) + debounced RingDetector.
 │
 ├── audio/              Audio abstraction (not implemented).
 │   └── audio.h/.cpp     IAudioIO interface + NullAudioIO placeholder.
@@ -82,7 +92,7 @@ src/
     └── ota_manager.h/.cpp          OtaCoordinator: version→download→verify→install→confirm.
 ```
 
-`include/` is still unused (see `include/README.md`). `test/` holds 26
+`include/` is still unused (see `include/README.md`). `test/` holds 32
 native unit test suites, one per PlatformIO test directory - see Testing
 strategy below.
 
@@ -305,13 +315,14 @@ Two PlatformIO environments exist:
 
 - `esp32-c3` — the real firmware, `framework = arduino`, with
   `lib_deps = bblanchon/ArduinoJson@^7.0.0`.
-- `native` — compiles the hardware-independent subset of `src/` (34 of
-  36 `.cpp` files) together with Unity tests under `test/` (26 suites),
+- `native` — compiles the hardware-independent subset of `src/` (42 of
+  45 `.cpp` files) together with Unity tests under `test/` (32 suites),
   using the host's own C++ compiler.
 
-`main.cpp` and `network/wifi.cpp` are excluded from the `native` build
-(via `build_src_filter` in `platformio.ini`) because they include
-Arduino-only headers unconditionally. Every other file - including
+`main.cpp`, `dev/mqtt_smoke_main.cpp`, and `network/wifi.cpp` are excluded
+from the `native` build (via `build_src_filter` in `platformio.ini`)
+because they include Arduino-only headers unconditionally. Every other
+file - including
 `hardware/clock.cpp`, `hardware/button.cpp`, `hardware/system_control.cpp`,
 `core/random_id.cpp`, and `hardware/gpio.cpp` - compiles natively because
 their Arduino-specific code is guarded with `#ifdef ARDUINO` and falls
