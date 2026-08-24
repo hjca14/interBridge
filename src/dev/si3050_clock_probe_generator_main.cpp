@@ -2,20 +2,34 @@
 #error "si3050_clock_probe_generator_main.cpp is only for INTERBRIDGE_SI3050_CLOCK_PROBE_GENERATOR"
 #endif
 
-// Phase 3B.1 bench-only experiment: generates the Si3050's target PCLK/
-// FSYNC clocks on GPIO0/GPIO1 using the ESP32-C3's I2S peripheral in
-// hardware TDM master mode, to be measured by a second board running
-// esp32dev-si3050-clock-meter. This is NOT Si3050 integration - it does
-// not touch Si3050Controller, Esp32PcmClock (which remains an untouched
-// stub), or any production/DEV MQTT firmware path. No physical action of
-// any kind is possible from this firmware. See
-// docs/si3050-clock-probe.md.
+// Phase 3B.1 bench-only experiment: attempts to generate the Si3050's
+// target PCLK/FSYNC clocks on GPIO0/GPIO1 using the ESP32-C3's I2S
+// peripheral in hardware TDM master mode, to be measured by a second
+// board running esp32dev-si3050-clock-meter. This is NOT Si3050
+// integration - it does not touch Si3050Controller, Esp32PcmClock
+// (which remains an untouched stub), or any production/DEV MQTT
+// firmware path. No physical action of any kind is possible from this
+// firmware. See docs/si3050-clock-probe.md.
+//
+// IMPORTANT: a real bench retest of the original configuration below
+// (i2s_driver_install() + i2s_set_pin() only, total_chan=16,
+// bits_per_sample=16, expected ratio 256) measured an actual PCLK:FSYNC
+// ratio of ~64 - NOT the requested 256 - even though pcnt confirmed a
+// real, stable signal was present. This firmware does NOT claim the
+// values it logs at startup are the real output frequencies - only the
+// separate meter board's measurement is that. See
+// docs/si3050-clock-probe.md's "Real bench observation: generator does
+// not reach the target ratio" for the full investigation, what was
+// tried here as a documented, driver-justified adjustment
+// (i2s_set_clk() below), and why it is still unconfirmed pending a
+// fresh bench retest.
 
 #include <Arduino.h>
 #include "driver/i2s.h"
 
 #include "../intercom/si3050/si3050_config.h"
 #include "../intercom/si3050/si3050_pins.h"
+#include "si3050_clock_probe_generator_config.h"
 
 using namespace interbridge;
 
@@ -23,32 +37,25 @@ namespace {
 
 constexpr i2s_port_t kI2sPort = I2S_NUM_0;
 
-// TDM slot geometry chosen so that, with the Si3050Config defaults
-// (pclkHz=2048000, fsyncHz=8000, reused below rather than duplicated as
-// fresh magic numbers):
-//   PCLK (I2S BCLK) = sample_rate * total_chan * bits_per_sample
-//                    = 8000 * 16 * 16 = 2,048,000 Hz
-//   FSYNC (I2S WS)  = sample_rate = 8000 Hz
-//   ratio           = total_chan * bits_per_sample = 256 PCLK cycles/frame
-// matching the Si3050's targets exactly.
+// TDM slot geometry REQUESTED from the driver - see the file-level
+// comment above: a real bench test showed this request is NOT honored
+// as documented by this driver/chip/framework combination, so this is
+// no longer described as "matching the target exactly" the way it was
+// before that test - only as what is asked for.
+//   requested BCLK (PCLK) = sample_rate * total_chan * bits_per_sample
+//                          = 8000 * 16 * 16 = 2,048,000 Hz
+//   requested WS (FSYNC)  = sample_rate = 8000 Hz
+//   requested ratio       = total_chan * bits_per_sample = 256
 //
-// Confirmed against the framework actually installed in this repo
-// (framework-arduinoespressif32 3.20017.241212+sha.dcc1105b, ESP-IDF 5.x
-// legacy `driver/i2s.h`; soc_caps.h reports SOC_I2S_SUPPORTS_TDM=1 for
-// ESP32-C3):
-//   - `i2s_channel_fmt_t::I2S_CHANNEL_FMT_MULTIPLE` selects TDM mode.
-//   - TDM channel activation is a bitmask of I2S_TDM_ACTIVE_CH0..CH15
-//     (hal/i2s_types.h), i.e. a hard ceiling of 16 channels - so 16
-//     channels x 16 bits is the widest TDM slot geometry that reaches
-//     exactly 256 without exceeding that ceiling (32 x 8 or 8 x 32 would
-//     also reach 256 arithmetically, but 32 channels exceeds the 16-slot
-//     TDM bitmask this driver exposes).
-//   - `I2S_COMM_FORMAT_STAND_PCM_SHORT` is documented in
-//     hal/i2s_types.h as "PCM Short standard, also known as DSP mode.
-//     The period of synchronization signal (WS) is 1 bck cycle" - this
-//     is the short, single-cycle frame pulse the Si3050 datasheet calls
-//     FSYNC, not I2S's own ~50%-duty Philips WS.
-// No approximation (LEDC/RMT/bit-banged delay loop) was used or needed.
+// TDM channel activation is a bitmask of I2S_TDM_ACTIVE_CH0..CH15
+// (hal/i2s_types.h), i.e. a hard ceiling of 16 channels exposed by this
+// driver - so 16 channels x 16 bits was chosen as the widest TDM slot
+// geometry that reaches exactly 256 without exceeding that ceiling.
+// `I2S_COMM_FORMAT_STAND_PCM_SHORT` is documented in hal/i2s_types.h as
+// "PCM Short standard, also known as DSP mode. The period of
+// synchronization signal (WS) is 1 bck cycle" - the short, single-cycle
+// frame pulse the Si3050 datasheet calls FSYNC, not I2S's own ~50%-duty
+// Philips WS. No approximation (LEDC/RMT/bit-banged delay loop) is used.
 constexpr uint32_t kTotalChannels = 16;
 constexpr i2s_bits_per_sample_t kBitsPerSample = I2S_BITS_PER_SAMPLE_16BIT;
 
@@ -103,18 +110,48 @@ void setup() {
     pinConfig.data_in_num = I2S_PIN_NO_CHANGE;
 
     const esp_err_t pinResult = (installResult == ESP_OK) ? i2s_set_pin(kI2sPort, &pinConfig) : installResult;
-    const bool started = (installResult == ESP_OK) && (pinResult == ESP_OK);
+
+    // Driver-documented, justified adjustment attempted in response to
+    // the real-hardware ratio mismatch: `driver/i2s.h`'s i2s_hal layer
+    // exposes a distinct `active_chan` (I2S active channel number) from
+    // `total_chan` (i2s_hal.h); the legacy i2s_config_t used by
+    // i2s_driver_install() above only sets total_chan/chan_mask, with no
+    // direct way to set active_chan. i2s_set_clk()'s own doc comment
+    // documents a `ch` parameter explicitly described as accepting
+    // "I2S_CHANNEL_MONO, I2S_CHANNEL_STEREO or specific channel in TDM
+    // mode" - i.e. it is the documented way to (re)apply the TDM active-
+    // channel bitmask specifically for clock configuration, which
+    // i2s_driver_install() alone may not fully resolve for TDM. This is
+    // NOT a new/guessed configuration - it requests the exact same
+    // total_chan/bits_per_sample already set above, just through the
+    // driver's own dedicated clock-configuration entry point.
+    // UNCONFIRMED: this has not been re-verified on real hardware in
+    // this session - see docs/si3050-clock-probe.md.
+    const uint32_t bitsCfg = static_cast<uint32_t>(kBitsPerSample); // low 16 bits only -> chan_bits defaults to match
+    const esp_err_t clkResult = (pinResult == ESP_OK)
+                                     ? i2s_set_clk(kI2sPort, kConfig.fsyncHz, bitsCfg,
+                                                   static_cast<i2s_channel_t>(kActiveChannelMask))
+                                     : pinResult;
+
+    const bool started = (installResult == ESP_OK) && (pinResult == ESP_OK) && (clkResult == ESP_OK);
     if (started) {
         i2s_zero_dma_buffer(kI2sPort); // fill DMA with silence so BCLK/WS run continuously from the start
     }
 
-    const uint32_t ratioTarget = kTotalChannels * static_cast<uint32_t>(kBitsPerSample);
-    Serial.printf("[SI3050 CLOCK PROBE] pclk_target_hz=%lu fsync_target_hz=%lu ratio_target=%lu started=%s\n",
-                 static_cast<unsigned long>(kConfig.pclkHz), static_cast<unsigned long>(kConfig.fsyncHz),
-                 static_cast<unsigned long>(ratioTarget), started ? "true" : "false");
+    const uint32_t requestedRatio = configuredTdmRatio(kTotalChannels, static_cast<uint32_t>(kBitsPerSample));
+    const uint32_t requestedPclkHz = configuredBclkHz(kConfig.fsyncHz, kTotalChannels, static_cast<uint32_t>(kBitsPerSample));
+    Serial.printf(
+        "[SI3050 CLOCK PROBE] requested_sample_rate_hz=%lu requested_total_chan=%lu requested_bits_per_sample=%lu "
+        "requested_ratio=%lu requested_pclk_hz=%lu started=%s\n",
+        static_cast<unsigned long>(kConfig.fsyncHz), static_cast<unsigned long>(kTotalChannels),
+        static_cast<unsigned long>(kBitsPerSample), static_cast<unsigned long>(requestedRatio),
+        static_cast<unsigned long>(requestedPclkHz), started ? "true" : "false");
+    Serial.println(
+        "[SI3050 CLOCK PROBE] note: the line above reports what was requested from the I2S driver, not a "
+        "measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies");
     if (!started) {
-        Serial.printf("[SI3050 CLOCK PROBE] i2s_driver_install=%d i2s_set_pin=%d\n", static_cast<int>(installResult),
-                     static_cast<int>(pinResult));
+        Serial.printf("[SI3050 CLOCK PROBE] i2s_driver_install=%d i2s_set_pin=%d i2s_set_clk=%d\n",
+                     static_cast<int>(installResult), static_cast<int>(pinResult), static_cast<int>(clkResult));
     }
 }
 
