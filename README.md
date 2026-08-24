@@ -58,7 +58,7 @@ the full device/cloud protocol specification.
 src/         Firmware source: core, hardware, intercom, audio, storage,
              provisioning, network, protocol, aws, ota.
 include/     Reserved for shared public headers (unused so far).
-test/        Native unit tests (Unity), one PlatformIO test per directory (32 suites).
+test/        Native unit tests (Unity), one PlatformIO test per directory (33 suites).
 docs/        Architecture documentation and the communication protocol spec.
 platformio.ini
 CONTEXT.md   Operational memory of the project — read this first.
@@ -86,13 +86,14 @@ pio device monitor -b 115200
 ## Running tests
 
 ```bash
-# Run all native unit tests (32 suites: state machine, events, intercom,
+# Run all native unit tests (33 suites: state machine, events, intercom,
 # MQTT topics, command parsing/handling/dedup, event outbox, reconnect
 # backoff, button, device identity, persistent storage, Device Shadow,
 # AWS IoT Jobs, OTA, health telemetry, provisioning (BLE-first onboarding
 # state machine), BLE advertisement/security mode, status indicator,
 # Fleet Provisioning, factory reset, MQTT transport, DEV MQTT smoke
-# state, Si3050 bring-up controller, Si3050 ring detector, ...)
+# state, Si3050 bring-up controller, Si3050 ring detector, Si3050 clock
+# probe math, ...)
 pio test -e native
 ```
 
@@ -166,6 +167,23 @@ exists yet, no Si3050 control register is read or written, no real SPI
 transaction or PCM clock is generated, and no ring pattern, off-hook, or
 audio behavior is implemented. It is not instantiated by the current
 `esp32-c3`/`esp32-c3-dev-mqtt` firmware paths.
+
+## Si3050 clock probe: ESP32-C3 -> ESP32 DevKitV1 (Phase 3B.1)
+
+Two more isolated PlatformIO environments, `esp32-c3-si3050-clock-probe`
+and `esp32dev-si3050-clock-meter`, form a bench-only experiment to check
+whether an ESP32-C3 can generate the Si3050's target PCLK (2.048 MHz)/
+FSYNC (8 kHz) clocks in hardware (I2S TDM master mode) and whether a
+second, classic ESP32 DevKitV1 board can measure them by hardware pulse
+counting (PCNT). **This only validates the clock generation/measurement
+concept - it does not make the product's PCM clock functional, does not
+validate the Si3050 board, and does not change any decision about an
+external oscillator.** See [docs/si3050-clock-probe.md](docs/si3050-clock-probe.md)
+for the full contract, wiring, build/flash/monitor commands, and expected
+output. Neither environment touches `Si3050Controller`, `Esp32PcmClock`
+(still an untouched stub), Wi-Fi, or `esp32-c3`/`esp32-c3-dev-mqtt`; the
+conversion math is covered by native tests. **Not flashed or run on real
+hardware yet.**
 
 ## Phase 2D MQTT command transport
 
