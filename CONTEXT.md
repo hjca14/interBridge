@@ -770,6 +770,32 @@ this pass:)*
   total for this suite is now 16. **Not validated on any real hardware -
   Rev A does not
   exist yet.**
+- **Phase 3B.1: Si3050 clock probe bench experiment added** (isolated from
+  the Si3050 foundation and from all product firmware paths). Two new
+  PlatformIO environments, each with an exclusive `build_src_filter`:
+  `esp32-c3-si3050-clock-probe` generates the Si3050's target PCLK
+  (2.048 MHz)/FSYNC (8 kHz) via the ESP32-C3's I2S peripheral in hardware
+  TDM master mode (16 channels x 16 bits = 256 PCLK cycles/frame,
+  `I2S_COMM_FORMAT_STAND_PCM_SHORT` for the short frame-sync FSYNC
+  pulse - confirmed against the real, installed
+  framework-arduinoespressif32 3.20017.241212 headers before writing any
+  code, not assumed); `esp32dev-si3050-clock-meter` measures those clocks
+  on a classic ESP32 DevKitV1 via hardware PCNT pulse counting (never
+  `digitalRead()`/GPIO interrupts for the pulses themselves), with
+  overflow-safe accumulation (the PCNT hardware register is only 16-bit)
+  and real (`esp_timer_get_time()`-measured) window durations. Neither
+  environment touches `Si3050Controller`, `Esp32PcmClock` (still an
+  untouched stub), Wi-Fi, or any door/GPIO/relay/RGDT/SPI/reset logic for
+  a real Si3050; neither is reachable from `esp32-c3`/`esp32-c3-dev-mqtt`.
+  The conversion/aggregation math (`src/dev/si3050_clock_probe_math.{h,
+  cpp}`) is hardware-independent and covered by 7 native tests -
+  required adding `-DUNITY_INCLUDE_DOUBLE` to `[env:native]` (the first
+  suite in this repo needing floating-point assertions). See
+  docs/si3050-clock-probe.md for the full contract, wiring, and expected
+  output. **Not flashed or run on real hardware in this session** - only
+  `pio run` (compile-only) was executed for both new environments; this
+  probe does not make the product's PCM clock functional and does not
+  validate the Si3050 board itself.
 
 ## Future Work
 
