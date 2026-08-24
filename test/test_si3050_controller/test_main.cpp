@@ -82,7 +82,7 @@ void test_initialize_follows_documented_electrical_sequence() {
     FakeDelayProvider delay(&log);
     Si3050Controller controller(bus, clock, reset, delay);
 
-    controller.initialize();
+    Si3050InitResult result = controller.initialize();
 
     const char* expected[] = {
         "bus.begin", "bus.cs.deselect", "reset.assert", "bus.sclkIdleHigh",
@@ -93,6 +93,7 @@ void test_initialize_follows_documented_electrical_sequence() {
         TEST_ASSERT_EQUAL_STRING(expected[i], log[i].c_str());
     }
 
+    TEST_ASSERT_TRUE(Si3050InitResult::Ready == result);
     TEST_ASSERT_TRUE(controller.isReady());
     TEST_ASSERT_TRUE(bus.beginCalled);
     TEST_ASSERT_TRUE(bus.sclkHeldHigh);
@@ -162,9 +163,10 @@ void test_initialize_is_idempotent() {
 
     controller.initialize();
     std::size_t sizeAfterFirst = log.size();
-    controller.initialize(); // must be a no-op - never re-runs bring-up
+    Si3050InitResult second = controller.initialize(); // must be a no-op - never re-runs bring-up
 
     TEST_ASSERT_EQUAL(sizeAfterFirst, log.size());
+    TEST_ASSERT_TRUE(Si3050InitResult::Ready == second);
 }
 
 void test_spi_read_via_controller_after_ready() {
@@ -185,6 +187,98 @@ void test_spi_read_via_controller_after_ready() {
     TEST_ASSERT_EQUAL(1, bus.transferCallCount);
 }
 
+// ---- Fail-closed: PCM clock never actually starts ----
+
+void test_clock_not_running_after_start_fails_closed() {
+    Si3050CallLog log;
+    FakeSi3050Bus bus(&log);
+    FakePcmClock clock(&log);
+    clock.startSucceeds = false; // simulates Esp32PcmClock's real (stub) behavior
+    FakeSi3050Reset reset(&log);
+    FakeDelayProvider delay(&log);
+    Si3050Controller controller(bus, clock, reset, delay);
+
+    Si3050InitResult result = controller.initialize();
+
+    TEST_ASSERT_TRUE(Si3050InitResult::ClockNotRunning == result);
+    TEST_ASSERT_TRUE(reset.isAsserted()); // /RESET never released
+    TEST_ASSERT_FALSE(controller.isReady());
+    TEST_ASSERT_FALSE(clock.isRunning());
+    TEST_ASSERT_TRUE(delay.calls.empty()); // no PCLK/PLL wait was meaningful without a real clock
+
+    std::optional<uint8_t> transferResult = controller.transferRaw(0x00);
+    TEST_ASSERT_FALSE(transferResult.has_value());
+    TEST_ASSERT_EQUAL(0, bus.transferCallCount);
+
+    TEST_ASSERT_TRUE(std::find(log.begin(), log.end(), "reset.release") == log.end());
+}
+
+// ---- Fail-closed: invalid Si3050Config (would divide by zero) ----
+
+void test_zero_pclk_config_fails_closed() {
+    Si3050CallLog log;
+    FakeSi3050Bus bus(&log);
+    FakePcmClock clock(&log);
+    FakeSi3050Reset reset(&log);
+    FakeDelayProvider delay(&log);
+    Si3050Config config;
+    config.pclkHz = 0;
+    Si3050Controller controller(bus, clock, reset, delay, config);
+
+    Si3050InitResult result = controller.initialize();
+
+    TEST_ASSERT_TRUE(Si3050InitResult::InvalidConfig == result);
+    TEST_ASSERT_TRUE(reset.isAsserted());
+    TEST_ASSERT_FALSE(controller.isReady());
+    TEST_ASSERT_FALSE(bus.beginCalled); // nothing touched beyond /RESET
+    TEST_ASSERT_FALSE(clock.isRunning());
+    TEST_ASSERT_EQUAL(0, bus.transferCallCount);
+    TEST_ASSERT_FALSE(controller.transferRaw(0x00).has_value());
+}
+
+void test_zero_fsync_config_fails_closed() {
+    FakeSi3050Bus bus;
+    FakePcmClock clock;
+    FakeSi3050Reset reset;
+    FakeDelayProvider delay;
+    Si3050Config config;
+    config.fsyncHz = 0;
+    Si3050Controller controller(bus, clock, reset, delay, config);
+
+    Si3050InitResult result = controller.initialize();
+
+    TEST_ASSERT_TRUE(Si3050InitResult::InvalidConfig == result);
+    TEST_ASSERT_TRUE(reset.isAsserted());
+    TEST_ASSERT_FALSE(controller.isReady());
+    TEST_ASSERT_FALSE(bus.beginCalled);
+    TEST_ASSERT_FALSE(controller.transferRaw(0x00).has_value());
+}
+
+void test_retry_succeeds_once_clock_actually_starts_running() {
+    FakeSi3050Bus bus;
+    FakePcmClock clock;
+    clock.startSucceeds = false;
+    FakeSi3050Reset reset;
+    FakeDelayProvider delay;
+    Si3050Controller controller(bus, clock, reset, delay);
+
+    Si3050InitResult first = controller.initialize();
+    TEST_ASSERT_TRUE(Si3050InitResult::ClockNotRunning == first);
+    TEST_ASSERT_FALSE(controller.isReady());
+
+    clock.startSucceeds = true; // the clock is "fixed"
+    Si3050InitResult second = controller.initialize();
+
+    TEST_ASSERT_TRUE(Si3050InitResult::Ready == second);
+    TEST_ASSERT_TRUE(controller.isReady());
+    TEST_ASSERT_FALSE(reset.isAsserted());
+
+    bus.nextTransferReturn = 0x42;
+    std::optional<uint8_t> transferResult = controller.transferRaw(0x00);
+    TEST_ASSERT_TRUE(transferResult.has_value());
+    TEST_ASSERT_EQUAL_HEX8(0x42, *transferResult);
+}
+
 int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_gpio8_and_gpio9_remain_reserved_per_contract);
@@ -199,5 +293,9 @@ int main(int, char**) {
     RUN_TEST(test_minimum_ten_cycle_wait_precedes_reset_release);
     RUN_TEST(test_initialize_is_idempotent);
     RUN_TEST(test_spi_read_via_controller_after_ready);
+    RUN_TEST(test_clock_not_running_after_start_fails_closed);
+    RUN_TEST(test_zero_pclk_config_fails_closed);
+    RUN_TEST(test_zero_fsync_config_fails_closed);
+    RUN_TEST(test_retry_succeeds_once_clock_actually_starts_running);
     return UNITY_END();
 }

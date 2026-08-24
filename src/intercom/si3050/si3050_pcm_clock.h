@@ -47,6 +47,12 @@ public:
 
     uint32_t lastPclkHz = 0;
     uint32_t lastFsyncHz = 0;
+    // Lets a test simulate a clock that was asked to start but never
+    // actually came up (e.g. real PCLK/FSYNC generation not implemented,
+    // matching Esp32PcmClock) - start() sets running_ from this instead
+    // of unconditionally true. Defaults to true so every other test's
+    // FakePcmClock behaves like a working clock without opting in.
+    bool startSucceeds = true;
 
 private:
     void log(const char* tag);

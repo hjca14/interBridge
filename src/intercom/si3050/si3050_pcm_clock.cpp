@@ -20,7 +20,7 @@ bool Esp32PcmClock::isRunning() const {
 void FakePcmClock::start(uint32_t pclkHz, uint32_t fsyncHz) {
     lastPclkHz = pclkHz;
     lastFsyncHz = fsyncHz;
-    running_ = true;
+    running_ = startSucceeds;
     log("clock.start");
 }
 

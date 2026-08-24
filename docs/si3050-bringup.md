@@ -102,26 +102,43 @@ every timing value used below - none of it is guessed. Relevant sections:
 ## Electrical bring-up contract
 
 `Si3050Controller::initialize()` (in `src/intercom/si3050/
-si3050_controller.cpp`) performs exactly these steps, in order, and never
-touches a control register:
+si3050_controller.cpp`) returns a `Si3050InitResult` (`Ready`,
+`InvalidConfig`, or `ClockNotRunning`) and performs exactly these steps,
+in order, never touching a control register - but only past two
+fail-closed gates:
 
+0. **Config gate.** `Si3050Config` is validated first: `pclkHz != 0 &&
+   fsyncHz != 0`. An invalid config never touches the bus or clock and
+   never runs any timing math (which would otherwise divide by `pclkHz`);
+   it actively (re)asserts `/RESET` and returns `InvalidConfig`.
 1. CS deselected (high).
 2. `/RESET` asserted (low).
 3. SCLK held high (selects PCM/SPI mode - sampled by the Si3050 when
    RESET is later released).
-4. PCLK/FSYNC started.
+4. PCLK/FSYNC started via `clock.start()`. **Clock gate.** The result is
+   not trusted blindly: `clock.isRunning()` is checked immediately after.
+   If it reports `false`, bring-up stops here - `/RESET` stays asserted,
+   neither wait below runs, `isReady()` stays `false`, and this call
+   returns `ClockNotRunning`. Because `Esp32PcmClock::isRunning()` always
+   reports `false` (real PCM clock generation is not implemented - see
+   above), this means the controller structurally refuses to finish
+   bring-up against that stub, so a future integration cannot pick it up
+   and have it silently appear to work. A later `initialize()` call (once
+   the clock genuinely starts) retries the whole sequence from scratch -
+   this outcome does not count as "already ready".
 5. Wait &ge; 10 PCLK cycles (t<sub>mr</sub>) - computed from the
    configured PCLK rate, not hardcoded.
 6. `/RESET` released (high).
 7. Wait the PLL settle time (`Tsettle = 64 / FPCLK`).
-8. `isReady()` becomes `true` - only now does
-   `Si3050Controller::transferRaw()` forward to the SPI bus; before this,
-   it returns `std::nullopt` without touching the bus at all.
+8. `isReady()` becomes `true` and this call returns `Ready` - only now
+   does `Si3050Controller::transferRaw()` forward to the SPI bus; before
+   this, it returns `std::nullopt` without touching the bus at all.
 
 The two waits in steps 5 and 7 are the only place a real, blocking
 `delayMicroseconds()` call happens, and only during this one-time bring-up
 - never in the main loop. They go through the injectable `IDelayProvider`
-so native tests never actually sleep.
+so native tests never actually sleep, and they are never reached unless
+both fail-closed gates above have already passed.
 
 ## Ring detection
 
@@ -146,14 +163,18 @@ that a future, bench-validated integration will build on.
 Two new native suites (mocks/fakes only - no Wi-Fi, broker, board, or real
 Si3050 required):
 
-- `test/test_si3050_controller/test_main.cpp` (12 tests): pin map
+- `test/test_si3050_controller/test_main.cpp` (16 tests): pin map
   compile-time contract exercised as runtime assertions too, the
   datasheet-derived timing formulas, the full bring-up call order via a
   shared `Si3050CallLog` across all four fakes, SCLK-before-reset-release
   and PCLK/FSYNC-before-reset-release as explicit ordering checks, the
   exact minimum-wait duration, `initialize()` idempotency, "CS born
-  deselected", "no SPI transaction before ready", and a mocked SPI read
-  after readiness.
+  deselected", "no SPI transaction before ready", a mocked SPI read after
+  readiness, and the fail-closed gates: a clock that starts but never
+  reports `isRunning()` (`/RESET` stays asserted, no PCLK/PLL wait runs,
+  `ClockNotRunning` returned), `pclkHz=0`, `fsyncHz=0` (both
+  `InvalidConfig`, no division by zero), and a later `initialize()` retry
+  succeeding once the fake clock is "fixed".
 - `test/test_ring_detector/test_main.cpp` (5 tests): baseline
   establishment, asserted-after-debounce, cleared-after-debounce,
   short-noise-pulse rejection, and a configurable debounce interval.
