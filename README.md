@@ -58,7 +58,7 @@ the full device/cloud protocol specification.
 src/         Firmware source: core, hardware, intercom, audio, storage,
              provisioning, network, protocol, aws, ota.
 include/     Reserved for shared public headers (unused so far).
-test/        Native unit tests (Unity), one PlatformIO test per directory (26 suites).
+test/        Native unit tests (Unity), one PlatformIO test per directory (32 suites).
 docs/        Architecture documentation and the communication protocol spec.
 platformio.ini
 CONTEXT.md   Operational memory of the project — read this first.
@@ -86,12 +86,13 @@ pio device monitor -b 115200
 ## Running tests
 
 ```bash
-# Run all native unit tests (26 suites: state machine, events, intercom,
+# Run all native unit tests (32 suites: state machine, events, intercom,
 # MQTT topics, command parsing/handling/dedup, event outbox, reconnect
 # backoff, button, device identity, persistent storage, Device Shadow,
 # AWS IoT Jobs, OTA, health telemetry, provisioning (BLE-first onboarding
 # state machine), BLE advertisement/security mode, status indicator,
-# Fleet Provisioning, factory reset, MQTT transport, ...)
+# Fleet Provisioning, factory reset, MQTT transport, DEV MQTT smoke
+# state, Si3050 bring-up controller, Si3050 ring detector, ...)
 pio test -e native
 ```
 
@@ -148,6 +149,23 @@ before re-associating, instead of possibly resuming DNS/MQTT over the stale
 association) - see [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)'s
 "Follow-up fix" subsection.
 
+## Si3050/Si3011-19 firmware foundation (Phase 3A)
+
+`src/intercom/si3050/` is a hardware-independent, natively-tested
+foundation for the Si3050 DAA (+ Si3011/18/19 line-side device) that will
+interface hardware Rev A to the analog intercom line. It models and
+documents the Si3050's electrical bring-up sequence (`Si3050Controller`)
+and a debounced `/RGDT` ring-line reader (`RingDetector`), gated behind
+narrow SPI/PCM-clock/reset/delay interfaces with real ESP32-C3 stubs and
+deterministic fakes for tests. See [docs/si3050-bringup.md](docs/si3050-bringup.md)
+for the full contract, its datasheet citations (`docs/Si3050-11-18-19.pdf`
+is checked into this repository), and a bring-up checklist for when Rev A
+hardware exists. **This is a testable foundation, not a working driver**:
+it is validated by native tests and compilation only - no Rev A board
+exists yet, no Si3050 control register is read or written, no real SPI
+transaction or PCM clock is generated, and no ring pattern, off-hook, or
+audio behavior is implemented. It is not instantiated by the current
+`esp32-c3`/`esp32-c3-dev-mqtt` firmware paths.
 
 ## Phase 2D MQTT command transport
 

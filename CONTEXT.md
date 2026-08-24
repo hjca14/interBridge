@@ -730,12 +730,54 @@ this pass:)*
   race in the recovery cascade". Validated by a real local MSVC
   compile-and-run of `test_dev_mqtt_state` (16/16) and both firmware builds
   compiling; **not yet re-validated on real hardware**.
+- **Phase 3A: Si3050/Si3011-19 firmware foundation added** (hardware Rev A
+  does not exist yet). `src/intercom/si3050/` models the Si3050's
+  electrical bring-up sequence (`Si3050Controller`: CS deselect -> RESET
+  assert -> SCLK held high -> PCLK/FSYNC start -> wait >=10 PCLK cycles ->
+  RESET release -> wait the PLL settle time -> SPI permitted) behind
+  narrow SPI/PCM-clock/reset/delay interfaces, plus a debounced `/RGDT`
+  ring-line reader (`RingDetector`). Every timing value is cited from the
+  Si3050 datasheet now checked into this repo
+  (`docs/Si3050-11-18-19.pdf`) - none is guessed. Deliberately NOT
+  implemented: any Si3050 control register read/write (DAA/line
+  configuration), real PCM clock generation, real SPI transactions (the
+  clock polarity/phase is unconfirmed), and real ring-pattern/off-hook/
+  audio behavior - see docs/si3050-bringup.md for the full scope and a
+  future bring-up checklist. Validated by 21 new native tests (16 + 5) and
+  both firmware builds compiling; the module is not instantiated by
+  either firmware path and has no dependency on `IHardwareIO`/door
+  actuation.
+- **Follow-up fix (same Phase 3A foundation, before merge): review found
+  `Si3050Controller::initialize()` released `/RESET` and set `ready_`
+  unconditionally even though `Esp32PcmClock` is a deliberate stub whose
+  `isRunning()` always reports `false`, and that an invalid
+  `Si3050Config` (`pclkHz=0`) would divide by zero in the timing math.**
+  Fixed: `initialize()` now returns a `Si3050InitResult`
+  (`Ready`/`InvalidConfig`/`ClockNotRunning`) and gates on two fail-closed
+  checks before doing anything else - `pclkHz`/`fsyncHz` must both be
+  non-zero (checked before touching the bus/clock or any timing math), and
+  `clock.isRunning()` must report `true` right after `clock.start()`
+  (checked before either PCLK-cycle or PLL-settle wait, and before
+  releasing `/RESET` or setting `ready_`). Either failure actively
+  (re)asserts `/RESET`, leaves `isReady()` false, and `transferRaw()`
+  keeps returning `std::nullopt`; a later `initialize()` call retries the
+  whole sequence rather than being treated as a no-op. Because
+  `Esp32PcmClock::isRunning()` always returns `false`, this means the
+  controller now structurally cannot finish bring-up against the real
+  (stub) clock implementation - a future integration cannot pick this up
+  and have it silently appear to work. 4 new native tests added (clock
+  never running, `pclkHz=0`, `fsyncHz=0`, retry-succeeds-once-fixed);
+  total for this suite is now 16. **Not validated on any real hardware -
+  Rev A does not
+  exist yet.**
 
 ## Future Work
 
-*(Prior-pass items - characterize the intercom circuit, implement ring
-detection, choose an audio codec - remain exactly as open. The concrete
-next steps are the Open Questions and Technical Debt items above, plus:)*
+*(Prior-pass items - characterize the intercom circuit, choose an audio
+codec - remain exactly as open. A Si3050 bring-up *foundation* now exists
+(see Technical Debt above), but real ring detection, off-hook, line
+characterization, and audio are still all open. The concrete next steps
+are the Open Questions and Technical Debt items above, plus:)*
 
 - Choose and implement a real MQTT 3.1.1/TLS client for
   `Esp32AwsIotTransport`.
