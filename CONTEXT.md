@@ -792,10 +792,32 @@ this pass:)*
   required adding `-DUNITY_INCLUDE_DOUBLE` to `[env:native]` (the first
   suite in this repo needing floating-point assertions). See
   docs/si3050-clock-probe.md for the full contract, wiring, and expected
-  output. **Not flashed or run on real hardware in this session** - only
-  `pio run` (compile-only) was executed for both new environments; this
-  probe does not make the product's PCM clock functional and does not
-  validate the Si3050 board itself.
+  output. This probe does not make the product's PCM clock functional and
+  does not validate the Si3050 board itself.
+- **Follow-up fix (same Phase 3B.1 experiment): a real first DevKitV1
+  boot found the meter's PCNT bring-up broken.** The original code
+  installed `pcnt_isr_service_install()` before either PCNT unit had been
+  configured; the driver rejected it ("PCNT driver error"), both
+  `pcnt_isr_handler_add()` calls then failed too ("ISR service is not
+  installed"), and the firmware went on to print `pcnt configured`
+  anyway since no return value was checked - it would have reported
+  fabricated measurements from a counter with no overflow ISR to catch
+  its 16-bit wrap. Fixed by reordering to configure/pause/clear both
+  units, then install the ISR service, then add handlers, then enable
+  events, then resume (`src/dev/si3050_clock_probe_meter_main.cpp`), and
+  by checking every relevant call's `esp_err_t` via the new
+  `PcntBringupTracker` (`src/dev/si3050_clock_probe_meter_bringup.{h,
+  cpp}`) - `pcnt_isr_service_install()`'s documented
+  `ESP_ERR_INVALID_STATE` ("already installed") is the one code treated
+  as ready to proceed; any other failure stops bring-up immediately,
+  prints one sanitized `pcnt bringup failed step=... esp_err=...` line,
+  and leaves `meter_started=false` (`loop()` never reports a measurement
+  in that state). 6 new native tests for the tracker/decision logic
+  itself (not the real PCNT calls, which native tests cannot exercise).
+  See docs/si3050-clock-probe.md's "Real bench observation: PCNT bring-up
+  order bug". **This fix has not yet been re-verified on real hardware -
+  only native tests and `pio run` (compile-only) confirm it in this
+  session.**
 
 ## Future Work
 

@@ -120,6 +120,18 @@ edge, which cannot keep up with 2.048 MHz.
   (`combinePulseCount()`), read and reset atomically with the ISR excluded
   (`portENTER_CRITICAL`/`portEXIT_CRITICAL` around the sample) so a
   concurrent overflow can never produce a torn read.
+- **Bring-up order and fail-closed error handling.** Both PCNT units are
+  fully configured/paused/cleared *before* the ISR service is installed,
+  which is itself installed before either handler is added, which is
+  done before either unit's counting is actually resumed - see "Real
+  bench observation" below for why this order matters and is not
+  optional. Every relevant ESP-IDF call's `esp_err_t` is checked
+  (`PcntBringupTracker` in `src/dev/si3050_clock_probe_meter_bringup.{h,
+  cpp}`); the first failure stops bring-up immediately, prints one
+  sanitized `pcnt bringup failed step=... esp_err=...` line, and leaves
+  `meter_started=false` - `loop()` never reports a measurement or stats
+  line in that state, and `setup()` never prints `pcnt configured`
+  unless every step genuinely succeeded.
 - **Real, measured window duration.** The window boundary comes from
   `esp_timer_get_time()` (a monotonic microsecond counter), not an
   assumed exact 1000 ms - `loop()`'s own polling/`Serial.printf()` jitter
@@ -142,9 +154,11 @@ pio run -e esp32dev-si3050-clock-meter -t upload
 pio device monitor -b 115200
 ```
 
-No flashing was performed as part of writing this PR - only `pio run`
-(compile-only) was executed. See the PR description for the exact
-commands run and their results.
+No flashing was performed while writing either version of this PR - only
+`pio run` (compile-only) was executed in-session. A real bench boot of
+the meter (outside this session) is what found the PCNT bring-up bug
+described in "Real bench observation" below. See the PR description for
+the exact commands run and their results.
 
 ## Expected output
 
@@ -168,10 +182,66 @@ tolerance and USB-CDC/print jitter mean exact integers should not be
 expected - the min/max stats over a multi-minute run are what actually
 characterizes the clock's stability, not any single line.
 
+Meter, if PCNT bring-up fails (see "Real bench observation" below - this
+is the actual failure mode a first real boot hit):
+
+```text
+[SI3050 CLOCK METER] pcnt bringup failed step=pcnt_isr_service_install esp_err=-1
+[SI3050 CLOCK METER] meter_started=false - no measurement will be reported
+```
+
+No `pcnt configured`, `window_us=...`, or `stats ...` line is ever printed
+in this state - the exact single line above is the one to look for when
+confirming the fix on a real board.
+
 After a bench run of a few minutes, copy the full serial log (both
 boards, plus the min/max lines) into the bench validation notes -
 including the first and last `stats` line so the drift/spread over the
 whole run is visible, not just one snapshot.
+
+## Real bench observation: PCNT bring-up order bug
+
+The first real boot of the meter on a DevKitV1 logged this and then went
+on to (wrongly) print `pcnt configured` regardless:
+
+```text
+E (11) pcnt: _pcnt_isr_service_install(316): PCNT driver error
+E (13) pcnt: _pcnt_isr_handler_add(264): ISR service is not installed, call pcnt_install_isr_service() first
+E (16) pcnt: _pcnt_isr_handler_add(264): ISR service is not installed, call pcnt_install_isr_service() first
+[SI3050 CLOCK METER] pcnt configured ...
+```
+
+The original bring-up order installed the ISR service (`pcnt_isr_service_
+install()`) *before* either PCNT unit had been configured
+(`pcnt_unit_config()`), which the installed driver rejects outright
+("PCNT driver error"); every following `pcnt_isr_handler_add()` call then
+failed too, since the service was never actually installed - so neither
+unit's overflow handler existed at all. None of the original code checked
+any of these return values, so the firmware printed `pcnt configured` and
+would have gone on to report fabricated measurements built from a PCNT
+counter that could silently wrap past its `int16_t` limit with no
+overflow ISR to catch it.
+
+Fixed in `src/dev/si3050_clock_probe_meter_main.cpp` by reordering to the
+sequence documented above (configure/pause/clear both units, then install
+the ISR service, then add handlers, then enable events, then resume), and
+by checking every relevant call's `esp_err_t`
+(`pcnt_unit_config`/`pcnt_counter_pause`/`pcnt_counter_clear`/
+`pcnt_event_enable`/`pcnt_isr_service_install`/`pcnt_isr_handler_add`/
+`pcnt_counter_resume`) via the new, natively-tested
+`PcntBringupTracker`. `pcnt_isr_service_install()`'s own documented
+`ESP_ERR_INVALID_STATE` ("ISR service already installed") is the one
+specific code treated as "ready to proceed" - `isPcntIsrServiceReady()`
+- every other non-`ESP_OK` code from any step is a hard failure: bring-up
+stops immediately, one sanitized `pcnt bringup failed step=... esp_err=...`
+line is printed, and `meter_started=false` - `setup()` never prints `pcnt
+configured` and `loop()` never prints a `window_us=.../stats ...` line
+in that state. **This fix has not yet been re-verified on real hardware
+in this session** - the corrected order matches the driver's documented
+contract and the observed failure mode, and compiles for both new
+environments, but a fresh bench boot confirming `pcnt configured` (or a
+clean, honest `meter_started=false` if something is still wrong) is still
+required before this counts as validated.
 
 ## Tests
 
@@ -187,6 +257,16 @@ are ignored). `TEST_ASSERT_EQUAL_DOUBLE` required adding
 disables double-precision assertions by default) - this is the first
 suite in this repo to use floating-point assertions.
 
+`test/test_si3050_clock_probe_meter_bringup/test_main.cpp` (6 tests,
+native, no hardware): `isPcntIsrServiceReady()` on success, on the
+documented "already installed" code, and on a genuine unrelated failure
+code; `PcntBringupTracker` starting without a failure; never failing when
+every recorded step succeeds; and recording only the first failure (a
+later failure or success never overwrites the original root cause). The
+real PCNT calls themselves are not exercised here - only the pure
+decision/tracking logic around them; see "Real bench observation" above
+for what remains unverified on real hardware.
+
 Grep-verified (not itself a compiled test, since it is a structural/
 negative property): neither `si3050_clock_probe_math.{h,cpp}`,
 `si3050_clock_probe_generator_main.cpp`, nor
@@ -196,10 +276,13 @@ the exact command and its (empty) result.
 
 ## Known limitations / not yet done
 
-- **Not flashed or run on real hardware in this session.** Everything
-  above has been verified by reading the installed framework's actual
-  headers and by `pio run` (compile-only) for both new environments - see
-  the PR description for real results.
+- **The meter's PCNT bring-up fix has not been re-verified on real
+  hardware yet.** The first real DevKitV1 boot (outside this session) is
+  what found the bring-up-order bug described above; the fix itself was
+  verified by native tests, by reading the installed driver's actual
+  documented error contract, and by `pio run` (compile-only) for both
+  environments in this session - not by a fresh bench boot. The generator
+  has not been flashed or run on real hardware at all yet.
 - The atomic ISR-excluded sample in the meter still allows a handful of
   PCLK edges to go uncounted during the brief critical section on every
   window boundary (interrupts, including the overflow ISR, are disabled
