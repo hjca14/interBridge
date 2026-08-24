@@ -16,6 +16,18 @@
 // never declares an absolute "PASS" - it does not prove amplitude,
 // noise, duty cycle, edge integrity, or fine alignment between PCLK and
 // FSYNC. No Wi-Fi, MQTT, or door-actuation dependency.
+//
+// PCNT bring-up order: a real first boot on a DevKitV1 showed
+// pcnt_isr_service_install() itself failing ("PCNT driver error") when
+// called before any unit had been configured, which then made both
+// pcnt_isr_handler_add() calls fail too ("ISR service is not
+// installed") - while the firmware went on to print "pcnt configured"
+// regardless, misreporting a broken bring-up as fine. Fixed by
+// reordering to configure/pause/clear both units FIRST, only then
+// install the ISR service, add handlers, enable events, and resume -
+// see bringUpPcnt() below - and by checking every relevant call's
+// esp_err_t, never printing "pcnt configured" or any measurement/stats
+// line unless every step actually succeeded.
 
 #include <Arduino.h>
 #include <esp_attr.h>
@@ -23,6 +35,7 @@
 #include "driver/pcnt.h"
 
 #include "si3050_clock_probe_math.h"
+#include "si3050_clock_probe_meter_bringup.h"
 
 using namespace interbridge;
 
@@ -47,6 +60,10 @@ ClockProbeMinMaxTracker g_ratioStats;
 
 uint32_t g_windowStartMs = 0;
 int64_t g_windowStartMicros = 0;
+
+// Set only once every PCNT bring-up step below has actually succeeded.
+// loop() must never report a measurement/stats line while this is false.
+bool g_meterStarted = false;
 
 bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
     return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
@@ -73,7 +90,18 @@ void IRAM_ATTR onPcntOverflow(void* arg) {
     portEXIT_CRITICAL_ISR(&g_pcntMux);
 }
 
-void configureUnit(pcnt_unit_t unit, gpio_num_t pin) {
+// Prints one sanitized line identifying exactly which bring-up step
+// failed and its esp_err_t - no pin numbers, SSID, endpoint, or any
+// other sensitive value, just the step name and a numeric code.
+void reportBringupFailure(const PcntBringupTracker& tracker) {
+    Serial.printf("[SI3050 CLOCK METER] pcnt bringup failed step=%s esp_err=%ld\n", tracker.failedStepName(),
+                 static_cast<long>(tracker.failedStepResult()));
+}
+
+// Steps 1-4 of the corrected bring-up order for one unit: configure,
+// disable the glitch filter, pause, clear. Must run for BOTH units
+// before the ISR service is installed - see bringUpPcnt().
+bool configurePcntUnit(pcnt_unit_t unit, gpio_num_t pin, PcntBringupTracker& tracker) {
     pcnt_config_t config = {};
     config.pulse_gpio_num = static_cast<int>(pin);
     config.ctrl_gpio_num = PCNT_PIN_NOT_USED;
@@ -86,18 +114,92 @@ void configureUnit(pcnt_unit_t unit, gpio_num_t pin) {
     config.counter_h_lim = static_cast<int16_t>(kClockProbePcntHighLimit);
     config.counter_l_lim = 0;
 
-    pcnt_unit_config(&config);
+    ClockProbeEspErr err = pcnt_unit_config(&config);
+    tracker.record("pcnt_unit_config", err, err == kClockProbeEspOk);
+    if (tracker.hasFailed()) return false;
 
     // Deliberately no glitch filter: pcnt_filter_enable()/
-    // pcnt_set_filter_value() are never called. The filter is measured
+    // pcnt_set_filter_value() are never called - the filter is measured
     // in APB clock cycles and could silently eat legitimate ~244 ns
-    // half-cycles at a 2.048 MHz PCLK.
-    pcnt_filter_disable(unit);
+    // half-cycles at a 2.048 MHz PCLK. pcnt_filter_disable() makes that
+    // explicit rather than relying on an assumed power-on default.
+    err = pcnt_filter_disable(unit);
+    tracker.record("pcnt_filter_disable", err, err == kClockProbeEspOk);
+    if (tracker.hasFailed()) return false;
 
-    pcnt_counter_pause(unit);
-    pcnt_counter_clear(unit);
-    pcnt_event_enable(unit, PCNT_EVT_H_LIM);
-    pcnt_counter_resume(unit);
+    err = pcnt_counter_pause(unit);
+    tracker.record("pcnt_counter_pause", err, err == kClockProbeEspOk);
+    if (tracker.hasFailed()) return false;
+
+    err = pcnt_counter_clear(unit);
+    tracker.record("pcnt_counter_clear", err, err == kClockProbeEspOk);
+    return !tracker.hasFailed();
+}
+
+// Steps 6-7 for one unit: add the overflow handler, enable the H_LIM
+// event. Must run only after the ISR service has been installed - see
+// bringUpPcnt().
+bool armPcntUnit(pcnt_unit_t unit, PcntBringupTracker& tracker) {
+    ClockProbeEspErr err =
+        pcnt_isr_handler_add(unit, onPcntOverflow, reinterpret_cast<void*>(static_cast<uintptr_t>(unit)));
+    tracker.record("pcnt_isr_handler_add", err, err == kClockProbeEspOk);
+    if (tracker.hasFailed()) return false;
+
+    err = pcnt_event_enable(unit, PCNT_EVT_H_LIM);
+    tracker.record("pcnt_event_enable", err, err == kClockProbeEspOk);
+    return !tracker.hasFailed();
+}
+
+// Step 8 for one unit: only now does counting actually start.
+bool resumePcntUnit(pcnt_unit_t unit, PcntBringupTracker& tracker) {
+    ClockProbeEspErr err = pcnt_counter_resume(unit);
+    tracker.record("pcnt_counter_resume", err, err == kClockProbeEspOk);
+    return !tracker.hasFailed();
+}
+
+// The corrected, real-hardware-verified bring-up order: both units are
+// fully configured/paused/cleared BEFORE the ISR service is installed,
+// which is itself installed before any handler is added, which is done
+// before either unit's counting is actually resumed. Stops at the first
+// failure - see PcntBringupTracker::record().
+bool bringUpPcnt() {
+    PcntBringupTracker tracker;
+
+    if (!configurePcntUnit(kPclkUnit, kPclkInputPin, tracker)) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+    if (!configurePcntUnit(kFsyncUnit, kFsyncInputPin, tracker)) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+
+    const ClockProbeEspErr installResult = pcnt_isr_service_install(0);
+    tracker.record("pcnt_isr_service_install", installResult, isPcntIsrServiceReady(installResult));
+    if (tracker.hasFailed()) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+
+    if (!armPcntUnit(kPclkUnit, tracker)) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+    if (!armPcntUnit(kFsyncUnit, tracker)) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+
+    if (!resumePcntUnit(kPclkUnit, tracker)) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+    if (!resumePcntUnit(kFsyncUnit, tracker)) {
+        reportBringupFailure(tracker);
+        return false;
+    }
+
+    return true;
 }
 
 // Atomically reads this window's (overflowCount, rawCount) and resets
@@ -123,11 +225,12 @@ void setup() {
     const uint32_t serialDeadline = millis() + 3000;
     while (!Serial && !deadlineReached(millis(), serialDeadline)) delay(10);
 
-    pcnt_isr_service_install(0);
-    configureUnit(kPclkUnit, kPclkInputPin);
-    configureUnit(kFsyncUnit, kFsyncInputPin);
-    pcnt_isr_handler_add(kPclkUnit, onPcntOverflow, reinterpret_cast<void*>(static_cast<uintptr_t>(kPclkUnit)));
-    pcnt_isr_handler_add(kFsyncUnit, onPcntOverflow, reinterpret_cast<void*>(static_cast<uintptr_t>(kFsyncUnit)));
+    g_meterStarted = bringUpPcnt();
+
+    if (!g_meterStarted) {
+        Serial.println("[SI3050 CLOCK METER] meter_started=false - no measurement will be reported");
+        return;
+    }
 
     Serial.printf("[SI3050 CLOCK METER] pcnt configured pclk_pin=%d fsync_pin=%d h_lim=%ld\n",
                  static_cast<int>(kPclkInputPin), static_cast<int>(kFsyncInputPin),
@@ -138,6 +241,11 @@ void setup() {
 }
 
 void loop() {
+    if (!g_meterStarted) {
+        delay(1000); // bring-up failed - nothing to do, never report a fake measurement
+        return;
+    }
+
     const uint32_t now = millis();
     if (!deadlineReached(now, g_windowStartMs + kReportIntervalMs)) {
         delay(5); // brief yield only - the reported window duration below comes from esp_timer_get_time(), not this delay
