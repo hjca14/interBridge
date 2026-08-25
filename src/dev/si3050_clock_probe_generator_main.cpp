@@ -147,14 +147,22 @@ void setup() {
         i2s_zero_dma_buffer(kI2sPort); // fill DMA with silence so BCLK/WS run continuously from the start
     }
 
-    const uint32_t requestedRatio = configuredTdmRatio(kTotalChannels, static_cast<uint32_t>(kBitsPerSample));
-    const uint32_t requestedPclkHz = configuredBclkHz(kConfig.fsyncHz, kTotalChannels, static_cast<uint32_t>(kBitsPerSample));
+    // requestedClocksPerFrame is the number of PCLK cycles the driver is
+    // asked to place between consecutive FSYNC pulses (slot_count *
+    // slot_width_bits) - the same quantity configuredTdmRatio() always
+    // computed, named explicitly here so a log reader never has to infer
+    // "ratio" means "clocks per frame". None of these fields are a
+    // frequency claim - see the note line below.
+    const uint32_t requestedClocksPerFrame = configuredTdmRatio(kTotalChannels, static_cast<uint32_t>(kBitsPerSample));
+    const uint32_t requestedPclkHz =
+        configuredBclkHz(kConfig.fsyncHz, kTotalChannels, static_cast<uint32_t>(kBitsPerSample));
     Serial.printf(
-        "[SI3050 CLOCK PROBE] requested_sample_rate_hz=%lu requested_total_chan=%lu requested_bits_per_sample=%lu "
-        "requested_ratio=%lu requested_pclk_hz=%lu started=%s\n",
-        static_cast<unsigned long>(kConfig.fsyncHz), static_cast<unsigned long>(kTotalChannels),
-        static_cast<unsigned long>(kBitsPerSample), static_cast<unsigned long>(requestedRatio),
-        static_cast<unsigned long>(requestedPclkHz), started ? "true" : "false");
+        "[SI3050 CLOCK PROBE] requested_sample_rate_hz=%lu requested_fsync_hz=%lu requested_pclk_hz=%lu "
+        "requested_clocks_per_frame=%lu slot_count=%lu slot_width_bits=%lu started=%s\n",
+        static_cast<unsigned long>(kConfig.fsyncHz), static_cast<unsigned long>(kConfig.fsyncHz),
+        static_cast<unsigned long>(requestedPclkHz), static_cast<unsigned long>(requestedClocksPerFrame),
+        static_cast<unsigned long>(kTotalChannels), static_cast<unsigned long>(kBitsPerSample),
+        started ? "true" : "false");
     Serial.println(
         "[SI3050 CLOCK PROBE] note: the line above reports what was requested from the I2S driver, not a "
         "measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies, "

@@ -869,8 +869,9 @@ this pass:)*
   toolchain, and does not decide on an external oscillator.**
 - **Follow-up correction (same Phase 3B.1 experiment): the "2.048 MHz/
   8 kHz/256" target used throughout the entries above was wrong.** A
-  full read of the Si3050 datasheet's Clock Generation and PCM Highway
-  sections (Section 5.31, "Communication Interface Mode Selection")
+  full read of the Si3050 datasheet's Clock Generation, Communication
+  Interface Mode Selection, and PCM Highway sections (cited by title,
+  not section number - numbering varies between datasheet revisions)
   shows the part has two distinct modes: **GCI mode**, which does
   require PCLK = 2.048 or 4.096 MHz and multiplexes control with data;
   and **PCM/SPI mode** (SPI for control, PCM for audio - the mode
@@ -903,6 +904,46 @@ this pass:)*
   PR #17 (which pursued an ESP-IDF 5/native TDM driver environment based
   on the same wrong 2.048 MHz/256 premise); PR #17 was closed without
   merge and none of its changes are included here.
+- **Follow-up (same PR #18, second update): the ~16 kHz FSYNC/~64:1
+  ratio reading is now confirmed real by a fresh physical retest**, run
+  with the renamed meter fields from the entry above (`pclk_rising_edges`
+  / `fsync_rising_edges`, both explicitly counting rising edges only):
+  `pclk_hz~=1,024,129`, `fsync_hz~=16,004`, `ratio~=63.992` - reproducing
+  the earlier reading and confirming it is a genuine, rising-edge-only
+  physical measurement, not a meter artifact. This PR then investigated
+  the legacy I2S generator driver in depth: it cross-referenced the
+  matching upstream `espressif/esp-idf` `v4.4.7` tag's
+  `components/driver/i2s.c` and `components/hal/i2s_hal.c` (not present
+  as source in the installed framework package, which ships only a
+  precompiled `libdriver.a`) and confirmed that `total_chan`/`chan_mask`
+  genuinely reach the TDM hardware registers (`i2s_ll_tx_set_chan_num()`/
+  `i2s_ll_tx_set_active_chan_mask()`), but that the driver's own
+  documented clock-divider formula, evaluated for the generator's actual
+  request, predicts `bclk~=2,051,282 Hz` (close to the original
+  2.048 MHz request) - not the ~1.024 MHz that real hardware measures.
+  Since the driver's own formula does not predict the real, confirmed
+  measurement even for the *current* configuration, no other
+  `total_chan`/`bits_per_sample` combination computed from that same
+  formula could be trusted to reach the corrected 1.024 MHz/8 kHz/128
+  target without another physical reflash/remeasure cycle - so, per
+  explicit instruction not to implement an unconfirmed approximation,
+  **the generator's actual I2S configuration is unchanged in this PR.**
+  Only its diagnostic log field names were clarified
+  (`requested_total_chan`/`requested_bits_per_sample`/`requested_ratio`
+  -> `slot_count`/`slot_width_bits`/`requested_clocks_per_frame`, plus a
+  new explicit `requested_fsync_hz`), and two native tests were added
+  documenting the corrected target's pure math (16 timeslots x 8 bits =
+  128 PCLK cycles/frame at 1.024 MHz/8 kHz) without claiming the
+  generator was reconfigured to it. See docs/si3050-clock-probe.md's
+  "Deeper investigation" section for the full source-grounded trace,
+  including one concrete but unconfirmed candidate mechanism
+  (`i2s_hal_tx_set_channel_style()`'s unconditional `half_sample_bits =
+  chan_num * chan_bits / 2` register write, applied even for TDM +
+  `I2S_COMM_FORMAT_STAND_PCM_SHORT`) that could not be verified without
+  ESP32-C3 Technical Reference Manual register-behavior documentation
+  not present in this installed framework. The meter, production,
+  DEV-MQTT, and Si3050 foundation code remain untouched; no real Si3050
+  hardware has been initialized at any point.
 
 ## Future Work
 
