@@ -2,12 +2,16 @@
 
 This document describes the Phase 3A firmware foundation for the Si3050
 DAA (+ Si3011/18/19 line-side device) that will interface the ESP32-C3 to
-the analog intercom line on hardware Rev A. It is a **testable
-foundation, not a working driver**: it has been validated with mocks and
-compilation only, on a host machine, with no Rev A board in existence yet.
-Nothing here has been run against real hardware.
+the analog intercom line on hardware Rev A. It started as a **testable
+foundation, not a working driver**: validated with mocks and compilation
+only, no Rev A board in existence, nothing run against real hardware. A
+follow-up pass (Phase 3B.2, this section) changed that for **one specific
+piece - PCM clock generation** - see "PCM clock: validation status" below
+for exactly what is and is not proven now. Everything else described
+below (register access, real SPI, ring pattern/off-hook/line/audio) is
+still unvalidated and still deferred.
 
-## Scope of this PR
+## Scope
 
 Implemented:
 
@@ -15,7 +19,13 @@ Implemented:
   (`Si3050Controller`), gating SPI access on it having completed.
 - Narrow HAL interfaces for the four things that sequence needs (SPI bus +
   chip select, PCM clock, `/RESET`, and a short injectable delay), each
-  with a real ESP32-C3 stub and a deterministic fake for tests.
+  with a real ESP32-C3 implementation and a deterministic fake for tests.
+- **Real PCM clock generation** (`Esp32PcmClock`, Phase 3B.2): a
+  1.024 MHz PCLK / 8 kHz FSYNC, 16 x 8 TDM, PCM-short I2S configuration -
+  physically validated on real ESP32-C3 hardware in an isolated bench
+  probe, and now integrated into the normal firmware's boot sequence
+  (`src/main.cpp`). See "PCM clock: validation status" below for the
+  precise scope of what this does and does not prove.
 - A compile-time-checked Rev A pin map (`si3050_pins.h`).
 - A debounced `/RGDT` ring-signal-line reader (`RingDetector`), reporting
   sanitized `Asserted`/`Cleared` level-change events only.
@@ -32,22 +42,106 @@ Explicitly **not** implemented (deferred to future, bench-validated PRs):
   `Si3050Controller::initialize()` stops right where the datasheet's
   electrical pin-timing requirements end and register-level
   configuration begins.
-- Real PCM clock generation (`Esp32PcmClock`): a stable, phase-locked
-  2.048 MHz PCLK with a correctly framed 8 kHz FSYNC needs a timer/I2S
-  peripheral configuration that has not been verified on real ESP32-C3
-  hardware in this repository - `isRunning()` always reports `false` so
-  nothing downstream can mistake this for a working clock.
+- **PCM audio data** (`DRX`/`DTX`) and any audio content. `Esp32PcmClock`
+  generates the PCLK/FSYNC clock signal only - the I2S data pins are left
+  unrouted (`I2S_PIN_NO_CHANGE`), matching the validated probe.
 - Real SPI transactions (`Esp32Si3050Bus::transfer()`): the SPI clock
   polarity/phase the Si3050 expects has not been confirmed against real
   hardware here, so it remains an explicit `TODO` rather than a guess.
 - Real ring **pattern** validation, off-hook detection, line
   characterization, or audio. `RingDetector` reports a debounced
   electrical level change only - see "Ring detection" below for exactly
-  why that is not the same as a validated ring.
+  why that is not the same as a validated ring. `RingDetector` is not
+  wired into `src/main.cpp` by this pass either.
 - Anything touching `IHardwareIO`, `setDoorOutput()`, or any door
-  actuation path. The new module has no dependency on any of that by
-  construction (verified by grep as part of this PR's validation, not
-  just by inspection of the two files that could plausibly need it).
+  actuation path. The Si3050 module has no dependency on any of that by
+  construction (verified by grep, not just inspection).
+- Any change to Wi-Fi, BLE, MQTT, AWS, provisioning, remote commands, or
+  reconnection behavior.
+
+## PCM clock: validation status
+
+Three distinct claims, kept explicitly separate so none is overstated:
+
+1. **Validated on the physical probe.** The exact `1.024 MHz` PCLK /
+   `8 kHz` FSYNC / `16 x 8` TDM / PCM-short geometry was flashed to a
+   real ESP32-C3 and measured externally by an independent ESP32
+   DevKitV1 running hardware pulse counting (PCNT) - see
+   docs/si3050-clock-probe.md's "Real bench observation: 16 x 8 slot
+   geometry reaches the PCM/SPI target". That happened in the isolated
+   `esp32-c3-si3050-clock-probe` bench environment, a throwaway I2S
+   configuration written directly in `src/dev/`, not through
+   `Esp32PcmClock` or `Si3050Controller`.
+2. **Integrated into the normal firmware.** `Esp32PcmClock`
+   (`src/intercom/si3050/si3050_pcm_clock.{h,cpp}`) now implements the
+   same geometry for real (not a stub), and `src/main.cpp` constructs
+   `Si3050Controller` with it and calls `initialize()` during `setup()`
+   (see "PCM clock integration" below). This has been **compiled and
+   linked** for the `esp32-c3` production and `esp32-c3-dev-mqtt`
+   environments, and its bring-up/rollback/idempotency decision logic is
+   covered by native tests (`test/test_si3050_pcm_clock/`) - but this
+   specific *integrated* code path (as opposed to the standalone probe
+   firmware above) has **not itself been flashed and measured on real
+   hardware**. The probe and the integration share the same validated
+   geometry constants and the same GPIO0/GPIO1 pins, but they are two
+   separate binaries.
+3. **Not validated against a real Si3050.** No Si3050 or Si3011/18/19
+   part has been connected or initialized at any point, in either the
+   probe or this integration. `Esp32Si3050Bus::transfer()` (real SPI)
+   remains an unimplemented `TODO`, so even once `Si3050Controller::
+   initialize()` reports `Ready`, no register has been read from or
+   written to a real part.
+
+## PCM clock integration
+
+`src/main.cpp` constructs `Esp32Si3050Bus`, `Esp32PcmClock`,
+`Esp32Si3050Reset`, `Esp32Si3050Delay`, and `Si3050Controller` inside
+`initializeSi3050()` (called from `setup()`, after `initializeHardware()`
+and before `initializeNetwork()`) - not as global objects like the other
+hardware singletons in that file, because `Esp32Si3050Bus`'s and
+`Esp32Si3050Reset`'s constructors call real `pinMode()`/`digitalWrite()`
+under `#ifdef ARDUINO`, which must not run before the Arduino runtime
+itself has initialized (before `setup()` starts). They are held in
+`std::optional<T>` and `.emplace()`d inside `initializeSi3050()` instead,
+mirroring the existing `std::optional`+`.emplace()` pattern already used
+elsewhere in that file for objects needing deferred construction (e.g.
+`mqttTopics`, `commandHandler`, `provisioningManager`).
+
+`initializeSi3050()` calls `si3050Controller->initialize()` once, at
+every boot, unconditionally - there is no feature flag gating it. This
+is safe to run with no Si3050 physically attached: the sequence only
+deselects CS, asserts then (once the clock is confirmed running)
+releases `/RESET`, holds SCLK high, and starts the PCLK/FSYNC clock -
+all plain GPIO/I2S operations with no real chip required to be present,
+and no register access is attempted. The `Si3050InitResult` outcome
+(`Ready`/`ClockNotRunning`/`InvalidConfig`) is logged via `Logger` only -
+it does not affect the state machine, MQTT, or any protocol event.
+There is currently no automatic retry if `initialize()` fails at boot;
+that remains a documented gap, not a silently-missing feature (see
+"Known gaps" below).
+
+**Pinning used:** `si3050_pins.h`'s existing Rev A pin map - GPIO0
+(PCLK) and GPIO1 (FSYNC), the same two pins the physical probe used and
+validated. This pin map was already established (with
+compile-time-checked reserved-pin collision checks) before this pass;
+this integration did not invent or guess any pin assignment, it reused
+the existing source of truth. This is a different, Si3050-specific pin
+map from the general `Esp32GpioHardware` abstraction (used for the
+door/relay/button path), which remains an undefined stub - that
+separate, still-open pinning question is unaffected by this pass.
+
+**Known gaps before this can be considered production-ready:**
+
+- No automatic retry of `Si3050Controller::initialize()` if it fails at
+  boot (e.g. `ClockNotRunning` from a real hardware fault) - a later
+  reboot is currently the only recovery path.
+- `Esp32PcmClock` has not been flashed and measured on real hardware as
+  *this specific integrated code path* (see "PCM clock: validation
+  status" above) - only the standalone probe firmware sharing its
+  geometry has been.
+- No real Si3050 has been connected, so the SCLK-level-at-RESET mode
+  selection, PLL settle timing, and DAA register sequence that follow
+  clock bring-up remain unconfirmed against actual part behavior.
 
 ## Hardware source of truth
 
@@ -130,13 +224,16 @@ fail-closed gates:
    not trusted blindly: `clock.isRunning()` is checked immediately after.
    If it reports `false`, bring-up stops here - `/RESET` stays asserted,
    neither wait below runs, `isReady()` stays `false`, and this call
-   returns `ClockNotRunning`. Because `Esp32PcmClock::isRunning()` always
-   reports `false` (real PCM clock generation is not implemented - see
-   above), this means the controller structurally refuses to finish
-   bring-up against that stub, so a future integration cannot pick it up
-   and have it silently appear to work. A later `initialize()` call (once
-   the clock genuinely starts) retries the whole sequence from scratch -
-   this outcome does not count as "already ready".
+   returns `ClockNotRunning`. `Esp32PcmClock` now implements a real
+   `start()` (see "PCM clock integration" above): `isRunning()` reports
+   `true` only once every I2S bring-up step it performs has actually
+   succeeded (checked via `Si3050PcmClockBringup`), and reports `false`
+   on any failure or on the native (host) build, where no real I2S
+   peripheral exists - so the controller still structurally cannot
+   report `Ready` unless the clock genuinely started. A later
+   `initialize()` call (once the clock genuinely starts) retries the
+   whole sequence from scratch - this outcome does not count as
+   "already ready".
 5. Wait &ge; 10 PCLK cycles (t<sub>mr</sub>) - computed from the
    configured PCLK rate, not hardcoded.
 6. `/RESET` released (high).
@@ -171,7 +268,7 @@ that a future, bench-validated integration will build on.
 
 ## Tests
 
-Two new native suites (mocks/fakes only - no Wi-Fi, broker, board, or real
+Native suites (mocks/fakes only - no Wi-Fi, broker, board, or real
 Si3050 required):
 
 - `test/test_si3050_controller/test_main.cpp` (16 tests): pin map
@@ -185,7 +282,26 @@ Si3050 required):
   reports `isRunning()` (`/RESET` stays asserted, no PCLK/PLL wait runs,
   `ClockNotRunning` returned), `pclkHz=0`, `fsyncHz=0` (both
   `InvalidConfig`, no division by zero), and a later `initialize()` retry
-  succeeding once the fake clock is "fixed".
+  succeeding once the fake clock is "fixed". Uses `FakePcmClock`
+  throughout, so these tests are unaffected by `Esp32PcmClock` becoming a
+  real implementation.
+- `test/test_si3050_pcm_clock/test_main.cpp` (21 tests): the validated
+  TDM geometry's pure math (`16 x 8 = 128` clocks/frame,
+  `8000 x 128 = 1,024,000` Hz); the fail-closed configuration gate
+  (`si3050PcmConfigurationSupported()`) accepting the validated target and
+  rejecting the old GCI-style target, a zero FSYNC, and a mismatched
+  PCLK/FSYNC pair; `Si3050PcmClockBringup`'s pure bring-up/rollback/
+  idempotency decision logic - success when every step succeeds, failure
+  at each of the three bring-up steps with the correct rollback-owed
+  state, first-failure-wins, rollback resetting state for a clean retry,
+  repeated stop() being safe, and `markRunning()` never overriding a
+  failed attempt; and `Esp32PcmClock` on the native (host) build never
+  claiming `isRunning()==true` without real hardware, plus safe repeated
+  `stop()`/`start()`-without-hardware calls. The real ESP-IDF I2S calls
+  themselves are not exercised here - only the pure decision/tracking
+  logic around them (same limitation as `test_si3050_clock_probe_meter_bringup`
+  has for the clock probe meter) - see "PCM clock: validation status"
+  above for what real-hardware validation exists instead.
 - `test/test_ring_detector/test_main.cpp` (5 tests): baseline
   establishment, asserted-after-debounce, cleared-after-debounce,
   short-noise-pulse rejection, and a configurable debounce interval.
@@ -206,7 +322,14 @@ Once Rev A hardware exists, in order:
    `transfer()` once the SPI mode is confirmed.
 5. **Reset / PCM** - confirm the documented electrical bring-up sequence
    against a scope (RESET pulse width, SCLK level at RESET, PCLK/FSYNC
-   presence) and implement real PCM clock generation.
+   presence). PCM clock generation itself is now implemented and
+   integrated (`Esp32PcmClock`, see "PCM clock integration" above) and
+   its geometry is physically validated in isolation - what remains here
+   is confirming the *integrated* code path (as run from
+   `Si3050Controller::initialize()` in the normal boot sequence) against
+   a scope, and confirming the electrical sequence's other timings
+   (RESET pulse width, SCLK level at RESET) once a real Si3050 is
+   present to observe.
 6. **RGDT** - confirm `/RGDT` idle level and behavior during a real
    incoming ring.
 7. **Line** - characterize the actual analog intercom line and, only then,
@@ -215,5 +338,8 @@ Once Rev A hardware exists, in order:
 8. **Audio** - codec/transport selection and implementation (still
    entirely open - see `src/audio/audio.h`).
 
-Each step above depends on the previous one having been bench-confirmed;
-none of them are validated by this PR.
+Each step above depends on the previous one having been bench-confirmed.
+None of them require a real Si3050 to already have happened - the PCM
+clock's *geometry* is the one exception, physically validated in
+isolation (see "PCM clock: validation status" above), but the
+*integrated* code path in step 5 is not, and none of the others are.

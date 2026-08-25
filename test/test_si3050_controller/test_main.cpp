@@ -141,7 +141,7 @@ void test_minimum_ten_cycle_wait_precedes_reset_release() {
     FakePcmClock clock;
     FakeSi3050Reset reset;
     FakeDelayProvider delay;
-    Si3050Config config; // default pclkHz = 2048000
+    Si3050Config config; // default pclkHz = 1024000 (PCM/SPI mode)
     Si3050Controller controller(bus, clock, reset, delay, config);
 
     controller.initialize();
