@@ -13,7 +13,7 @@
 namespace interbridge {
 
 bool Si3050PcmClockBringup::shouldStart() const {
-    return !running_;
+    return !running_ && !teardownFailed_;
 }
 
 void Si3050PcmClockBringup::recordDriverInstall(Si3050PcmClockEspErr result, bool succeeded) {
@@ -60,12 +60,40 @@ bool Si3050PcmClockBringup::shouldUninstall() const {
     return driverInstalled_;
 }
 
-void Si3050PcmClockBringup::recordUninstalled() {
-    driverInstalled_ = false;
-    running_ = false;
+void Si3050PcmClockBringup::resetAfterInstallFailure() {
+    // Only meaningful when i2s_driver_install() itself failed:
+    // driverInstalled_ is already false (nothing was acquired), so
+    // there is nothing to roll back - just clear the failure so the
+    // next start() can run a full, fresh attempt. The caller must have
+    // already read/logged failedStepName()/failedStepResult() before
+    // calling this.
     hasFailed_ = false;
     failedStepName_ = nullptr;
     failedStepResult_ = kSi3050PcmClockEspOk;
+}
+
+void Si3050PcmClockBringup::recordUninstall(Si3050PcmClockEspErr result, bool succeeded) {
+    if (succeeded) {
+        // Confirmed released - safe to fully reset for a clean retry.
+        driverInstalled_ = false;
+        running_ = false;
+        teardownFailed_ = false;
+        hasFailed_ = false;
+        failedStepName_ = nullptr;
+        failedStepResult_ = kSi3050PcmClockEspOk;
+        return;
+    }
+    // The uninstall call itself failed - the driver may still be
+    // active. Never treat this as "safely released": driverInstalled_
+    // stays true (so shouldUninstall() keeps reporting a real teardown
+    // is still owed/worth retrying) and teardownFailed_ blocks
+    // shouldStart() - fail-closed against installing a second instance
+    // on top of a possibly-still-active driver.
+    running_ = false;
+    teardownFailed_ = true;
+    hasFailed_ = true;
+    failedStepName_ = "i2s_driver_uninstall";
+    failedStepResult_ = result;
 }
 
 #ifdef ARDUINO
@@ -85,6 +113,18 @@ void logBringupFailure(const Si3050PcmClockBringup& bringup) {
 }
 
 } // namespace
+
+void Esp32PcmClock::rollbackAfterBringupFailure() {
+    const esp_err_t uninstallResult = i2s_driver_uninstall(kSi3050PcmI2sPort);
+    bringup_.recordUninstall(uninstallResult, uninstallResult == ESP_OK);
+    if (uninstallResult != ESP_OK) {
+        // The original bring-up failure was already logged by the
+        // caller - this is a second, distinct line: rollback itself
+        // also failed, so the driver may still be active. Never claim
+        // it was safely released.
+        logBringupFailure(bringup_);
+    }
+}
 #endif // ARDUINO
 
 void Esp32PcmClock::start(uint32_t pclkHz, uint32_t fsyncHz) {
@@ -137,8 +177,12 @@ void Esp32PcmClock::start(uint32_t pclkHz, uint32_t fsyncHz) {
     const esp_err_t installResult = i2s_driver_install(kSi3050PcmI2sPort, &i2sConfig, 0, nullptr);
     bringup_.recordDriverInstall(installResult, installResult == ESP_OK);
     if (bringup_.hasFailed()) {
-        logBringupFailure(bringup_);
-        return; // nothing was installed - no rollback needed
+        logBringupFailure(bringup_); // record/log the original error first...
+        bringup_.resetAfterInstallFailure(); // ...then clear it: nothing was
+                                              // installed, so a later start()
+                                              // must be able to retry, not be
+                                              // stuck on this transient failure.
+        return;
     }
 
     i2s_pin_config_t pinConfig = {};
@@ -155,8 +199,7 @@ void Esp32PcmClock::start(uint32_t pclkHz, uint32_t fsyncHz) {
     bringup_.record("i2s_set_pin", pinResult, pinResult == ESP_OK);
     if (bringup_.hasFailed()) {
         logBringupFailure(bringup_);
-        i2s_driver_uninstall(kSi3050PcmI2sPort); // roll back what this call acquired
-        bringup_.recordUninstalled();
+        rollbackAfterBringupFailure(); // exactly one real uninstall attempt
         return;
     }
 
@@ -164,8 +207,7 @@ void Esp32PcmClock::start(uint32_t pclkHz, uint32_t fsyncHz) {
     bringup_.record("i2s_zero_dma_buffer", zeroResult, zeroResult == ESP_OK);
     if (bringup_.hasFailed()) {
         logBringupFailure(bringup_);
-        i2s_driver_uninstall(kSi3050PcmI2sPort);
-        bringup_.recordUninstalled();
+        rollbackAfterBringupFailure();
         return;
     }
 
@@ -181,10 +223,20 @@ void Esp32PcmClock::start(uint32_t pclkHz, uint32_t fsyncHz) {
 void Esp32PcmClock::stop() {
 #ifdef ARDUINO
     if (bringup_.shouldUninstall()) {
-        i2s_driver_uninstall(kSi3050PcmI2sPort);
+        const esp_err_t uninstallResult = i2s_driver_uninstall(kSi3050PcmI2sPort);
+        bringup_.recordUninstall(uninstallResult, uninstallResult == ESP_OK);
+        if (uninstallResult != ESP_OK) {
+            // Never claim the driver was safely released when the
+            // uninstall call itself failed - logged so this is visible,
+            // and bringup_ now fail-closed (see recordUninstall()).
+            logBringupFailure(bringup_);
+        }
     }
+    // When shouldUninstall() is false, nothing is owed: either nothing
+    // was ever installed, or a prior recordUninstall() already
+    // confirmed release - state is already at rest, so repeated stop()
+    // calls (with or without a prior start()) are safe no-ops.
 #endif
-    bringup_.recordUninstalled(); // safe even if nothing was installed/running
 }
 
 bool Esp32PcmClock::isRunning() const {

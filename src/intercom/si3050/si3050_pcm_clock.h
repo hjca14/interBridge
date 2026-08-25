@@ -86,11 +86,30 @@ constexpr Si3050PcmClockEspErr kSi3050PcmClockEspOk = 0;
 // meter - see src/dev/si3050_clock_probe_meter_bringup.h - but is a
 // separate class so this production module has no dependency on
 // src/dev/).
+//
+// Three failure paths are tracked distinctly, because they need
+// different recovery behavior:
+//   1. i2s_driver_install() itself fails: nothing was acquired, so the
+//      next start() must be able to run a full, fresh attempt -
+//      resetAfterInstallFailure() clears retry state without ever
+//      implying a real teardown happened.
+//   2. A later bring-up step (i2s_set_pin(), i2s_zero_dma_buffer())
+//      fails after a successful install: the driver IS held, so a real
+//      i2s_driver_uninstall() is owed - its own result must be reported
+//      via recordUninstall().
+//   3. That real i2s_driver_uninstall() call itself fails (in case 2's
+//      rollback, or in a real stop()): the driver may still be active,
+//      so this must NOT be treated as "safely released" - shouldStart()
+//      stays permanently false (fail-closed against installing a second
+//      instance on top of a possibly-still-active driver) until a later
+//      i2s_driver_uninstall() attempt reports success.
 class Si3050PcmClockBringup {
 public:
-    // True if start() should attempt a fresh install sequence (false =
-    // already running - start() must be idempotent and must not touch
-    // hardware again).
+    // True if start() should attempt a fresh install sequence. False
+    // while already running (start() must be idempotent and must not
+    // touch hardware again) OR while a prior i2s_driver_uninstall()
+    // call itself failed and has not yet been retried successfully
+    // (fail-closed - see the class comment above).
     bool shouldStart() const;
 
     // Step 1: i2s_driver_install(). Tracked separately from the other
@@ -114,22 +133,39 @@ public:
     const char* failedStepName() const; // nullptr if hasFailed() is false
     Si3050PcmClockEspErr failedStepResult() const;
 
-    // True if a real i2s_driver_uninstall() call is owed right now: the
-    // driver was installed by recordDriverInstall() and has not yet
-    // been rolled back (on a later failure) or stopped. True both while
-    // genuinely running and mid-failure after a successful install -
-    // both cases mean the driver resource is still held.
+    // True if a real i2s_driver_uninstall() call is owed/worth retrying
+    // right now: the driver was installed by recordDriverInstall() and
+    // has not yet been *confirmed* released by a successful
+    // recordUninstall() call. True while genuinely running, mid-failure
+    // after a successful install, and after a failed uninstall attempt
+    // (so a later retry can try again) - all three mean the driver
+    // resource is still considered held.
     bool shouldUninstall() const;
 
-    // Call once the caller has actually issued i2s_driver_uninstall() -
-    // whether as a failure rollback or a real stop() - to reset all
-    // state for the next start(). Safe to call even when nothing was
-    // installed (stop() on an already-stopped clock).
-    void recordUninstalled();
+    // Call ONLY when i2s_driver_install() itself just failed (nothing
+    // was acquired - shouldUninstall() is false) and the caller has
+    // already logged/recorded that original failure (failedStepName()/
+    // failedStepResult() are meant to be read before calling this).
+    // Resets hasFailed()/failedStepName()/failedStepResult() so the next
+    // start() can run a full, fresh attempt - never issues or implies a
+    // real i2s_driver_uninstall() call, since nothing needs releasing.
+    void resetAfterInstallFailure();
+
+    // Call once the caller has actually issued a real
+    // i2s_driver_uninstall() - whether as rollback after a later
+    // bring-up step failed, or as a real stop() - with that call's own
+    // esp_err_t. Never silently treats a failed uninstall as "safely
+    // released": on success, the driver is confirmed released and this
+    // fully resets to a clean, retryable state (shouldStart() becomes
+    // true again); on failure, shouldUninstall() stays true (so a later
+    // retry can attempt uninstall again) and shouldStart() becomes
+    // false - fail-closed - until a later uninstall attempt succeeds.
+    void recordUninstall(Si3050PcmClockEspErr result, bool succeeded);
 
 private:
     bool running_ = false;
     bool driverInstalled_ = false;
+    bool teardownFailed_ = false;
     bool hasFailed_ = false;
     const char* failedStepName_ = nullptr;
     Si3050PcmClockEspErr failedStepResult_ = kSi3050PcmClockEspOk;
@@ -154,6 +190,15 @@ public:
     bool isRunning() const override;
 
 private:
+#ifdef ARDUINO
+    // Issues the real i2s_driver_uninstall() call after a bring-up
+    // failure past a successful i2s_driver_install() (i2s_set_pin() or
+    // i2s_zero_dma_buffer() failing), reports that call's own result to
+    // bringup_ via recordUninstall() - never assuming it succeeded - and
+    // logs if it did not. Shared by start()'s two post-install failure
+    // paths so exactly one real uninstall attempt happens per failure.
+    void rollbackAfterBringupFailure();
+#endif
     Si3050PcmClockBringup bringup_;
 };
 
