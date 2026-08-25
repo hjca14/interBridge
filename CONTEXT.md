@@ -1006,6 +1006,63 @@ this pass:)*
   other code are unchanged from the previous entry. See
   docs/si3050-clock-probe.md's "Real bench observation: 16 x 8 slot
   geometry reaches the PCM/SPI target" for the full record.
+- **Phase 3B.2: PCM clock generation implemented for real and integrated
+  into the normal firmware.** `Esp32PcmClock`
+  (`src/intercom/si3050/si3050_pcm_clock.{h,cpp}`) is no longer a stub:
+  it configures the ESP32-C3's I2S peripheral for the exact 16 x 8 TDM/
+  PCM-short/1.024 MHz-PCLK/8 kHz-FSYNC geometry the Phase 3B.1 probe
+  physically validated, restated as its own constants
+  (`kSi3050PcmTdmSlotCount`/`kSi3050PcmTdmSlotWidthBits`) rather than a
+  dependency on the probe's `src/dev/` module. Every driver call's
+  `esp_err_t` is checked via a new `Si3050PcmClockBringup` (mirrors
+  `PcntBringupTracker`'s role for the clock probe meter): `start()` is
+  idempotent (a second call while already running never re-installs),
+  any mid-sequence failure rolls back exactly what that call acquired
+  (`i2s_driver_uninstall()` only if `i2s_driver_install()` actually
+  succeeded), and `stop()` is safe to call repeatedly or without a prior
+  `start()`. A fail-closed configuration gate
+  (`si3050PcmConfigurationSupported()`) rejects any `pclkHz` that does
+  not match what the fixed 16 x 8 geometry implies for the requested
+  `fsyncHz`, rather than silently substituting a different value.
+  `Si3050Config`'s default `pclkHz` changed from `2048000` to `1024000`
+  to match. `src/main.cpp` now constructs `Esp32Si3050Bus`,
+  `Esp32PcmClock`, `Esp32Si3050Reset`, `Esp32Si3050Delay`, and
+  `Si3050Controller` inside a new `initializeSi3050()` (called from
+  `setup()`, after `initializeHardware()`) and calls
+  `si3050Controller->initialize()` once at every boot, unconditionally -
+  no feature flag, since the sequence is safe with no Si3050 physically
+  attached (plain GPIO/I2S operations, no register access). These are
+  held in `std::optional<T>` and `.emplace()`d inside that function
+  rather than as global objects like the other hardware singletons in
+  that file, because `Esp32Si3050Bus`'s/`Esp32Si3050Reset`'s
+  constructors call real `pinMode()`/`digitalWrite()` under `#ifdef
+  ARDUINO` - which must not run before the Arduino runtime itself has
+  initialized (before `setup()` starts); no currently-instantiated
+  global hardware object in that file touched a real pin from a global
+  constructor before this, so this would have been a genuine new boot
+  risk without the deferred-construction fix. GPIO0/GPIO1 (the same pins
+  the physical probe validated) come from the existing `si3050_pins.h`
+  source of truth - no pin was invented or guessed. 7 new native tests
+  (`test/test_si3050_pcm_clock/`) cover the TDM geometry math, the
+  configuration gate, and `Si3050PcmClockBringup`'s bring-up/rollback/
+  idempotency decision logic exhaustively (success, failure at each of
+  the three steps with correct rollback-owed state, first-failure-wins,
+  rollback-enables-retry, repeated stop() safety) - the real ESP-IDF I2S
+  calls themselves are not exercised natively, same limitation as the
+  clock probe meter's own tracker tests. **What this does and does not
+  prove is kept explicit in docs/si3050-bringup.md's new "PCM clock:
+  validation status" section**. Three validation levels are recorded:
+  (1) the `16 x 8` geometry was physically validated earlier by the
+  isolated probe; (2) the real `Esp32PcmClock` implementation in the
+  normal `esp32-c3` environment has now also been reflashed and measured
+  physically at approximately `1.024 MHz` PCLK / `8 kHz` FSYNC / `128`;
+  and (3) no real Si3050 has been connected or initialized at any point,
+  so `Esp32Si3050Bus::transfer()` (real SPI),
+  DAA/register configuration, DRX/DTX, audio, ring, off-hook, and relay
+  behavior all remain outside scope and unvalidated. The existing CI
+  result remains unchanged, as do Wi-Fi/BLE/MQTT/AWS/provisioning/reconnection, the
+  clock probe environments (kept as bench regression), and PR #17's IDF5
+  approach (not reintroduced).
 
 ## Future Work
 

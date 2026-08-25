@@ -150,23 +150,29 @@ before re-associating, instead of possibly resuming DNS/MQTT over the stale
 association) - see [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)'s
 "Follow-up fix" subsection.
 
-## Si3050/Si3011-19 firmware foundation (Phase 3A)
+## Si3050/Si3011-19 firmware foundation (Phase 3A + 3B.2 PCM clock)
 
 `src/intercom/si3050/` is a hardware-independent, natively-tested
 foundation for the Si3050 DAA (+ Si3011/18/19 line-side device) that will
 interface hardware Rev A to the analog intercom line. It models and
 documents the Si3050's electrical bring-up sequence (`Si3050Controller`)
 and a debounced `/RGDT` ring-line reader (`RingDetector`), gated behind
-narrow SPI/PCM-clock/reset/delay interfaces with real ESP32-C3 stubs and
-deterministic fakes for tests. See [docs/si3050-bringup.md](docs/si3050-bringup.md)
+narrow SPI/PCM-clock/reset/delay interfaces. See [docs/si3050-bringup.md](docs/si3050-bringup.md)
 for the full contract, its datasheet citations (`docs/Si3050-11-18-19.pdf`
-is checked into this repository), and a bring-up checklist for when Rev A
-hardware exists. **This is a testable foundation, not a working driver**:
-it is validated by native tests and compilation only - no Rev A board
-exists yet, no Si3050 control register is read or written, no real SPI
-transaction or PCM clock is generated, and no ring pattern, off-hook, or
-audio behavior is implemented. It is not instantiated by the current
-`esp32-c3`/`esp32-c3-dev-mqtt` firmware paths.
+is checked into this repository), the PCM clock's precise validation
+status, and a bring-up checklist for when Rev A hardware exists.
+
+**PCM clock generation is now real, integrated, and physically measured.**
+The validation has three deliberately separate levels: (1) the isolated
+Phase 3B.1 probe previously validated the exact `16 x 8` TDM geometry;
+(2) the real `Esp32PcmClock` implementation in the normal `esp32-c3`
+firmware has now also been reflashed and measured physically at approximately
+`1.024 MHz` PCLK / `8 kHz` FSYNC / `128` clocks per frame; and (3) no real
+Si3050 has been connected or initialized. Consequently, real SPI,
+Si3050/DAA register access, PCM data (`DRX`/`DTX`), audio, ring, off-hook,
+and relay behavior remain outside this validation and unvalidated. See
+[docs/si3050-bringup.md](docs/si3050-bringup.md)'s "PCM clock: validation
+status" for the precise distinction.
 
 ## Si3050 clock probe: ESP32-C3 -> ESP32 DevKitV1 (Phase 3B.1)
 
@@ -192,12 +198,13 @@ confirmed `pclk_hz ~= 1,024,100`, `fsync_hz ~= 8,001`-`8,002`,
 `ratio ~= 127.98`-`128.00` across stable reporting windows (the first
 window after boot contained a brief startup transient and is excluded).
 **This confirms the clock signal only** - no real Si3050 hardware has
-been connected or initialized, PCM audio data (`DRX`/`DTX`) and audio
-content are untested, and this validated configuration exists only in
-the isolated `esp32-c3-si3050-clock-probe` bench environment: it is
-**not** integrated into `Esp32PcmClock` (still the untouched,
-unintegrated stub) or `Si3050Controller`, and no production or DEV MQTT
-firmware path uses it. See
+been connected or initialized, and PCM audio data (`DRX`/`DTX`) and
+audio content are untested. This validated *geometry* has since been
+implemented for real in `Esp32PcmClock` and integrated into the normal
+firmware's boot sequence (see "Si3050/Si3011-19 firmware foundation"
+above) - but the standalone `esp32-c3-si3050-clock-probe` bench
+environment itself remains a separate, isolated throwaway firmware, kept
+as a bench regression check, not the production code path. See
 [docs/si3050-clock-probe.md](docs/si3050-clock-probe.md) for the full
 contract, wiring, build/flash/monitor commands, and the complete bench
 record.

@@ -17,6 +17,11 @@
 #include "hardware/status_indicator.h"
 #include "hardware/system_control.h"
 #include "intercom/intercom.h"
+#include "intercom/si3050/si3050_bus.h"
+#include "intercom/si3050/si3050_controller.h"
+#include "intercom/si3050/si3050_delay.h"
+#include "intercom/si3050/si3050_pcm_clock.h"
+#include "intercom/si3050/si3050_reset.h"
 #include "network/health_reporter.h"
 #include "network/mqtt_topics.h"
 #include "network/mqtt_transport.h"
@@ -55,6 +60,25 @@ Esp32SystemControl systemControl;
 Esp32ButtonInput buttonInputHardware;
 ButtonController buttonController(buttonInputHardware);
 Esp32StatusIndicator statusIndicator;
+
+// ---- Si3050 PCM clock bring-up ----
+// Constructed inside setup() (initializeSi3050()), not at global scope
+// like the hardware objects above: Esp32Si3050Bus's/Esp32Si3050Reset's
+// constructors call real pinMode()/digitalWrite() under #ifdef ARDUINO
+// (see si3050_bus.cpp/si3050_reset.cpp), which must not run before the
+// Arduino runtime itself has initialized - no other object in this file
+// touches a real pin from a global constructor, for the same reason.
+// See CONTEXT.md and docs/si3050-bringup.md for what this does and does
+// not validate: the PCLK/FSYNC clock geometry is physically validated
+// (docs/si3050-clock-probe.md), but Esp32Si3050Bus::transfer() (real SPI)
+// remains an unimplemented TODO, so this integrates clock generation and
+// its bring-up ordering only - no DAA/register configuration, ring,
+// off-hook, or audio.
+std::optional<Esp32Si3050Bus> si3050Bus;
+std::optional<Esp32PcmClock> si3050PcmClock;
+std::optional<Esp32Si3050Reset> si3050Reset;
+std::optional<Esp32Si3050Delay> si3050Delay;
+std::optional<Si3050Controller> si3050Controller;
 
 // ---- Storage / identity ----
 NvsStore persistentStore; // STUB - see CONTEXT.md, nothing survives reboot yet.
@@ -197,6 +221,43 @@ void initializeHardware() {
     Logger::info("Hardware layer initialized (stub, GPIO mapping not defined)");
 }
 
+void initializeSi3050() {
+    // Runs the Si3050's documented electrical bring-up sequence (CS
+    // deselected, /RESET asserted, SCLK held high, PCLK/FSYNC started,
+    // then /RESET released only once the clock is confirmed running -
+    // see Si3050Controller). The PCM clock geometry (16 x 8 TDM, PCM
+    // short, 1.024 MHz PCLK / 8 kHz FSYNC) is physically validated on
+    // real ESP32-C3 hardware - see docs/si3050-clock-probe.md. This call
+    // only brings up the clock and its electrical ordering: it never
+    // reads or writes a single Si3050 control register (DAA/line/audio
+    // configuration remains out of scope - see Si3050Controller and
+    // docs/si3050-bringup.md), and Esp32Si3050Bus::transfer() (real SPI)
+    // is still an unimplemented TODO, so isReady()==true here does not
+    // mean a real Si3050 has been read from. Safe to run with no Si3050
+    // physically attached: /RESET is simply released on an otherwise
+    // idle GPIO, and si3050_pins.h's GPIO0/GPIO1 (PCLK/FSYNC) are the
+    // same pins already used - and physically validated - by the Phase
+    // 3B.1 clock probe.
+    si3050Bus.emplace();
+    si3050PcmClock.emplace();
+    si3050Reset.emplace();
+    si3050Delay.emplace();
+    si3050Controller.emplace(*si3050Bus, *si3050PcmClock, *si3050Reset, *si3050Delay);
+
+    Si3050InitResult result = si3050Controller->initialize();
+    switch (result) {
+        case Si3050InitResult::Ready:
+            Logger::info("Si3050 PCM clock started (1.024 MHz PCLK / 8 kHz FSYNC, PCM/SPI bring-up complete)");
+            break;
+        case Si3050InitResult::ClockNotRunning:
+            Logger::error("Si3050 PCM clock failed to start - bring-up stopped, /RESET stays asserted");
+            break;
+        case Si3050InitResult::InvalidConfig:
+            Logger::error("Si3050: invalid Si3050Config (pclkHz/fsyncHz == 0) - bring-up skipped");
+            break;
+    }
+}
+
 void initializeNetwork() {
     Logger::info("Network layer initialized (AWS IoT MQTT/mTLS; fail-closed until configured)");
 }
@@ -329,6 +390,7 @@ void setup() {
     initializeLogging();
     initializeIdentity();
     initializeHardware();
+    initializeSi3050();
     initializeNetwork();
     initializeIntercom();
     initializeStateMachine();
