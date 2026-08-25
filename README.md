@@ -171,19 +171,36 @@ audio behavior is implemented. It is not instantiated by the current
 ## Si3050 clock probe: ESP32-C3 -> ESP32 DevKitV1 (Phase 3B.1)
 
 Two more isolated PlatformIO environments, `esp32-c3-si3050-clock-probe`
-and `esp32dev-si3050-clock-meter`, form a bench-only experiment to check
-whether an ESP32-C3 can generate the Si3050's target PCLK (2.048 MHz)/
-FSYNC (8 kHz) clocks in hardware (I2S TDM master mode) and whether a
-second, classic ESP32 DevKitV1 board can measure them by hardware pulse
-counting (PCNT). **This only validates the clock generation/measurement
-concept - it does not make the product's PCM clock functional, does not
-validate the Si3050 board, and does not change any decision about an
-external oscillator.** See [docs/si3050-clock-probe.md](docs/si3050-clock-probe.md)
-for the full contract, wiring, build/flash/monitor commands, and expected
-output. Neither environment touches `Si3050Controller`, `Esp32PcmClock`
-(still an untouched stub), Wi-Fi, or `esp32-c3`/`esp32-c3-dev-mqtt`; the
-conversion math is covered by native tests. **Not flashed or run on real
-hardware yet.**
+and `esp32dev-si3050-clock-meter`, form a bench experiment checking
+whether an ESP32-C3 can generate a Si3050-compatible PCLK/FSYNC clock in
+hardware (I2S TDM master mode) and whether a second, classic ESP32
+DevKitV1 board can measure it by hardware pulse counting (PCNT). The
+target is **PCM/SPI mode** (SPI for control, PCM for audio - the mode
+InterBridge plans to use): `PCLK ~= 1.024 MHz`, `FSYNC = 8 kHz`,
+ratio ~= 128 - not the `2.048 MHz`/256 figure required only by the
+Si3050's separate GCI mode, which InterBridge does not use. See
+[docs/si3050-clock-probe.md](docs/si3050-clock-probe.md)'s "Corrected
+premise" section for the full datasheet-sourced distinction.
+
+**Physically confirmed: the generator's 16 slots x 8 bits TDM geometry
+reaches this target on real hardware.** The original 16 x 16 geometry
+measured `pclk_hz ~= 1,024,000`/`fsync_hz ~= 16,000`/`ratio ~= 64` -
+not the target. The generator was changed to request 16 x 8 (matching
+the Si3050's own PCM/SPI PCM Highway description exactly - 128
+requested clocks/frame instead of 256), and a real bench retest
+confirmed `pclk_hz ~= 1,024,100`, `fsync_hz ~= 8,001`-`8,002`,
+`ratio ~= 127.98`-`128.00` across stable reporting windows (the first
+window after boot contained a brief startup transient and is excluded).
+**This confirms the clock signal only** - no real Si3050 hardware has
+been connected or initialized, PCM audio data (`DRX`/`DTX`) and audio
+content are untested, and this validated configuration exists only in
+the isolated `esp32-c3-si3050-clock-probe` bench environment: it is
+**not** integrated into `Esp32PcmClock` (still the untouched,
+unintegrated stub) or `Si3050Controller`, and no production or DEV MQTT
+firmware path uses it. See
+[docs/si3050-clock-probe.md](docs/si3050-clock-probe.md) for the full
+contract, wiring, build/flash/monitor commands, and the complete bench
+record.
 
 ## Phase 2D MQTT command transport
 

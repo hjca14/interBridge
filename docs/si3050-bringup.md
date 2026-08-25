@@ -25,9 +25,13 @@ Explicitly **not** implemented (deferred to future, bench-validated PRs):
 
 - Any Si3050/Si3011-19 **control register** read or write (DAA/line
   parameters, PCM highway mode enable, powering up the line-side device,
-  etc. - datasheet Section 5.3 steps 3-6). `Si3050Controller::initialize()`
-  stops right where the datasheet's electrical pin-timing requirements end
-  and register-level configuration begins.
+  etc. - steps 3-6 of the datasheet's documented initialization
+  procedure, as numbered in the checked-in `docs/Si3050-11-18-19.pdf`
+  Rev. 1.5 copy; step numbering, like section numbering, is not assumed
+  stable across other datasheet revisions).
+  `Si3050Controller::initialize()` stops right where the datasheet's
+  electrical pin-timing requirements end and register-level
+  configuration begins.
 - Real PCM clock generation (`Esp32PcmClock`): a stable, phase-locked
   2.048 MHz PCLK with a correctly framed 8 kHz FSYNC needs a timer/I2S
   peripheral configuration that has not been verified on real ESP32-C3
@@ -77,27 +81,34 @@ stays on a bare bench pad. Nothing in this firmware assumes a use for it.
 
 `docs/Si3050-11-18-19.pdf` (Skyworks "Si3050+Si3011/18/19", Rev. 1.5,
 August 24 2021) is checked into this repository and is the source for
-every timing value used below - none of it is guessed. Relevant sections:
+every timing value used below - none of it is guessed. Cited by section
+title below, not section number (numbering varies between datasheet
+revisions - see docs/si3050-clock-probe.md's "Corrected premise" for
+why this matters). Relevant sections:
 
 - **Table 6, "Switching Characteristics - General Inputs" (page 10):**
   `PCLK Before RESET` (t<sub>mr</sub>) &ge; 10 cycles; `CS, SCLK Before
   RESET` (t<sub>mxr</sub>) &ge; 20 ns; `RESET Pulse Width` (t<sub>rl</sub>)
   &ge; the greater of 250 ns or 10 PCLK cycle times.
-- **Section 5.30, "Clock Generation" (page 39):** PLL settle time
-  `Tsettle = 64 / FPCLK`. At the Rev A target of 2.048 MHz, this is
-  31.25 &micro;s (rounded up to 32 &micro;s in code). Section 5.3 separately
-  states this is "less than 1 ms from the application of PCLK", consistent
-  with the formula at any valid PCLK rate.
-- **Section 5.31, "Communication Interface Mode Selection" / Table 20
-  (page 39):** the state of SCLK at the instant RESET is sampled selects
-  PCM/SPI mode (SCLK=1) vs. GCI mode - why SCLK must be held high before
-  RESET is released.
+- **"Clock Generation" (page 39):** PLL settle time `Tsettle = 64 /
+  FPCLK`. At the Rev A target of 2.048 MHz, this is 31.25 &micro;s
+  (rounded up to 32 &micro;s in code). The datasheet separately states
+  this is "less than 1 ms from the application of PCLK", consistent with
+  the formula at any valid PCLK rate. Note: 2.048 MHz is a target chosen
+  for Rev A, not the only valid PCLK rate - PCM/SPI mode (the mode
+  InterBridge plans to use, see below) also accepts 1.024 MHz; see
+  docs/si3050-clock-probe.md's "Corrected premise" for the full
+  distinction from GCI mode's stricter 2.048/4.096 MHz requirement.
+- **"Communication Interface Mode Selection" / Table 20 (page 39):** the
+  state of SCLK at the instant RESET is sampled selects PCM/SPI mode
+  (SCLK=1) vs. GCI mode - why SCLK must be held high before RESET is
+  released.
 - **Pin description table:** `/CS`, `/RESET`, and `/RGDT` are each
   explicitly documented as active-low.
-- **Section 5.18, "Ring Detection" (page 33):** `/RGDT` is open-drain,
-  defaults active low, and toggles *at the ring signal's own frequency*
-  during an actual ring burst - it is not a clean single asserted/cleared
-  level. See "Ring detection" below.
+- **"Ring Detection" (page 33):** `/RGDT` is open-drain, defaults active
+  low, and toggles *at the ring signal's own frequency* during an actual
+  ring burst - it is not a clean single asserted/cleared level. See
+  "Ring detection" below.
 
 ## Electrical bring-up contract
 
@@ -148,7 +159,7 @@ and reports `RingEvent::Asserted`/`RingEvent::Cleared` on a stable level
 change. It does not touch audio, intercom line state, or publish any MQTT
 event.
 
-Important caveat, directly from the datasheet (Section 5.18): during an
+Important caveat, directly from the datasheet's "Ring Detection" section: during an
 actual ring burst, `/RGDT` itself toggles at the ring signal's cadence
 (tens of Hz), not a steady level. A simple debounced level reader like
 this one will see that as a rapid string of asserted/cleared transitions,

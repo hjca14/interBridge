@@ -9,20 +9,24 @@ using namespace interbridge;
 void setUp() {}
 void tearDown() {}
 
-void test_ratio_at_target_frequencies_is_256() {
-    // 2.048 MHz PCLK / 8 kHz FSYNC over the same window = 256, matching
-    // the Si3050's documented PCLK:FSYNC relationship.
-    TEST_ASSERT_EQUAL_DOUBLE(256.0, pclkToFsyncRatio(2048000, 8000));
+void test_ratio_at_pcm_spi_target_frequencies_is_128() {
+    // 1.024 MHz PCLK / 8 kHz FSYNC over the same window = 128 - the
+    // Si3050's PCM/SPI-mode target (16 timeslots of 8 bits per frame),
+    // which is the mode InterBridge plans to use. This is NOT the same as
+    // GCI mode's 2.048/4.096 MHz requirement - see docs/si3050-clock-probe.md.
+    TEST_ASSERT_EQUAL_DOUBLE(static_cast<double>(kPcmSpiTargetRatio),
+                             pclkToFsyncRatio(kPcmSpiTargetPclkHz, kPcmSpiTargetFsyncHz));
 }
 
-void test_window_result_at_target_frequencies() {
-    ClockProbeWindowResult result = computeClockProbeWindowResult(1000000, 2048000, 8000);
+void test_window_result_at_pcm_spi_target_frequencies() {
+    ClockProbeWindowResult result =
+        computeClockProbeWindowResult(1000000, kPcmSpiTargetPclkHz, kPcmSpiTargetFsyncHz);
     TEST_ASSERT_EQUAL_UINT64(1000000, result.windowMicros);
-    TEST_ASSERT_EQUAL_UINT64(2048000, result.pclkEdges);
-    TEST_ASSERT_EQUAL_UINT64(8000, result.fsyncEdges);
-    TEST_ASSERT_EQUAL_DOUBLE(2048000.0, result.pclkHz);
+    TEST_ASSERT_EQUAL_UINT64(kPcmSpiTargetPclkHz, result.pclkRisingEdges);
+    TEST_ASSERT_EQUAL_UINT64(kPcmSpiTargetFsyncHz, result.fsyncRisingEdges);
+    TEST_ASSERT_EQUAL_DOUBLE(1024000.0, result.pclkHz);
     TEST_ASSERT_EQUAL_DOUBLE(8000.0, result.fsyncHz);
-    TEST_ASSERT_EQUAL_DOUBLE(256.0, result.ratio);
+    TEST_ASSERT_EQUAL_DOUBLE(128.0, result.ratio);
 }
 
 void test_frequency_conversion_uses_real_window_duration() {
@@ -76,8 +80,8 @@ void test_min_max_tracker_single_sample_is_both_min_and_max() {
 
 int main(int, char**) {
     UNITY_BEGIN();
-    RUN_TEST(test_ratio_at_target_frequencies_is_256);
-    RUN_TEST(test_window_result_at_target_frequencies);
+    RUN_TEST(test_ratio_at_pcm_spi_target_frequencies_is_128);
+    RUN_TEST(test_window_result_at_pcm_spi_target_frequencies);
     RUN_TEST(test_frequency_conversion_uses_real_window_duration);
     RUN_TEST(test_zero_and_invalid_counts_are_handled_without_dividing_by_zero);
     RUN_TEST(test_overflow_combination_and_out_of_range_raw_count);

@@ -120,9 +120,11 @@ bool configurePcntUnit(pcnt_unit_t unit, gpio_num_t pin, PcntBringupTracker& tra
 
     // Deliberately no glitch filter: pcnt_filter_enable()/
     // pcnt_set_filter_value() are never called - the filter is measured
-    // in APB clock cycles and could silently eat legitimate ~244 ns
-    // half-cycles at a 2.048 MHz PCLK. pcnt_filter_disable() makes that
-    // explicit rather than relying on an assumed power-on default.
+    // in APB clock cycles and could silently eat legitimate sub-microsecond
+    // half-cycles at PCLK rates in the hundreds of kHz to low MHz (e.g.
+    // ~488 ns at 1.024 MHz, ~244 ns at 2.048 MHz). pcnt_filter_disable()
+    // makes that explicit rather than relying on an assumed power-on
+    // default.
     err = pcnt_filter_disable(unit);
     tracker.record("pcnt_filter_disable", err, err == kClockProbeEspOk);
     if (tracker.hasFailed()) return false;
@@ -235,6 +237,12 @@ void setup() {
     Serial.printf("[SI3050 CLOCK METER] pcnt configured pclk_pin=%d fsync_pin=%d h_lim=%ld\n",
                  static_cast<int>(kPclkInputPin), static_cast<int>(kFsyncInputPin),
                  static_cast<long>(kClockProbePcntHighLimit));
+    // Both units are configured identically by configurePcntUnit() above
+    // (pos_mode=PCNT_COUNT_INC, neg_mode=PCNT_COUNT_DIS): rising edges
+    // only, on both PCLK and FSYNC. This line states that configuration
+    // as fact, not a frequency claim - it does not mean the values below
+    // have been confirmed against the PCM/SPI-mode target yet.
+    Serial.println("[SI3050 CLOCK METER] pclk_edge_mode=rising_only fsync_edge_mode=rising_only");
 
     g_windowStartMs = millis();
     g_windowStartMicros = esp_timer_get_time();
@@ -263,19 +271,22 @@ void loop() {
     int32_t fsyncRaw = 0;
     sampleAndResetUnit(kFsyncUnit, g_fsyncOverflowCount, fsyncOverflow, fsyncRaw);
 
-    const uint64_t pclkEdges = combinePulseCount(pclkOverflow, pclkRaw, kClockProbePcntHighLimit);
-    const uint64_t fsyncEdges = combinePulseCount(fsyncOverflow, fsyncRaw, kClockProbePcntHighLimit);
+    const uint64_t pclkRisingEdges = combinePulseCount(pclkOverflow, pclkRaw, kClockProbePcntHighLimit);
+    const uint64_t fsyncRisingEdges = combinePulseCount(fsyncOverflow, fsyncRaw, kClockProbePcntHighLimit);
 
-    const ClockProbeWindowResult result = computeClockProbeWindowResult(windowMicros, pclkEdges, fsyncEdges);
+    const ClockProbeWindowResult result =
+        computeClockProbeWindowResult(windowMicros, pclkRisingEdges, fsyncRisingEdges);
 
     g_pclkHzStats.observe(result.pclkHz);
     g_fsyncHzStats.observe(result.fsyncHz);
     g_ratioStats.observe(result.ratio);
 
     Serial.printf(
-        "[SI3050 CLOCK METER] window_us=%llu pclk_edges=%llu pclk_hz=%.1f fsync_edges=%llu fsync_hz=%.2f ratio=%.3f\n",
-        static_cast<unsigned long long>(result.windowMicros), static_cast<unsigned long long>(result.pclkEdges),
-        result.pclkHz, static_cast<unsigned long long>(result.fsyncEdges), result.fsyncHz, result.ratio);
+        "[SI3050 CLOCK METER] window_us=%llu pclk_rising_edges=%llu pclk_hz=%.1f fsync_rising_edges=%llu "
+        "fsync_hz=%.2f ratio=%.3f\n",
+        static_cast<unsigned long long>(result.windowMicros),
+        static_cast<unsigned long long>(result.pclkRisingEdges), result.pclkHz,
+        static_cast<unsigned long long>(result.fsyncRisingEdges), result.fsyncHz, result.ratio);
     Serial.printf(
         "[SI3050 CLOCK METER] stats pclk_hz_min=%.1f pclk_hz_max=%.1f fsync_hz_min=%.2f fsync_hz_max=%.2f "
         "ratio_min=%.3f ratio_max=%.3f\n",
