@@ -967,16 +967,45 @@ this pass:)*
   geometry's pure math (`configuredTdmRatio(16, 8) == 128`,
   `configuredBclkHz(8000, 16, 8) == 1,024,000`); the previous 16 x 16
   geometry's math is kept as a separate regression-only test pair, since
-  the generator no longer requests it. **This has not been flashed or
-  measured on real hardware as of this update** - see
-  docs/si3050-clock-probe.md's "Experimental attempt: 16 x 8 slot
-  geometry" for exactly what a physical retest with the unchanged,
-  already-validated `esp32dev-si3050-clock-meter` needs to show
-  (`pclk_hz ~= 1,024,000`, `fsync_hz ~= 8,000`, `ratio ~= 128`) before
-  this can be treated as confirmed. The meter, production, DEV-MQTT, and
-  Si3050 foundation code remain untouched; no `i2s_set_clk()`, LEDC,
-  RMT, bit-banging, delays, or private registers were used; no real
-  Si3050 hardware has been initialized.
+  the generator no longer requests it. At the time of this update, this
+  had not yet been flashed or measured on real hardware - see the
+  follow-up entry immediately below for the physical confirmation. The
+  meter, production, DEV-MQTT, and Si3050 foundation code remain
+  untouched; no `i2s_set_clk()`, LEDC, RMT, bit-banging, delays, or
+  private registers were used; no real Si3050 hardware has been
+  initialized.
+- **Follow-up (same PR #18, fourth/final update): the 16 x 8 geometry is
+  now physically confirmed.** The ESP32-C3 was reflashed with the 16 x 8
+  generator from the entry above and measured by the DevKitV1's
+  already-validated, rising-edge-only PCNT meter:
+  `window_us=1000245 pclk_hz=1035308.3 fsync_hz=8089.02 ratio=127.989`,
+  `window_us=1002000 pclk_hz=1024096.8 fsync_hz=8002.00 ratio=127.980`,
+  `window_us=1001000 pclk_hz=1024125.9 fsync_hz=8001.00 ratio=128.000`.
+  The first window contains the startup transient immediately after the
+  I2S peripheral came up and is not representative; the following two
+  windows stabilized at `pclk_hz ~= 1,024,097`-`1,024,126`, `fsync_hz ~=
+  8,001`-`8,002`, `ratio ~= 127.98`-`128.00` - matching the corrected
+  PCM/SPI target (`PCLK = 1.024 MHz`, `FSYNC = 8 kHz`, `ratio = 128`)
+  within normal crystal/USB-CDC jitter. **This confirms, on real
+  hardware, that the ESP32-C3 on this exact toolchain and legacy I2S
+  driver can generate a PCM/SPI-mode-compatible Si3050 clock signal via
+  a 16 x 8 TDM configuration**, measured externally by the independent
+  DevKitV1/PCNT meter board (never self-measured by the generator).
+  This confirms the clock signal only: no real Si3050 or Si3011/18/19
+  part has been connected or initialized at any point, PCM audio data
+  (`DRX`/`DTX`) and audio content remain completely untested, and this
+  validated 16 x 8 configuration exists only in the isolated
+  `esp32-c3-si3050-clock-probe` bench environment - it has **not** been
+  integrated into `Esp32PcmClock` (still the untouched, unintegrated
+  stub) or `Si3050Controller`, and no production/DEV-MQTT/Wi-Fi/BLE/AWS
+  firmware path uses it. No code changes were made in this update beyond
+  documentation (this file, README.md, docs/si3050-clock-probe.md) and
+  removing now-inaccurate "experimental"/"unconfirmed"/"not yet tested"
+  language from source comments describing the 16 x 8 geometry
+  specifically - the 16 x 8 configuration itself, the meter, and all
+  other code are unchanged from the previous entry. See
+  docs/si3050-clock-probe.md's "Real bench observation: 16 x 8 slot
+  geometry reaches the PCM/SPI target" for the full record.
 
 ## Future Work
 

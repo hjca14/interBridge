@@ -2,16 +2,16 @@
 #error "si3050_clock_probe_generator_main.cpp is only for INTERBRIDGE_SI3050_CLOCK_PROBE_GENERATOR"
 #endif
 
-// Phase 3B.1 bench-only experiment: attempts to generate the Si3050's
-// target PCLK/FSYNC clocks on GPIO0/GPIO1 using the ESP32-C3's I2S
-// peripheral in hardware TDM master mode, to be measured by a second
-// board running esp32dev-si3050-clock-meter. This is NOT Si3050
-// integration - it does not touch Si3050Controller, Esp32PcmClock
-// (which remains an untouched stub), or any production/DEV MQTT
-// firmware path. No physical action of any kind is possible from this
-// firmware. See docs/si3050-clock-probe.md.
+// Phase 3B.1 bench experiment: generates the Si3050's PCM/SPI-mode
+// PCLK/FSYNC clocks on GPIO0/GPIO1 using the ESP32-C3's I2S peripheral in
+// hardware TDM master mode, measured by a second board running
+// esp32dev-si3050-clock-meter. This is NOT Si3050 integration - it does
+// not touch Si3050Controller, Esp32PcmClock (which remains an untouched,
+// unintegrated stub - see below), or any production/DEV MQTT firmware
+// path. No physical action of any kind is possible from this firmware.
+// See docs/si3050-clock-probe.md.
 //
-// IMPORTANT - bench history, not yet resolved:
+// IMPORTANT - bench history:
 // 1. The original configuration (total_chan=16, bits_per_sample=16,
 //    requesting ratio 256, i.e. 2,048,000 Hz PCLK) measured an actual
 //    PCLK:FSYNC ratio of ~64 (pclk_hz~=1,024,000, fsync_hz~=16,000) -
@@ -28,25 +28,32 @@
 //    upstream espressif/esp-idf v4.4.7 tag's components/driver/i2s.c and
 //    components/hal/i2s_hal.c, since this installed framework ships only
 //    a precompiled libdriver.a) found that the driver's own documented
-//    clock-divider formula does not predict the real measured output
-//    even for the original request - see docs/si3050-clock-probe.md's
-//    "Deeper investigation" section. No `total_chan`/`bits_per_sample`
-//    combination computed from that same formula could therefore be
-//    trusted without a real physical retest.
+//    clock-divider formula does not predict the real measured output for
+//    the 16 x 16 request - see docs/si3050-clock-probe.md's "Deeper
+//    investigation" section.
 //
-// EXPERIMENTAL ATTEMPT (this change): 16 slots x 8 bits = 128 requested
-// clocks/frame, instead of 16 x 16 = 256. This is not a guess from the
-// (already-shown-unreliable) clock formula - it is chosen because it
+// GEOMETRY CHANGE, PHYSICALLY VALIDATED: 16 slots x 8 bits = 128
+// requested clocks/frame, instead of 16 x 16 = 256 - chosen because it
 // directly matches the Si3050 datasheet's own PCM/SPI-mode PCM Highway
 // description (16 timeslots x 8 bits/timeslot = 128 PCLK cycles/frame,
 // FSYNC = 8 kHz, PCLK = 1.024 MHz - see docs/si3050-clock-probe.md's
-// "Corrected premise"). It is a deliberate, reversible bench trial, not
-// a confirmed fix: **this firmware does not claim the values it logs at
-// startup are the real output frequencies - only a physical retest with
-// esp32dev-si3050-clock-meter (unchanged, already validated) can confirm
-// whether this actually reaches ~1.024 MHz/~8 kHz/~128 on real
-// hardware.** See docs/si3050-clock-probe.md's "Experimental attempt:
-// 16 x 8 slot geometry" section.
+// "Corrected premise"), not derived from the (already-shown-unreliable)
+// clock formula above. **A physical retest with this exact geometry,
+// flashed to a real ESP32-C3 and measured by the unchanged, already-
+// validated esp32dev-si3050-clock-meter, confirmed `pclk_hz ~=
+// 1,024,100`, `fsync_hz ~= 8,001`-`8,002`, `ratio ~= 127.98`-`128.00`
+// across multiple stable reporting windows** (the first window
+// immediately after boot showed a brief startup transient and is not
+// representative - see docs/si3050-clock-probe.md's "Real bench
+// observation: 16 x 8 slot geometry reaches the PCM/SPI target"). This
+// confirms the ESP32-C3, on this exact toolchain/driver, can generate a
+// PCM/SPI-mode-compatible Si3050 clock via this TDM configuration.
+// **This confirms the clock signal only** - no real Si3050 has been
+// connected or initialized, PCM DRX/DTX and audio are untested, and this
+// validated configuration lives only in this isolated probe environment;
+// it has not been integrated into `Esp32PcmClock` (still the untouched,
+// unintegrated stub used by the real firmware path) or
+// `Si3050Controller`.
 //
 // This installed framework (framework-arduinoespressif32
 // 3.20017.241212+sha.dcc1105b) is built on ESP-IDF 4.4.7
@@ -82,11 +89,12 @@ namespace {
 
 constexpr i2s_port_t kI2sPort = I2S_NUM_0;
 
-// TDM slot geometry REQUESTED from the driver - see the file-level
-// comment above: real bench tests of the previous (16 x 16) geometry
-// showed this kind of request is NOT honored as documented by this
-// driver/chip/framework combination, so this is not described as
-// "matching the target exactly" - only as what is asked for.
+// TDM slot geometry REQUESTED from the driver, and PHYSICALLY CONFIRMED
+// by a real bench retest to be honored (see the file-level comment
+// above and docs/si3050-clock-probe.md's "Real bench observation: 16 x 8
+// slot geometry reaches the PCM/SPI target") - unlike the previous
+// 16 x 16 geometry, which real bench tests showed was NOT honored as
+// documented.
 //   requested BCLK (PCLK) = sample_rate * total_chan * bits_per_sample
 //                          = 8000 * 16 * 8 = 1,024,000 Hz
 //   requested WS (FSYNC)  = sample_rate = 8000 Hz
@@ -95,12 +103,13 @@ constexpr i2s_port_t kI2sPort = I2S_NUM_0;
 // TDM channel activation is a bitmask of I2S_TDM_ACTIVE_CH0..CH15
 // (hal/i2s_types.h), i.e. a hard ceiling of 16 channels exposed by this
 // driver. 16 channels x 8 bits was chosen deliberately (not derived from
-// the driver's own clock formula, already shown unreliable - see the
-// file-level comment above) because it is exactly the Si3050 datasheet's
-// own PCM/SPI-mode PCM Highway geometry: 16 timeslots of 8 bits each,
-// 128 PCLK cycles/frame. `I2S_BITS_PER_SAMPLE_8BIT` (hal/i2s_types.h) is
-// a directly-supported value of `i2s_bits_per_sample_t` on this chip -
-// confirmed in the installed header, not assumed - and the driver's own
+// the driver's own clock formula, already shown unreliable for the
+// previous geometry - see the file-level comment above) because it is
+// exactly the Si3050 datasheet's own PCM/SPI-mode PCM Highway geometry:
+// 16 timeslots of 8 bits each, 128 PCLK cycles/frame.
+// `I2S_BITS_PER_SAMPLE_8BIT` (hal/i2s_types.h) is a directly-supported
+// value of `i2s_bits_per_sample_t` on this chip - confirmed in the
+// installed header, not assumed - and the driver's own
 // `i2s_driver_install()` validation only requires
 // `bits_per_sample % 8 == 0 && bits_per_sample <= 32`, which 8 satisfies.
 // `bits_per_chan` is left at its default (0 = "equal to bits_per_sample"
@@ -126,8 +135,9 @@ constexpr uint32_t kActiveChannelMask = I2S_TDM_ACTIVE_CH0 | I2S_TDM_ACTIVE_CH1 
                                         I2S_TDM_ACTIVE_CH15;
 
 const Si3050Config kConfig; // fsyncHz=8000 reused from here, not duplicated - kConfig.pclkHz (its Rev A
-                            // default, unrelated to this probe's own experimental PCLK request below) is
-                            // not read by this file; the requested PCLK comes from configuredBclkHz() instead.
+                            // default, unrelated to this probe's own physically-confirmed PCLK request
+                            // below) is not read by this file; the requested PCLK comes from
+                            // configuredBclkHz() instead.
 
 bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
     return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
@@ -200,9 +210,9 @@ void setup() {
         started ? "true" : "false");
     Serial.println(
         "[SI3050 CLOCK PROBE] note: the line above reports what was requested from the I2S driver, not a "
-        "measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies, "
-        "and real bench tests have shown this driver does not honor this request as documented - see "
-        "docs/si3050-clock-probe.md");
+        "measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies. "
+        "A real bench retest of this exact 16x8 geometry confirmed it reaches the PCM/SPI target "
+        "(~1.024 MHz/~8 kHz/~128) - see docs/si3050-clock-probe.md");
     if (!started) {
         Serial.printf("[SI3050 CLOCK PROBE] i2s_driver_install=%d i2s_set_pin=%d\n", static_cast<int>(installResult),
                      static_cast<int>(pinResult));
