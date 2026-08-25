@@ -1051,14 +1051,16 @@ this pass:)*
   calls themselves are not exercised natively, same limitation as the
   clock probe meter's own tracker tests. **What this does and does not
   prove is kept explicit in docs/si3050-bringup.md's new "PCM clock:
-  validation status" section**: the *geometry* was physically validated
-  by the separate probe firmware; this *integrated* code path compiles,
-  links, and passes native tests, but has not itself been flashed and
-  measured on real hardware; and no real Si3050 has been connected or
-  initialized at any point, so `Esp32Si3050Bus::transfer()` (real SPI),
-  DAA/register configuration, ring pattern/off-hook/line characterization,
-  and audio (DRX/DTX) all remain entirely unimplemented and untouched by
-  this pass - as do Wi-Fi/BLE/MQTT/AWS/provisioning/reconnection, the
+  validation status" section**. Three validation levels are recorded:
+  (1) the `16 x 8` geometry was physically validated earlier by the
+  isolated probe; (2) the real `Esp32PcmClock` implementation in the
+  normal `esp32-c3` environment has now also been reflashed and measured
+  physically at approximately `1.024 MHz` PCLK / `8 kHz` FSYNC / `128`;
+  and (3) no real Si3050 has been connected or initialized at any point,
+  so `Esp32Si3050Bus::transfer()` (real SPI),
+  DAA/register configuration, DRX/DTX, audio, ring, off-hook, and relay
+  behavior all remain outside scope and unvalidated. The existing CI
+  result remains unchanged, as do Wi-Fi/BLE/MQTT/AWS/provisioning/reconnection, the
   clock probe environments (kept as bench regression), and PR #17's IDF5
   approach (not reintroduced).
 

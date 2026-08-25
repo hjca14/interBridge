@@ -162,19 +162,15 @@ for the full contract, its datasheet citations (`docs/Si3050-11-18-19.pdf`
 is checked into this repository), the PCM clock's precise validation
 status, and a bring-up checklist for when Rev A hardware exists.
 
-**PCM clock generation is now real, not a stub.** `Esp32PcmClock`
-implements the exact `1.024 MHz` PCLK / `8 kHz` FSYNC / `16 x 8` TDM
-geometry physically validated by the Phase 3B.1 clock probe (see below),
-and `src/main.cpp` now constructs `Si3050Controller` with it and calls
-`initialize()` during `setup()` - **integrated into the normal firmware
-boot sequence**, using the same GPIO0/GPIO1 pins the probe validated.
-This is still **not** a working Si3050 driver: no real Si3050 has been
-connected or initialized, `Esp32Si3050Bus::transfer()` (real SPI) remains
-an unimplemented `TODO`, no control register is read or written, no PCM
-audio data (`DRX`/`DTX`) is configured or exchanged, and no ring pattern,
-off-hook, relay, or audio behavior is implemented. This specific
-*integrated* code path (as opposed to the standalone bench probe) has
-also not itself been flashed and measured on real hardware yet - see
+**PCM clock generation is now real, integrated, and physically measured.**
+The validation has three deliberately separate levels: (1) the isolated
+Phase 3B.1 probe previously validated the exact `16 x 8` TDM geometry;
+(2) the real `Esp32PcmClock` implementation in the normal `esp32-c3`
+firmware has now also been reflashed and measured physically at approximately
+`1.024 MHz` PCLK / `8 kHz` FSYNC / `128` clocks per frame; and (3) no real
+Si3050 has been connected or initialized. Consequently, real SPI,
+Si3050/DAA register access, PCM data (`DRX`/`DTX`), audio, ring, off-hook,
+and relay behavior remain outside this validation and unvalidated. See
 [docs/si3050-bringup.md](docs/si3050-bringup.md)'s "PCM clock: validation
 status" for the precise distinction.
 
