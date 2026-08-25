@@ -8,30 +8,33 @@ void setUp() {}
 void tearDown() {}
 
 void test_configured_ratio_matches_requested_geometry() {
-    // The geometry the generator actually requests (16 TDM channels x
-    // 16 bits/sample) - this is what is REQUESTED, not what a real
-    // bench test measured (~64, see docs/si3050-clock-probe.md).
-    TEST_ASSERT_EQUAL_UINT32(256, configuredTdmRatio(16, 16));
-}
-
-void test_configured_bclk_matches_requested_geometry() {
-    TEST_ASSERT_EQUAL_UINT32(2048000, configuredBclkHz(8000, 16, 16));
-}
-
-void test_configured_ratio_matches_corrected_pcm_spi_target() {
-    // The Si3050's PCM/SPI-mode target (16 timeslots of 8 bits/frame,
-    // per docs/si3050-clock-probe.md's "Corrected premise") = 128 PCLK
-    // cycles/frame. This documents what geometry these pure functions say
-    // WOULD reach the target - it is target math only, not a claim that
-    // the generator's actual I2S configuration was changed to this (it
-    // was not - see "Deeper investigation" in docs/si3050-clock-probe.md
-    // for why this PR could not confirm any specific geometry change
-    // against real hardware).
+    // The geometry the generator actually requests as of this PR's
+    // experimental attempt (16 TDM channels x 8 bits/sample = 16
+    // timeslots x 8 bits, matching the Si3050's PCM/SPI-mode PCM Highway
+    // geometry per docs/si3050-clock-probe.md's "Corrected premise") =
+    // 128 PCLK cycles/frame. This is what is REQUESTED, not yet
+    // confirmed by a physical retest - see docs/si3050-clock-probe.md's
+    // "Experimental attempt: 16 x 8 slot geometry".
     TEST_ASSERT_EQUAL_UINT32(128, configuredTdmRatio(16, 8));
 }
 
-void test_configured_bclk_matches_corrected_pcm_spi_target() {
+void test_configured_bclk_matches_requested_geometry() {
     TEST_ASSERT_EQUAL_UINT32(1024000, configuredBclkHz(8000, 16, 8));
+}
+
+void test_configured_ratio_matches_previous_geometry() {
+    // The generator's PREVIOUS geometry (16 TDM channels x 16
+    // bits/sample, before this PR's experimental attempt) - kept as a
+    // regression check on the pure math, not because the generator still
+    // requests this. A real bench test of this geometry measured an
+    // actual ratio of ~64, not 256 - see docs/si3050-clock-probe.md's
+    // "Real bench observation: generator does not reach the target
+    // ratio".
+    TEST_ASSERT_EQUAL_UINT32(256, configuredTdmRatio(16, 16));
+}
+
+void test_configured_bclk_matches_previous_geometry() {
+    TEST_ASSERT_EQUAL_UINT32(2048000, configuredBclkHz(8000, 16, 16));
 }
 
 void test_configured_ratio_is_pure_multiplication() {
@@ -48,8 +51,8 @@ int main(int, char**) {
     UNITY_BEGIN();
     RUN_TEST(test_configured_ratio_matches_requested_geometry);
     RUN_TEST(test_configured_bclk_matches_requested_geometry);
-    RUN_TEST(test_configured_ratio_matches_corrected_pcm_spi_target);
-    RUN_TEST(test_configured_bclk_matches_corrected_pcm_spi_target);
+    RUN_TEST(test_configured_ratio_matches_previous_geometry);
+    RUN_TEST(test_configured_bclk_matches_previous_geometry);
     RUN_TEST(test_configured_ratio_is_pure_multiplication);
     RUN_TEST(test_configured_bclk_is_pure_multiplication);
     return UNITY_END();

@@ -188,13 +188,17 @@ for the full contract, wiring, build/flash/monitor commands, and expected
 output. Neither environment touches `Si3050Controller`, `Esp32PcmClock`
 (still an untouched stub), Wi-Fi, or `esp32-c3`/`esp32-c3-dev-mqtt`; the
 conversion math is covered by native tests. **Flashed and measured on
-real hardware (both boards): the meter is confirmed working and
-rising-edge-only on both signals, and confirms a real, stable
-`pclk_hz ~= 1,024,000` (already a valid PCM/SPI PCLK rate) - but
-`fsync_hz ~= 16,000`/`ratio ~= 64`, not yet the 8 kHz/128 target.** No
-real Si3050 hardware has been connected or initialized at any point -
-see [docs/si3050-clock-probe.md](docs/si3050-clock-probe.md) for the
-full bench record and the generator-driver investigation.
+real hardware (both boards) with the generator's previous 16 x 16 slot
+geometry: the meter is confirmed working and rising-edge-only on both
+signals, and confirmed a real, stable `pclk_hz ~= 1,024,000` (already a
+valid PCM/SPI PCLK rate) - but `fsync_hz ~= 16,000`/`ratio ~= 64`, not
+yet the 8 kHz/128 target.** The generator now requests a **16 x 8** slot
+geometry instead (matching the Si3050's own PCM/SPI PCM Highway
+description exactly - 128 requested clocks/frame) as an explicit,
+reversible bench experiment - **not yet flashed or measured on real
+hardware.** No real Si3050 hardware has been connected or initialized at
+any point - see [docs/si3050-clock-probe.md](docs/si3050-clock-probe.md)
+for the full bench record and the generator-driver investigation.
 
 ## Phase 2D MQTT command transport
 

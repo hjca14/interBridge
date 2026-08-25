@@ -44,19 +44,23 @@ This document's original two questions, as originally framed:
 
 1. Can an ESP32-C3 generate the Si3050's target PCM clocks (originally
    stated here as PCLK = 2.048 MHz, FSYNC = 8 kHz, ratio 256 - see the
-   correction above) in hardware? **Not yet, confirmed by three real
-   bench tests against the corrected target too** (the original TDM
-   configuration, an additional `i2s_set_clk()` adjustment, and a
-   retest with the meter's edge-mode explicitly confirmed as
-   rising-only): all three measured the same real signal - `pclk_hz ~=
-   1,024,000` (already a valid PCM/SPI-mode PCLK rate), `fsync_hz ~=
-   16,000` (2x the corrected 8 kHz target), `ratio ~= 64` (half the
-   corrected 128 target) - and the framework version installed here does
-   not vendor the newer, better-specified I2S driver that might do
-   better. See "Real bench observation: generator does not reach the
+   correction above) in hardware? **Not yet confirmed against the
+   corrected target with the 16 x 16 slot geometry** (three real bench
+   tests - the original TDM configuration, an additional `i2s_set_clk()`
+   adjustment, and a retest with the meter's edge-mode explicitly
+   confirmed as rising-only - all measured the same real signal:
+   `pclk_hz ~= 1,024,000` [already a valid PCM/SPI-mode PCLK rate],
+   `fsync_hz ~= 16,000` [2x the corrected 8 kHz target], `ratio ~= 64`
+   [half the corrected 128 target]), and the framework version installed
+   here does not vendor the newer, better-specified I2S driver that
+   might do better. A follow-up PR update then changed the generator to
+   request a **16 x 8 slot geometry** instead (matching the datasheet's
+   own PCM/SPI PCM Highway description exactly) as an explicit bench
+   experiment - **not yet tested on real hardware as of this document
+   update.** See "Real bench observation: generator does not reach the
    target ratio" below for the full investigation, including a deeper,
-   source-grounded look at the legacy I2S driver added in this PR, and
-   the alternatives left for a future decision.
+   source-grounded look at the legacy I2S driver, the 16 x 8 experiment,
+   and the alternatives left for a future decision.
 2. Can a second board measure those clocks by hardware pulse counting and
    report believable frequencies/ratio back over serial? **Yes, and this
    is now fully confirmed.** A real bench retest confirmed the PCNT
@@ -121,13 +125,19 @@ higher-level `I2SClass`, which only exposes 2-channel Philips/MSB/PDM
 modes) as a hardware TDM master:
 
 - 16 TDM slots (`total_chan = 16`, `chan_mask` activating
-  `I2S_TDM_ACTIVE_CH0..CH15`), 16 bits/sample
-  (`I2S_BITS_PER_SAMPLE_16BIT`), sample rate = `Si3050Config::fsyncHz`
-  (8000). Per the driver's own documented formula
-  (`i2s_set_sample_rates()`'s doc comment in `driver/i2s.h`),
-  `bit_clock = sample_rate * total_chan * bits_per_sample = 8000 * 16 *
-  16 = 2,048,000 Hz` - **this is what is requested, not what a real bench
-  test measured** - see "Real bench observation" below.
+  `I2S_TDM_ACTIVE_CH0..CH15`), **8 bits/sample as of this PR's
+  experimental attempt** (`I2S_BITS_PER_SAMPLE_8BIT` - was
+  `I2S_BITS_PER_SAMPLE_16BIT` before, see "Experimental attempt: 16 x 8
+  slot geometry" below), sample rate = `Si3050Config::fsyncHz` (8000).
+  Per the driver's own documented formula (`i2s_set_sample_rates()`'s
+  doc comment in `driver/i2s.h`), `bit_clock = sample_rate * total_chan *
+  bits_per_sample = 8000 * 16 * 8 = 1,024,000 Hz` - **this is what is
+  requested, not what a real bench test measured** - see "Real bench
+  observation" and "Experimental attempt" below. `bits_per_chan` is left
+  at its default (`0`, meaning "equal to `bits_per_sample`" per
+  `driver/i2s.h`), so no 16-bit assumption is left anywhere else in this
+  configuration - including DMA buffer sizing, which is computed from the
+  same 8-bit width.
 - `communication_format = I2S_COMM_FORMAT_STAND_PCM_SHORT`: documented in
   `hal/i2s_types.h` as "PCM Short standard, also known as DSP mode. The
   period of synchronization signal (WS) is 1 bck cycle" - this is the
@@ -158,13 +168,19 @@ express it:
 `soc/esp32c3/include/soc/soc_caps.h` reports `SOC_I2S_SUPPORTS_TDM=1` for
 ESP32-C3, and the vendored `driver/i2s.h`/`hal/i2s_types.h` expose the
 `i2s_config_t` TDM fields (`chan_mask`, `total_chan`) and
-`I2S_COMM_FORMAT_STAND_PCM_SHORT` needed above. No approximation
-(LEDC/RMT/bit-banged `delay()`/`digitalWrite()` loop) is used. **A real
-bench test of exactly this configuration did not reach the target
-ratio** - see "Real bench observation: generator does not reach the
-target ratio" below; do not read the bullets above as a claim that the
-hardware delivers the target values, only that they are what is
-requested from a documented API.
+`I2S_COMM_FORMAT_STAND_PCM_SHORT` needed above. `I2S_BITS_PER_SAMPLE_8BIT`
+is confirmed present in the same installed `hal/i2s_types.h` enum
+(`i2s_bits_per_sample_t`) as a directly-supported value, and the
+installed driver's own `i2s_driver_install()` validation (cross-referenced
+in "Deeper investigation" below) only requires `bits_per_sample % 8 == 0
+&& bits_per_sample <= 32`, which 8 satisfies - so this is not a build-time
+or install-time rejection risk, confirmed from source, not assumed. No
+approximation (LEDC/RMT/bit-banged `delay()`/`digitalWrite()` loop) is
+used. **A real bench test of the previous (16 x 16) configuration did
+not reach the target ratio** - see "Real bench observation: generator
+does not reach the target ratio" below; do not read the bullets above as
+a claim that the hardware delivers the target values, only that they are
+what is requested from a documented API.
 
 No sleeps, busy-waits, or approximations are used in the clock path
 itself; `loop()` only idles (the I2S peripheral runs entirely in
@@ -248,12 +264,18 @@ commands run in-session and their results.
 
 Generator, once at startup - reports what was *requested*, never a
 frequency claim (see "Real bench observation" below). Field names as of
-this PR (see "What the generator now logs" below for the rename):
+the previous PR update (see "What the generator now logs" below for the
+rename), with the values now reflecting **this PR's 16 x 8 experimental
+attempt** (`slot_width_bits=8`, was `16`):
 
 ```text
-[SI3050 CLOCK PROBE] requested_sample_rate_hz=8000 requested_fsync_hz=8000 requested_pclk_hz=2048000 requested_clocks_per_frame=256 slot_count=16 slot_width_bits=16 started=true
+[SI3050 CLOCK PROBE] requested_sample_rate_hz=8000 requested_fsync_hz=8000 requested_pclk_hz=1024000 requested_clocks_per_frame=128 slot_count=16 slot_width_bits=8 started=true
 [SI3050 CLOCK PROBE] note: the line above reports what was requested from the I2S driver, not a measurement - only esp32dev-si3050-clock-meter's real hardware measurement confirms actual frequencies
 ```
+
+**This is still only what was requested, not a measurement** - see
+"Experimental attempt: 16 x 8 slot geometry" below for what a physical
+retest would need to show before this can be treated as confirmed.
 
 Meter, roughly once per second - this is an **actual real bench
 measurement** of the current (unchanged) generator configuration,
@@ -271,14 +293,19 @@ target):
 
 The corrected target this probe is actually checking against is `PCLK ~=
 1,024,000 Hz`, `FSYNC ~= 8,000 Hz`, `ratio ~= 128` (PCM/SPI mode - see
-"Corrected premise" above), not 2,048,000 Hz/8,000 Hz/256. The confirmed
-`pclk_hz` above (~1,024,000) already matches that corrected PCLK target;
-`fsync_hz` (~16,000) and `ratio` (~64) do not, and this PR's
-investigation (see "Deeper investigation" below) could not determine a
-source-grounded generator change to close that gap. **Clock
-compatibility with the corrected PCM/SPI target should only be marked as
-physically confirmed once a bench test shows approximately `pclk_hz ~=
-1,024,000`, `fsync_hz ~= 8,000`, `ratio ~= 128`** - not yet the case.
+"Corrected premise" above), not 2,048,000 Hz/8,000 Hz/256. The reading
+above is from the generator's *previous* (16 x 16) geometry: `pclk_hz`
+(~1,024,000) already matched the corrected PCLK target; `fsync_hz`
+(~16,000) and `ratio` (~64) did not. A source-grounded investigation
+(see "Deeper investigation" below) found the driver's own clock formula
+could not reliably predict a fix, so the generator was instead changed
+to request the datasheet's own PCM/SPI-mode geometry directly (16 x 8 -
+see "Experimental attempt: 16 x 8 slot geometry" below) as an explicit,
+unconfirmed bench trial. **Clock compatibility with the corrected
+PCM/SPI target should only be marked as physically confirmed once a
+bench test - with this new geometry, after a reflash - shows
+approximately `pclk_hz ~= 1,024,000`, `fsync_hz ~= 8,000`, `ratio ~=
+128`** - not yet the case.
 Real crystal/clock tolerance and USB-CDC/print jitter mean exact
 integers should never be expected either way, so the min/max stats over
 a multi-minute run are what actually characterize the clock's stability,
@@ -408,16 +435,20 @@ target ratio" below for the generator-side investigation this PR adds.
 **Read against the corrected target from "Corrected premise" above,
 not the original one.** The measurement itself below is the unmodified
 historical record of what was first measured (against the then-assumed
-`2.048 MHz`/`256` GCI-style target) - it is kept verbatim rather than
-rewritten, but its `requested_pclk_hz=2,048,000`/`ratio=256` framing
-reflects the generator's own request at that time (unchanged since,
-see "Generator" below), not a confirmed Si3050 requirement. A fresh
+`2.048 MHz`/`256` GCI-style target, from the generator's *original*
+16 x 16 request) - it is kept verbatim rather than rewritten, but its
+`requested_pclk_hz=2,048,000`/`ratio=256` framing reflects only what was
+requested *at that time*, not a confirmed Si3050 requirement, and not
+the generator's current request (see "Experimental attempt: 16 x 8 slot
+geometry" below - the generator has since been changed). A fresh
 physical retest (see "Real bench observation: meter edge configuration
-re-examined" above) has since **confirmed** the same ~16 kHz FSYNC/~64:1
-ratio reading is real and not a meter artifact. This PR's own
-contribution is a deeper, source-grounded investigation of *why* (see
-"Deeper investigation" below) - it does not change the generator's
-actual I2S configuration.
+re-examined" above) confirmed the same ~16 kHz FSYNC/~64:1 ratio reading
+for the 16 x 16 geometry is real and not a meter artifact. A deeper,
+source-grounded investigation of *why* follows below ("Deeper
+investigation"), followed by an explicit, reversible bench experiment
+with a different slot geometry ("Experimental attempt: 16 x 8 slot
+geometry") - the only actual change made to the generator's I2S
+configuration across this document's history.
 
 The same physical retest that confirmed the PCNT fix also measured the
 generator's actual output for the first time. With the three wires
@@ -562,24 +593,27 @@ real source, not an API-formula guess:
   is not present in this installed framework package (only register
   field names and setter functions are - no register *behavior*
   reference), and this PR does not have access to that document.
-- **Conclusion: this cannot be reliably fixed by adjusting
-  `total_chan`/`bits_per_sample`/`sample_rate` from the available
-  source alone.** Since the driver's own formula does not predict the
-  real measured behavior even for the *current*, already-measured
+- **Conclusion (at the time this investigation was written): this cannot
+  be reliably *predicted* by adjusting `total_chan`/`bits_per_sample`/
+  `sample_rate` and computing the result from the available source
+  alone.** Since the driver's own formula does not predict the real
+  measured behavior even for the *current*, already-measured
   configuration, computing a *different* target configuration from that
   same formula (e.g. picking `total_chan`/`bits_per_sample` so that
   `chan_num * chan_bit` divides out to the corrected 128 ratio) would be
   extrapolating from a formula already shown not to match reality - an
   approximation, not a source-grounded fix, and one that could only be
   validated by yet another physical reflash/remeasure cycle with no
-  principled reason to expect success. Per explicit instruction, this
-  PR does not implement that approximation: **the generator's actual
-  I2S configuration (`sample_rate`, `bits_per_sample`, `total_chan`,
-  `chan_mask`, `communication_format`) is unchanged in this PR.** Only
-  its diagnostic log field names were clarified (see "What the generator
-  now logs" below), and `i2s_set_clk()` was not reintroduced (see
-  "Attempted and REJECTED" immediately below, unchanged from before this
-  PR).
+  principled reason to expect success *from the formula*. At the point
+  this was written, the generator's actual I2S configuration was left
+  unchanged, and only its diagnostic log field names were clarified (see
+  "What the generator now logs" below); `i2s_set_clk()` was not
+  reintroduced (see "Attempted and REJECTED" immediately below).
+  **A follow-up PR update changed this decision** - not by trusting the
+  unreliable formula for a *derived* target, but by trying the Si3050
+  datasheet's *own* PCM/SPI-mode PCM Highway geometry directly, as an
+  explicit, reversible, clearly-unconfirmed bench experiment. See
+  "Experimental attempt: 16 x 8 slot geometry" below.
 
 **Attempted and REJECTED: the `i2s_set_clk()` adjustment did not change
 the output.** Based on the header evidence above, an explicit
@@ -600,6 +634,84 @@ Indistinguishable from the original measurement above. This call has
 been **removed** from `src/dev/si3050_clock_probe_generator_main.cpp` -
 it is not a fix, does not change the real signal, and must not be
 reintroduced or presented as a solution without new evidence.
+
+### Experimental attempt: 16 x 8 slot geometry
+
+**This is a bench experiment, not a confirmed fix - it has not yet been
+tested on real hardware as of this document update.**
+
+`src/dev/si3050_clock_probe_generator_main.cpp` now requests **16 TDM
+channels x 8 bits/sample** (`kBitsPerSample = I2S_BITS_PER_SAMPLE_8BIT`,
+was `I2S_BITS_PER_SAMPLE_16BIT`) instead of 16 x 16. This choice is
+**not** derived from the driver's own clock formula - "Deeper
+investigation" above already showed that formula does not predict real
+measured behavior, so extrapolating a *different* configuration from it
+would be exactly the kind of unconfirmed approximation this PR set out
+to avoid. Instead, 16 x 8 is chosen because it is **directly the Si3050
+datasheet's own PCM/SPI-mode PCM Highway geometry**: 16 timeslots, 8
+bits per timeslot, 128 PCLK cycles per frame - see "Corrected premise"
+above. `total_chan=16`, `sample_rate=8000`,
+`communication_format=I2S_COMM_FORMAT_STAND_PCM_SHORT`, master TX mode,
+and the GPIO0=PCLK/GPIO1=FSYNC pin routing are all otherwise unchanged
+from the previous configuration.
+
+What changed, concretely, in `src/dev/si3050_clock_probe_generator_main.cpp`:
+
+- `kBitsPerSample`: `I2S_BITS_PER_SAMPLE_16BIT` -> `I2S_BITS_PER_SAMPLE_8BIT`.
+  Confirmed present and directly usable on ESP32-C3 in the installed
+  `hal/i2s_types.h` (`i2s_bits_per_sample_t` enum) - not a value this PR
+  invented. `bits_per_chan` is left unset (`i2s_config_t` is
+  zero-initialized), which the driver documents as "equal to
+  `bits_per_sample`" - so the TDM channel width matches the 8-bit sample
+  width exactly, with no leftover 16-bit slot width anywhere.
+- The DMA buffer size comment and math were updated to reflect 8-bit
+  samples (`dma_buf_len * total_chan * bits_per_sample / 8` = `64 * 16 *
+  8 / 8` = 1,024 bytes/buffer, still well under the driver's 4,092-byte
+  limit) - `dma_buf_len` itself (`64`) did not need to change.
+- The generator's diagnostic log now reports `requested_pclk_hz=1024000`
+  and `requested_clocks_per_frame=128` (both computed via
+  `configuredTdmRatio()`/`configuredBclkHz()`, so they can never
+  silently drift from the actual `total_chan`/`bits_per_sample` values
+  used), and `slot_width_bits=8` instead of `16` - see "Expected output"
+  above for the exact line.
+- All driver return-value checking is unchanged: `i2s_driver_install()`
+  and `i2s_set_pin()`'s `esp_err_t` results are still both checked,
+  `started` is still only `true` when both succeeded, and the failure
+  path still logs both raw `esp_err_t` values and never claims
+  `started=true` on failure - see `setup()`.
+- `i2s_set_clk()` was **not** reintroduced - see "Attempted and
+  REJECTED" immediately above, which remains valid: it was already shown
+  not to change the output for the previous geometry, and no new
+  evidence justifies retrying it here.
+
+**Build-time / install-time acceptance, confirmed in this PR:**
+`i2s_driver_install()`'s own validation (`i2s.c`'s `i2s_set_clk()`, called
+internally during install - see "Deeper investigation" above) only
+requires `bits_per_sample % 8 == 0 && bits_per_sample <= 32`; 8 satisfies
+both, so this is not expected to be rejected at either build or install
+time - and `pio run -e esp32-c3-si3050-clock-probe` does compile and
+link cleanly with this change (see the PR's build report). This does
+**not** mean the physical output is correct - only a real
+`esp32dev-si3050-clock-meter` measurement can determine that.
+
+**What a physical retest needs to show:**
+
+| | Previous (16 x 16) - confirmed | This experiment (16 x 8) - not yet tested |
+|---|---|---|
+| Requested | `pclk_hz=2,048,000` `ratio=256` | `pclk_hz=1,024,000` `ratio=128` |
+| Measured (real bench, three retests) | `pclk_hz ~= 1,024,000` `fsync_hz ~= 16,000` `ratio ~= 64` | unknown until reflashed and measured |
+| Target (PCM/SPI mode) | `pclk_hz ~= 1,024,000` `fsync_hz ~= 8,000` `ratio ~= 128` | same |
+
+The generator must be reflashed (`pio run -e esp32-c3-si3050-clock-probe
+-t upload`) and the **unchanged, already-validated**
+`esp32dev-si3050-clock-meter` must be used to measure the real output -
+see "Build / flash / monitor" above. **Do not treat this as resolved
+until that physical retest shows approximately `pclk_hz ~= 1,024,000`,
+`fsync_hz ~= 8,000`, `ratio ~= 128`.** If the retest instead reproduces
+something like the previous `~1,024,000`/`~16,000`/`~64` reading (or any
+other unexpected result), that outcome must be documented here plainly,
+not smoothed over - this is exactly the kind of "try it, then report
+what actually happened" bench iteration this probe exists for.
 
 ### Toolchain investigation: is the newer, native TDM driver available here?
 
@@ -645,14 +757,16 @@ field names were clarified in this PR (`requested_total_chan`/
 `slot_width_bits`/`requested_clocks_per_frame`, plus the new explicit
 `requested_fsync_hz`) so a reader never has to infer that "ratio" means
 "PCLK cycles per FSYNC frame," or that "total_chan"/"bits_per_sample"
-mean the TDM slot count/width - **this is a naming-only change; the
-underlying values and the actual I2S configuration requested are
-unchanged.** `requested_clocks_per_frame`/`requested_pclk_hz` are
-computed via `configuredTdmRatio()`/`configuredBclkHz()`
-(`src/dev/si3050_clock_probe_generator_config.h`, natively tested) so
-the log can never silently drift from the actual `total_chan`/
-`bits_per_sample` values used to configure the driver. See "Expected
-output" below for the exact lines.
+mean the TDM slot count/width - **the field renaming itself changed no
+values** (that came from a separate, later change - see "Experimental
+attempt: 16 x 8 slot geometry" below - which changed
+`slot_width_bits`/`requested_clocks_per_frame`/`requested_pclk_hz`'s
+actual values, not their names). `requested_clocks_per_frame`/
+`requested_pclk_hz` are computed via `configuredTdmRatio()`/
+`configuredBclkHz()` (`src/dev/si3050_clock_probe_generator_config.h`,
+natively tested) so the log can never silently drift from the actual
+`total_chan`/`bits_per_sample` values used to configure the driver. See
+"Expected output" above for the exact lines.
 
 ### Minimal alternatives for a future decision (none implemented here)
 
@@ -664,28 +778,29 @@ Per explicit instruction not to implement a workaround/approximation:
    directly. A toolchain/framework version decision, not a firmware code
    change.
 2. **Reconsider the target geometry.** *Partially resolved by "Corrected
-   premise" above*: the Si3050 does **not** require exactly 2.048 MHz/
-   8 kHz/256:1 for the PCM/SPI mode InterBridge plans to use - 1.024 MHz/
-   8 kHz/128:1 is a valid PCM/SPI-mode target per the datasheet. What
-   remains open, and could not be resolved from source in this PR (see
-   "Deeper investigation" above), is whether *this specific* ESP32-C3
-   I2S peripheral on *this specific* toolchain can be made to deliver
-   1.024 MHz/8 kHz/128:1 at all - the installed legacy driver's own
-   documented clock formula does not predict the real, confirmed
-   ~1.024 MHz/~16 kHz/~64:1 measurement even for its *current* request,
-   so no other `total_chan`/`bits_per_sample` combination computed from
-   that same formula can be trusted either without a real reflash/
-   remeasure cycle. The realistic paths are: a newer ESP-IDF >= 5.0-based
-   core (see item 1 above), a physical retest of a specific candidate
-   configuration accepting that it is unconfirmed until measured (not
-   attempted in this PR - see "Deeper investigation" above), or an
-   external clock generator/oscillator for the Si3050's PCM interface -
-   a hardware decision, out of this firmware's scope.
+   premise" above, and now being tested by "Experimental attempt: 16 x 8
+   slot geometry" above*: the Si3050 does **not** require exactly
+   2.048 MHz/8 kHz/256:1 for the PCM/SPI mode InterBridge plans to use -
+   1.024 MHz/8 kHz/128:1 is a valid PCM/SPI-mode target per the
+   datasheet, and the generator now requests exactly that geometry
+   (16 timeslots x 8 bits). Whether *this specific* ESP32-C3 I2S
+   peripheral on *this specific* toolchain actually delivers it remains
+   open until a physical retest confirms or refutes it - the installed
+   legacy driver's own documented clock formula does not predict the
+   real, confirmed ~1.024 MHz/~16 kHz/~64:1 measurement of the *previous*
+   request, so this experiment is a deliberate datasheet-grounded trial,
+   not a formula-derived prediction. If it does not reach the target on
+   real hardware, the realistic remaining paths are: a newer
+   ESP-IDF >= 5.0-based core (see item 1 above), a further bench
+   experiment with a different candidate geometry, or an external clock
+   generator/oscillator for the Si3050's PCM interface - a hardware
+   decision, out of this firmware's scope.
 
-**This PR stays as investigation and documentation.** It does not claim
-the ESP32-C3 (on this toolchain) delivers the clock the Si3050 needs, and
-it does not decide on an external oscillator or any other hardware
-change - those remain open decisions for the team.
+**This PR stays as investigation, documentation, and one explicit,
+reversible bench experiment.** It does not claim the ESP32-C3 (on this
+toolchain) delivers the clock the Si3050 needs until a physical retest
+confirms it, and it does not decide on an external oscillator or any
+other hardware change - those remain open decisions for the team.
 
 ## Tests
 
@@ -717,20 +832,20 @@ bring-up order bug" above.
 
 `test/test_si3050_clock_probe_generator_config/test_main.cpp` (6 tests,
 native, no hardware): `configuredTdmRatio()`/`configuredBclkHz()` at the
-generator's actual, unchanged requested geometry (16 channels x 16 bits
--> ratio 256, BCLK 2,048,000); at the corrected PCM/SPI-mode target
-geometry (16 timeslots x 8 bits -> ratio 128, BCLK 1,024,000 at 8 kHz -
-target math only, not a claim the generator's real I2S config was
-changed to this, since this PR could not confirm any specific geometry
-change against real hardware - see "Deeper investigation" above); and
-as pure multiplication for other inputs (including zero). These
+generator's *current, actual* requested geometry (16 channels x 8 bits
+-> ratio 128, BCLK 1,024,000 at 8 kHz - the "Experimental attempt: 16 x
+8 slot geometry" above); at the generator's *previous* geometry (16
+channels x 16 bits -> ratio 256, BCLK 2,048,000, kept as a regression
+check on the pure math, not because the generator still requests it);
+and as pure multiplication for other inputs (including zero). These
 functions compute what the generator *requests* and logs - they say
-nothing about what the hardware actually produces, and the generator
-itself is unchanged by this PR (see "Generator" above); `ratio=256`
-here is still the generator's own unmodified TDM request, not a claim
-about the Si3050's actual requirement - see "Corrected premise" and
-"Real bench observation: generator does not reach the target ratio"
-above.
+nothing about what the hardware actually produces, and this remains true
+after this PR's change: `configuredTdmRatio(16, 8) == 128` and
+`configuredBclkHz(8000, 16, 8) == 1,024,000` document the *request*, not
+a confirmed physical measurement - see "Experimental attempt: 16 x 8
+slot geometry" and "Real bench observation: generator does not reach the
+target ratio" above for what a physical retest would need to show before
+this is confirmed.
 
 Grep-verified (not itself a compiled test, since it is a structural/
 negative property): neither `si3050_clock_probe_math.{h,cpp}`,
@@ -763,37 +878,36 @@ description for the exact command and its (empty) result.
   PCM/SPI target is not yet confirmed - that requires a future bench
   test showing approximately `pclk_hz ~= 1,024,000`, `fsync_hz ~=
   8,000`, `ratio ~= 128`.**
-- **The generator was not changed in this PR** and still requests the
-  original TDM geometry (`total_chan=16`, `bits_per_sample=16`,
-  logged as `requested_clocks_per_frame=256`/`requested_pclk_hz=
-  2048000`) - see "Generator" above. This PR's deeper, source-grounded
-  investigation (see "Deeper investigation" above) found that the
-  installed legacy I2S driver's own documented clock formula does not
-  predict the real, confirmed measurement even for this *current*
-  request, so it could not determine a different `total_chan`/
-  `bits_per_sample` combination that could be trusted to reach the
-  corrected target without another physical reflash/remeasure cycle -
-  changing the generator's requested geometry on that basis would be an
-  unconfirmed approximation, which this PR does not implement. This
-  remains a follow-up decision, out of scope here.
+- **The generator now requests 16 TDM channels x 8 bits (was 16 x 16)**
+  - `requested_clocks_per_frame=128`/`requested_pclk_hz=1024000`/
+  `slot_width_bits=8` - see "Experimental attempt: 16 x 8 slot geometry"
+  above. This is a deliberate, reversible bench trial grounded directly
+  in the Si3050 datasheet's own PCM/SPI-mode PCM Highway geometry (16
+  timeslots x 8 bits), **not** a value derived from the legacy driver's
+  own clock formula (already shown unreliable - see "Deeper
+  investigation" above). **It has not yet been confirmed on real
+  hardware as of this document update** - that requires reflashing the
+  generator and measuring with the unchanged, already-validated
+  `esp32dev-si3050-clock-meter`.
 - **The meter's PCNT bring-up fix is confirmed on real hardware** (a
   physical retest with all three wires connected printed `pcnt
   configured` and reported a real, stable signal) - see "Real bench
   observation: PCNT bring-up order bug" above.
-- **The generator does not reach the corrected PCM/SPI target on real
-  hardware, confirmed by three separate physical retests** (the
-  original TDM configuration, an additional `i2s_set_clk()` adjustment
-  that was flashed twice and measured an identical, still-wrong result
-  both times - since removed from the code, and this PR's retest with
-  the meter's edge mode confirmed). The installed framework's I2S
-  driver (ESP-IDF 4.4.7-based) is confirmed, not assumed, to lack the
-  newer native TDM driver that might resolve this, and this PR further
-  confirmed that the installed driver's own clock-divider formula does
-  not predict the real measured output even for the current request -
-  see "Real bench observation: generator does not reach the target
-  ratio" above, including the alternatives left for a future team
-  decision. This PR does not claim the ESP32-C3 delivers the Si3050's
-  target clock on this toolchain.
+- **The generator's *previous* (16 x 16) geometry did not reach the
+  corrected PCM/SPI target on real hardware, confirmed by three separate
+  physical retests** (the original TDM configuration, an additional
+  `i2s_set_clk()` adjustment that was flashed twice and measured an
+  identical, still-wrong result both times - since removed from the
+  code, and a further retest with the meter's edge mode confirmed). The
+  installed framework's I2S driver (ESP-IDF 4.4.7-based) is confirmed,
+  not assumed, to lack the newer native TDM driver that might resolve
+  this, and a source-level investigation further confirmed that the
+  installed driver's own clock-divider formula does not predict the real
+  measured output even for that request - see "Real bench observation:
+  generator does not reach the target ratio" above. **Whether the new
+  16 x 8 geometry does any better is not yet known** - this PR does not
+  claim the ESP32-C3 delivers the Si3050's target clock on this
+  toolchain until a physical retest confirms it.
 - The atomic ISR-excluded sample in the meter still allows a handful of
   PCLK edges to go uncounted during the brief critical section on every
   window boundary (interrupts, including the overflow ISR, are disabled

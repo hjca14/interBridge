@@ -944,6 +944,39 @@ this pass:)*
   not present in this installed framework. The meter, production,
   DEV-MQTT, and Si3050 foundation code remain untouched; no real Si3050
   hardware has been initialized at any point.
+- **Follow-up (same PR #18, third update): an explicit, reversible bench
+  experiment on the generator.** The prior entry concluded the legacy
+  driver's clock formula couldn't reliably predict a fix, and stopped
+  short of changing the generator. This update changes it anyway - not
+  by trusting that same unreliable formula for a *derived* configuration,
+  but by requesting the Si3050 datasheet's *own* PCM/SPI-mode PCM Highway
+  geometry directly: `src/dev/si3050_clock_probe_generator_main.cpp`'s
+  `kBitsPerSample` changed from `I2S_BITS_PER_SAMPLE_16BIT` to
+  `I2S_BITS_PER_SAMPLE_8BIT` (16 TDM slots x 8 bits = 128 requested
+  clocks/frame, was 16 x 16 = 256), confirmed accepted by the installed
+  driver's own validation (`bits_per_sample % 8 == 0 && <= 32`) and by a
+  clean `pio run -e esp32-c3-si3050-clock-probe` build. `total_chan=16`,
+  `sample_rate=8000`, PCM-short format, master TX, and the GPIO0/GPIO1
+  pin routing are otherwise unchanged; `bits_per_chan` stays at its
+  driver-documented default (equal to `bits_per_sample`), and the DMA
+  buffer size comment/math were updated for the 8-bit width so no stale
+  16-bit assumption remains anywhere in the file. The generator's log
+  now reports `requested_pclk_hz=1024000`/`requested_clocks_per_frame=
+  128`/`slot_width_bits=8`. Two native tests
+  (`test_si3050_clock_probe_generator_config`) assert this new requested
+  geometry's pure math (`configuredTdmRatio(16, 8) == 128`,
+  `configuredBclkHz(8000, 16, 8) == 1,024,000`); the previous 16 x 16
+  geometry's math is kept as a separate regression-only test pair, since
+  the generator no longer requests it. **This has not been flashed or
+  measured on real hardware as of this update** - see
+  docs/si3050-clock-probe.md's "Experimental attempt: 16 x 8 slot
+  geometry" for exactly what a physical retest with the unchanged,
+  already-validated `esp32dev-si3050-clock-meter` needs to show
+  (`pclk_hz ~= 1,024,000`, `fsync_hz ~= 8,000`, `ratio ~= 128`) before
+  this can be treated as confirmed. The meter, production, DEV-MQTT, and
+  Si3050 foundation code remain untouched; no `i2s_set_clk()`, LEDC,
+  RMT, bit-banging, delays, or private registers were used; no real
+  Si3050 hardware has been initialized.
 
 ## Future Work
 
