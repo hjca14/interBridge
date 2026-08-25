@@ -1042,7 +1042,7 @@ this pass:)*
   constructor before this, so this would have been a genuine new boot
   risk without the deferred-construction fix. GPIO0/GPIO1 (the same pins
   the physical probe validated) come from the existing `si3050_pins.h`
-  source of truth - no pin was invented or guessed. 21 new native tests
+  source of truth - no pin was invented or guessed. 7 new native tests
   (`test/test_si3050_pcm_clock/`) cover the TDM geometry math, the
   configuration gate, and `Si3050PcmClockBringup`'s bring-up/rollback/
   idempotency decision logic exhaustively (success, failure at each of

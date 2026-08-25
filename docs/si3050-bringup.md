@@ -283,7 +283,7 @@ Si3050 required):
   succeeding once the fake clock is "fixed". Uses `FakePcmClock`
   throughout, so these tests are unaffected by `Esp32PcmClock` becoming a
   real implementation.
-- `test/test_si3050_pcm_clock/test_main.cpp` (21 tests): the validated
+- `test/test_si3050_pcm_clock/test_main.cpp` (27 tests): the validated
   TDM geometry's pure math (`16 x 8 = 128` clocks/frame,
   `8000 x 128 = 1,024,000` Hz); the fail-closed configuration gate
   (`si3050PcmConfigurationSupported()`) accepting the validated target and
