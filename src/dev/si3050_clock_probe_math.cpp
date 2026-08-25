@@ -15,19 +15,20 @@ double pulseFrequencyHz(uint64_t pulseEdges, uint64_t windowMicros) {
     return static_cast<double>(pulseEdges) * 1000000.0 / static_cast<double>(windowMicros);
 }
 
-double pclkToFsyncRatio(uint64_t pclkEdges, uint64_t fsyncEdges) {
-    if (fsyncEdges == 0) return 0.0;
-    return static_cast<double>(pclkEdges) / static_cast<double>(fsyncEdges);
+double pclkToFsyncRatio(uint64_t pclkRisingEdges, uint64_t fsyncRisingEdges) {
+    if (fsyncRisingEdges == 0) return 0.0;
+    return static_cast<double>(pclkRisingEdges) / static_cast<double>(fsyncRisingEdges);
 }
 
-ClockProbeWindowResult computeClockProbeWindowResult(uint64_t windowMicros, uint64_t pclkEdges, uint64_t fsyncEdges) {
+ClockProbeWindowResult computeClockProbeWindowResult(uint64_t windowMicros, uint64_t pclkRisingEdges,
+                                                      uint64_t fsyncRisingEdges) {
     ClockProbeWindowResult result;
     result.windowMicros = windowMicros;
-    result.pclkEdges = pclkEdges;
-    result.fsyncEdges = fsyncEdges;
-    result.pclkHz = pulseFrequencyHz(pclkEdges, windowMicros);
-    result.fsyncHz = pulseFrequencyHz(fsyncEdges, windowMicros);
-    result.ratio = pclkToFsyncRatio(pclkEdges, fsyncEdges);
+    result.pclkRisingEdges = pclkRisingEdges;
+    result.fsyncRisingEdges = fsyncRisingEdges;
+    result.pclkHz = pulseFrequencyHz(pclkRisingEdges, windowMicros);
+    result.fsyncHz = pulseFrequencyHz(fsyncRisingEdges, windowMicros);
+    result.ratio = pclkToFsyncRatio(pclkRisingEdges, fsyncRisingEdges);
     return result;
 }
 

@@ -23,6 +23,19 @@ namespace interbridge {
 // instead of being duplicated as a second magic number.
 constexpr int32_t kClockProbePcntHighLimit = 30000;
 
+// The Si3050's PCM/SPI-mode clock target - the mode InterBridge actually
+// plans to use (SPI for control, PCM for audio), per the datasheet's
+// Clock Generation and PCM Highway sections: PCLK must be synchronous to
+// an 8 kHz FSYNC, and 1.024 MHz is a valid PCLK rate in this mode
+// (1,024,000 / 8,000 = 128 PCLK cycles per frame = 16 timeslots of 8
+// bits). This is NOT the same as the Si3050's GCI mode, which requires
+// PCLK = 2.048 or 4.096 MHz and multiplexes control with data on the same
+// highway - GCI is not the mode InterBridge plans to use. See
+// docs/si3050-clock-probe.md for the full distinction.
+constexpr uint32_t kPcmSpiTargetPclkHz = 1024000;
+constexpr uint32_t kPcmSpiTargetFsyncHz = 8000;
+constexpr uint32_t kPcmSpiTargetRatio = 128;
+
 // Combines a hardware pulse counter's periodic overflow count with its
 // current raw value into a single, unbounded pulse total since the last
 // reset.
@@ -45,25 +58,30 @@ uint64_t combinePulseCount(uint32_t overflowCount, int32_t rawCount, int32_t hLi
 // zero) - a degenerate window, never a valid measurement.
 double pulseFrequencyHz(uint64_t pulseEdges, uint64_t windowMicros);
 
-// PCLK:FSYNC ratio for edge counts taken over the same window - computed
-// directly from the two edge counts (not from two already-rounded
-// frequencies), so it is exact regardless of window duration or jitter
-// in when the window boundary was sampled. Returns 0.0 if fsyncEdges is
-// 0 (would otherwise divide by zero).
-double pclkToFsyncRatio(uint64_t pclkEdges, uint64_t fsyncEdges);
+// PCLK:FSYNC ratio for rising-edge counts taken over the same window -
+// computed directly from the two edge counts (not from two already-
+// rounded frequencies), so it is exact regardless of window duration or
+// jitter in when the window boundary was sampled. Returns 0.0 if
+// fsyncRisingEdges is 0 (would otherwise divide by zero). Both counts
+// must be rising-edge-only counts (see the meter's PCNT configuration,
+// pos_mode=PCNT_COUNT_INC/neg_mode=PCNT_COUNT_DIS on both units) -
+// counting both edges of either signal would silently double it.
+double pclkToFsyncRatio(uint64_t pclkRisingEdges, uint64_t fsyncRisingEdges);
 
 // One reporting window's full result, as printed by the meter firmware
-// roughly once per second.
+// roughly once per second. The edge counts are rising-edge-only (see
+// pclkToFsyncRatio() above) - never a count of both edges.
 struct ClockProbeWindowResult {
     uint64_t windowMicros = 0;
-    uint64_t pclkEdges = 0;
-    uint64_t fsyncEdges = 0;
+    uint64_t pclkRisingEdges = 0;
+    uint64_t fsyncRisingEdges = 0;
     double pclkHz = 0.0;
     double fsyncHz = 0.0;
     double ratio = 0.0;
 };
 
-ClockProbeWindowResult computeClockProbeWindowResult(uint64_t windowMicros, uint64_t pclkEdges, uint64_t fsyncEdges);
+ClockProbeWindowResult computeClockProbeWindowResult(uint64_t windowMicros, uint64_t pclkRisingEdges,
+                                                      uint64_t fsyncRisingEdges);
 
 // Running minimum/maximum tracker for one bench session's worth of
 // per-window measurements (pclkHz, fsyncHz, or ratio, tracked

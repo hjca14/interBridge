@@ -867,6 +867,42 @@ this pass:)*
   team decision. **This PR stays as investigation/documentation - it does
   not claim the ESP32-C3 delivers the Si3050's target clock on this
   toolchain, and does not decide on an external oscillator.**
+- **Follow-up correction (same Phase 3B.1 experiment): the "2.048 MHz/
+  8 kHz/256" target used throughout the entries above was wrong.** A
+  full read of the Si3050 datasheet's Clock Generation and PCM Highway
+  sections (Section 5.31, "Communication Interface Mode Selection")
+  shows the part has two distinct modes: **GCI mode**, which does
+  require PCLK = 2.048 or 4.096 MHz and multiplexes control with data;
+  and **PCM/SPI mode** (SPI for control, PCM for audio - the mode
+  InterBridge plans to use), where **PCLK = 1.024 MHz is a valid rate**
+  (1,024,000 / 8,000 = 128 PCLK cycles/frame = 16 timeslots of 8 bits).
+  The corrected target for this probe is therefore `PCLK ~= 1.024 MHz`/
+  `FSYNC ~= 8 kHz`/`ratio ~= 128`, not 2.048 MHz/256. Separately, a
+  hypothesis that the meter's ~16 kHz FSYNC reading (from the retest
+  above) was a PCNT double-edge-counting artifact was checked against
+  the actual code in `src/dev/si3050_clock_probe_meter_main.cpp` and
+  found **not** to hold: both the PCLK and FSYNC PCNT units are
+  configured by the same `configurePcntUnit()` function
+  (`pos_mode=PCNT_COUNT_INC`/`neg_mode=PCNT_COUNT_DIS` on both), so both
+  already counted rising edges only, before and after this change. This
+  change renames the meter's log/struct fields for clarity
+  (`pclk_edges`/`fsync_edges` -> `pclk_rising_edges`/
+  `fsync_rising_edges`), adds a boot-time line stating the configured
+  edge mode explicitly, adds `kPcmSpiTargetPclkHz`/
+  `kPcmSpiTargetFsyncHz`/`kPcmSpiTargetRatio` constants and matching
+  native tests in `src/dev/si3050_clock_probe_math.{h,cpp}`, and
+  corrects this document plus docs/si3050-clock-probe.md and README.md.
+  **It does not change the meter's PCNT edge configuration, the
+  generator, or any production/Si3050Controller/DEV-MQTT code, and no
+  real Si3050 hardware has been initialized at any point.** The ~16 kHz
+  FSYNC reading remains unexplained and requires a fresh physical
+  retest against the corrected target before clock compatibility can be
+  marked as physically confirmed - see docs/si3050-clock-probe.md's
+  "Corrected premise" and "Real bench observation: meter edge
+  configuration re-examined" sections. This supersedes the abandoned
+  PR #17 (which pursued an ESP-IDF 5/native TDM driver environment based
+  on the same wrong 2.048 MHz/256 premise); PR #17 was closed without
+  merge and none of its changes are included here.
 
 ## Future Work
 
