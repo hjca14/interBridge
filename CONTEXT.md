@@ -1063,6 +1063,66 @@ this pass:)*
   result remains unchanged, as do Wi-Fi/BLE/MQTT/AWS/provisioning/reconnection, the
   clock probe environments (kept as bench regression), and PR #17's IDF5
   approach (not reintroduced).
+- **Phase 3B.8: bench-only DEV physical ring simulator added** (a
+  momentary button on the ESP32-C3 publishes a real `RING_DETECTED`
+  `DeviceEvent` through the existing production AWS IoT Basic Ingest
+  pipeline, for bench-testing the downstream notification pipeline
+  without a real Si3050/intercom line - see `docs/dev-ring-simulator.md`
+  and `docs/roadmap-3b.md`). A new isolated environment,
+  `esp32-c3-dev-ring-simulator`, gated behind
+  `INTERBRIDGE_DEV_RING_SIMULATOR`, mutually exclusive (via
+  `build_src_filter`) with `esp32-c3`, `esp32-c3-dev-mqtt`, and both
+  Si3050 clock probe environments. It reuses `DevMqttSmokeState`
+  (`src/dev/mqtt_smoke_state.*`, already bench-validated - see
+  `docs/mqtt-dev-smoke-test.md`) for Wi-Fi/DNS/NTP/MQTT connectivity
+  bring-up rather than duplicating it, and publishes exclusively through
+  `MqttTopics::eventsIngest()` + `Esp32AwsIotTransport` +
+  `MemoryEventOutbox` (the same production `IEventOutbox`
+  contract) - no second MQTT client, no parallel topic. Two new
+  hardware-independent, natively-tested classes: `DevRingButtonController`
+  (`src/dev/dev_ring_button.*` - debounces a momentary button and emits a
+  one-shot "ring requested" pulse only on the released-to-pressed edge,
+  never while held, with an additional short post-event lockout against
+  contact-bounce bursts) and `DevRingEventCoordinator` +
+  `publishPendingEvents()` (`src/dev/dev_ring_event.*` - builds the
+  `DeviceEvent`/`event_id` and enqueues it, then drains the outbox against
+  the transport exactly like `main.cpp`'s `updateNetwork()` loop, so a
+  retry or an offline press never regenerates the `event_id`/payload).
+  Never touches the real Si3050 driver stack, `RingDetector`, PCM clock,
+  provisioning, BLE, or production Wi-Fi/AWS credentials/composition -
+  `main.cpp` is completely excluded from this environment's build.
+  GPIO20 was chosen for the button (`src/dev/dev_ring_simulator_config.h`,
+  with compile-time `static_assert`s against colliding with any real
+  Si3050/BOOT/USB pin): the validated bench board only exposes 15 GPIOs
+  total, and GPIO0-8/10/9/18/19 are already committed to
+  Si3050/BOOT/USB - GPIO20 is a **documentation-reserved-only, currently
+  unimplemented** pin (`kSi3050ReservedPinButton`; `Esp32ButtonInput` has
+  no real GPIO wired in any code path yet), and its reuse here is an
+  explicit, user-approved, DEV-only-scoped decision, not a silent
+  conflict - see `docs/dev-ring-simulator.md` for the full pin-budget
+  rationale and why this must be revisited once the Si3050 and the final
+  board (with its real config/reset button) are integrated together. 11
+  new native tests across `test/test_dev_ring_button` and
+  `test/test_dev_ring_event` (one press → exactly one event; bounce/hold
+  produce no duplicates; release+press yields a new, different
+  `event_id`; a failed-then-retried publish preserves the same
+  `event_id`/payload; an offline press enqueues and a reconnect replays
+  it; JSON stays contract-compatible). Validated for real in this pass
+  (not just claimed): `pio run` actually succeeded (real PlatformIO +
+  espressif32/riscv32-esp toolchain were available in this session) for
+  `esp32-c3`, `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`,
+  `esp32-c3-si3050-clock-probe`, and `esp32dev-si3050-clock-meter` - all
+  five compiled cleanly with `platformio.ini` only gaining one new
+  exclusion line per pre-existing environment, confirming no other build
+  was altered. Native tests were also genuinely compiled **and executed**
+  this pass via a locally available MSVC (VS 2022 Build Tools, `cl.exe`)
+  against the real ArduinoJson v7/Unity sources already fetched into
+  `.pio/libdeps/native` - all 38 native suites (295 assertions) passed,
+  0 failed. **Not yet validated on real hardware** - no board has been
+  flashed, no physical button wired, and the offline/reconnect replay and
+  AWS IoT delivery have only been exercised through native fakes
+  (`FakeDevRingButtonInput`, `FakeDeviceTransport`) - see
+  `docs/dev-ring-simulator.md` > Honest status.
 
 ## Future Work
 

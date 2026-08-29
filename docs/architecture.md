@@ -319,9 +319,10 @@ Two PlatformIO environments exist:
   45 `.cpp` files) together with Unity tests under `test/` (32 suites),
   using the host's own C++ compiler.
 
-`main.cpp`, `dev/mqtt_smoke_main.cpp`, and `network/wifi.cpp` are excluded
-from the `native` build (via `build_src_filter` in `platformio.ini`)
-because they include Arduino-only headers unconditionally. Every other
+`main.cpp`, `dev/mqtt_smoke_main.cpp`, `dev/dev_ring_simulator_main.cpp`,
+and `network/wifi.cpp` are excluded from the `native` build (via
+`build_src_filter` in `platformio.ini`) because they include Arduino-only
+headers unconditionally. Every other
 file - including
 `hardware/clock.cpp`, `hardware/button.cpp`, `hardware/system_control.cpp`,
 `core/random_id.cpp`, and `hardware/gpio.cpp` - compiles natively because
@@ -419,6 +420,25 @@ hardware and system-control dependencies are explicitly non-actuating. Ignored D
 credentials live only in a transient `MemoryStore`; this is not reboot persistence.
 Production NVS, BLE/Fleet Provisioning, and onboarding remain pending.
 
+## DEV physical ring simulator isolation (Phase 3B.8)
+
+`src/dev/dev_ring_simulator_main.cpp` is compiled only by
+`esp32-c3-dev-ring-simulator`, gated behind
+`INTERBRIDGE_DEV_RING_SIMULATOR`; it is excluded from `esp32-c3`,
+`esp32-c3-dev-mqtt`, and both Si3050 clock probe environments, and none of
+those are linked into it. It reuses `DevMqttSmokeState` for connectivity
+bring-up (same Wi-Fi → DNS → NTP → MQTT cascade as the DEV MQTT smoke
+harness above) instead of duplicating it. Two hardware-independent,
+natively-tested classes carry the actual bench logic:
+`DevRingButtonController` (`src/dev/dev_ring_button.*`) debounces the
+physical button and emits a one-shot pulse only on the released-to-pressed
+edge; `DevRingEventCoordinator` + `publishPendingEvents()`
+(`src/dev/dev_ring_event.*`) turn that pulse into a `RING_DETECTED`
+`DeviceEvent`, enqueue it into a `MemoryEventOutbox`, and drain that
+outbox against `Esp32AwsIotTransport`/`MqttTopics::eventsIngest()` exactly
+like `main.cpp`'s production outbox loop - the same `event_id` survives
+any retry or offline period. See `docs/dev-ring-simulator.md` for the
+wiring, GPIO rationale, and manual test procedure.
 
 ## MQTT/mTLS command lifecycle (Phase 2D)
 

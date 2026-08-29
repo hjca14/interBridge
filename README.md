@@ -58,7 +58,7 @@ the full device/cloud protocol specification.
 src/         Firmware source: core, hardware, intercom, audio, storage,
              provisioning, network, protocol, aws, ota.
 include/     Reserved for shared public headers (unused so far).
-test/        Native unit tests (Unity), one PlatformIO test per directory (33 suites).
+test/        Native unit tests (Unity), one PlatformIO test per directory (38 suites).
 docs/        Architecture documentation and the communication protocol spec.
 platformio.ini
 CONTEXT.md   Operational memory of the project — read this first.
@@ -86,14 +86,14 @@ pio device monitor -b 115200
 ## Running tests
 
 ```bash
-# Run all native unit tests (33 suites: state machine, events, intercom,
+# Run all native unit tests (38 suites: state machine, events, intercom,
 # MQTT topics, command parsing/handling/dedup, event outbox, reconnect
 # backoff, button, device identity, persistent storage, Device Shadow,
 # AWS IoT Jobs, OTA, health telemetry, provisioning (BLE-first onboarding
 # state machine), BLE advertisement/security mode, status indicator,
 # Fleet Provisioning, factory reset, MQTT transport, DEV MQTT smoke
 # state, Si3050 bring-up controller, Si3050 ring detector, Si3050 clock
-# probe math, ...)
+# probe math, DEV ring simulator button/event (Phase 3B.8), ...)
 pio test -e native
 ```
 
@@ -149,6 +149,25 @@ recovery cascade (the state machine now waits for a real disconnect signal
 before re-associating, instead of possibly resuming DNS/MQTT over the stale
 association) - see [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)'s
 "Follow-up fix" subsection.
+
+## DEV physical ring simulator (Phase 3B.8)
+
+A separate `esp32-c3-dev-ring-simulator` PlatformIO environment lets a
+momentary button (GPIO20, `INPUT_PULLUP`, wired to GND - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md)) publish a real
+`RING_DETECTED` `DeviceEvent` through the exact same AWS IoT Basic Ingest
+pipeline production uses, so the downstream notification pipeline can be
+bench-tested without a real Si3050/intercom line. It reuses the DEV MQTT
+smoke environment's connectivity state machine and the existing
+`MqttTopics`/`Esp32AwsIotTransport`/`IEventOutbox` contract rather than
+inventing a new one, and never touches the real Si3050 driver stack,
+provisioning, BLE, or production Wi-Fi/AWS composition. Implemented and
+compiled (native tests pass, all PlatformIO environments still build);
+**not yet validated on real hardware** - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) for the wiring
+diagram, GPIO rationale, and manual test procedure, and
+[docs/roadmap-3b.md](docs/roadmap-3b.md) for how this fits with the rest
+of the (cross-repo) ring-notification pipeline.
 
 ## Si3050/Si3011-19 firmware foundation (Phase 3A + 3B.2 PCM clock)
 
