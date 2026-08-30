@@ -188,40 +188,59 @@ This phase only makes the **firmware** publish a real `RING_DETECTED`
 event. Turning that into a phone notification requires the rest of the
 pipeline, tracked separately (see `docs/roadmap-3b.md`):
 
-- **Phase 3B.6** (backend FCM sender): a backend service must still
-  subscribe/route this AWS IoT Basic Ingest event and call FCM to deliver
-  a push notification. Nothing in this phase implements that - no FCM,
-  HTTP, or direct Firebase integration exists in this firmware, by
-  design.
-- **Phase 3B.7** (notification preference application): the backend must
-  still apply the user's/app's notification preferences before deciding
-  whether/how to notify.
+- **Phase 3B.6** (backend FCM sender): `telemetry_ingestion` invokes
+  `push_sender`, which delivers the push notification via Firebase Cloud
+  Messaging. **Implemented and deployed in DEV** - the backend has
+  accepted a real event end-to-end and recorded `Sent=1` for it.
+- **Phase 3B.7** (notification preference application): the backend
+  applies the user's/app's notification preferences before deciding
+  whether/how to notify. **Implemented and deployed in DEV.**
 
-Without 3B.6/3B.7, this simulator only proves the firmware→AWS IoT leg;
-no phone notification will actually arrive from pressing the button.
+With 3B.6/3B.7 now deployed, this simulator's remaining, un-closed gap is
+the **firmware side of the loop**: no real button on real hardware has
+yet triggered that pipeline. The `Sent=1` confirmation above came from a
+backend/synthetic test event, not from a physical press on a flashed
+board - see Honest status below. The minimal slice of **Phase 3B.9**
+needed to actually display a data-only FCM notification on Android is in
+progress (mobile repo); the full call UI is separate future work.
 
 ## Honest status
 
-**Implemented and compiled, not yet validated on real hardware.**
+**Implemented and compiled. Native tests pass locally; this update also
+fixes two real defects found by CI on the previous commit (a dangling
+reference into a temporary `std::vector` returned by
+`IEventOutbox::pending()`, and test helpers that drove
+`DevRingButtonController` directly instead of through
+`DevRingEventCoordinator::update()`, silently skipping the outbox enqueue
+and then calling `.back()` on an empty container - see
+`test/test_dev_ring_event/test_main.cpp`). Whether this fix is actually
+green on GitHub Actions CI must be confirmed by that run itself - this
+document does not assert a passing CI result on its own.**
 
 - Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
-  pass: one press → exactly one `RING_DETECTED`; bounce/hold produce no
-  duplicates; release+press produces a new event with a different
-  `event_id`; a failed publish attempt followed by a retry preserves the
-  same `event_id` and payload; an offline press enqueues and a later
-  reconnect replays it; the JSON stays contract-compatible.
+  cover: one press → exactly one `RING_DETECTED`; holding the button
+  never repeats; releasing and pressing again yields a new, different
+  `event_id`; `event_id` matches `^evt-[0-9a-f]{32}$`; a failed publish
+  attempt followed by a retry preserves the exact same `event_id` and
+  payload; an offline press enqueues and a later reconnect replays it;
+  `timestamp` is only present when the clock is valid; the JSON stays
+  contract-compatible. All device-id fixtures used in these assertions
+  are themselves asserted valid against the real `isValidDeviceId()`
+  contract (`ib-` + exactly 32 lowercase hex chars) rather than using an
+  arbitrary placeholder string.
 - `pio run -e esp32-c3-dev-ring-simulator` compiles successfully, with no
   new warnings.
 - `pio run -e esp32-c3`, `pio run -e esp32-c3-dev-mqtt`,
   `pio run -e esp32-c3-si3050-clock-probe`, and
   `pio run -e esp32dev-si3050-clock-meter` all still compile successfully
-  and are byte-for-byte unaffected in source (only `platformio.ini`
-  gained one new exclusion line per environment to keep
-  `dev_ring_simulator_main.cpp` out of them) - confirming this DEV-only
-  addition does not alter any other build.
+  and are unaffected in source (only `platformio.ini` gained one new
+  exclusion line per environment to keep `dev_ring_simulator_main.cpp`
+  out of them) - confirming this DEV-only addition does not alter any
+  other build.
 - **Not yet done**: flashing a real board, wiring the physical button,
   and running the manual procedure above. GPIO20's electrical behavior
   under `INPUT_PULLUP` on this specific module, the end-to-end AWS IoT
   delivery, and the offline/reconnect replay have only been exercised
   through native fakes (`FakeDevRingButtonInput`, `FakeDeviceTransport`),
-  not real hardware.
+  not real hardware - this is true even though 3B.6/3B.7 are now deployed
+  in DEV, since neither of those exercised a real physical button.

@@ -1123,6 +1123,37 @@ this pass:)*
   AWS IoT delivery have only been exercised through native fakes
   (`FakeDevRingButtonInput`, `FakeDeviceTransport`) - see
   `docs/dev-ring-simulator.md` > Honest status.
+- **Follow-up fix (same Phase 3B.8 work, before merge): GitHub Actions CI
+  caught two real defects in `test/test_dev_ring_event/test_main.cpp`
+  that this session's local MSVC run had not caught.** (1) A dangling
+  reference: `const std::string& json = outbox.pending()[0].eventJson;`
+  bound a reference into the internal storage of a `std::vector`
+  temporary returned **by value** from `IEventOutbox::pending()`; that
+  temporary is destroyed at the end of its own full expression, and
+  MSVC/glibc happened to disagree on how visibly that use-after-free
+  manifested (MSVC silently tolerated it; libstdc++ on the Ubuntu CI
+  runner did not). Fixed by storing the returned vector in a real local
+  variable (`auto pending = outbox.pending();`) before indexing into it,
+  everywhere the test does so. (2) The `press()`/`release()` test helpers
+  called `DevRingButtonController::update()` directly instead of going
+  through `DevRingEventCoordinator::update()` - the coordinator (which
+  owns the actual enqueue-into-outbox logic) never saw those presses at
+  all, so `outbox.pending().back()` was called against an **empty**
+  outbox, which is undefined behavior for `std::deque` and is what
+  actually produced CI's crash. Fixed by rewriting both helpers to drive
+  `coordinator.update()` (the same path the real firmware loop uses)
+  instead of the underlying button controller. While fixing this, the
+  suite was also reworked per review to (a) use only `ib-`+32-lowercase-
+  hex device-id fixtures, asserted valid against the real
+  `isValidDeviceId()` (`provisioning/device_identity.h`) rather than
+  arbitrary placeholder strings like the previous `ib-test-device`/`ib-x`,
+  and (b) add an explicit `event_id` format assertion
+  (`^evt-[0-9a-f]{32}$`) alongside the existing uniqueness/retry/offline-
+  replay/timestamp-gating coverage. Re-validated locally (MSVC, all 38
+  native suites) and by rebuilding all five embedded environments
+  unchanged; **the authoritative confirmation is the next GitHub Actions
+  run on this branch**, not this local run - see the PR for that run's
+  actual result.
 
 ## Future Work
 

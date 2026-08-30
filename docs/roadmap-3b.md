@@ -13,19 +13,23 @@ those files for the full record of 3B.1-3B.2.
 | 3B.1 | Si3050 clock probe bench experiment (PCLK/FSYNC generation + measurement on isolated hardware) | `interBridge` | Done - see `docs/si3050-clock-probe.md` |
 | 3B.2 | Real `Esp32PcmClock` PCM clock generation, integrated into normal firmware | `interBridge` | Done - see `docs/si3050-bringup.md` |
 | 3B.3-3B.5 | Not tracked in this repository/document | - | Out of scope here |
-| 3B.6 | Backend FCM sender: subscribe to `RING_DETECTED` (and related) Basic Ingest events and deliver a push notification via Firebase Cloud Messaging | Backend repo | Not started (not in this repo) |
-| 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | Not started (not in this repo) |
-| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; not yet validated on real hardware - see `docs/dev-ring-simulator.md`** |
-| 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | Not started (not in this repo) |
+| 3B.6 | Backend FCM sender: `telemetry_ingestion` invokes `push_sender`, which delivers a push notification via Firebase Cloud Messaging for `RING_DETECTED` (and related) Basic Ingest events | Backend repo | **Implemented and deployed in DEV** - the backend has accepted a real event end-to-end and recorded `Sent=1` for it |
+| 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | **Implemented and deployed in DEV** |
+| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; still not validated on real hardware - a physical button has not yet been wired and pressed on a flashed board. See `docs/dev-ring-simulator.md` > Honest status.** |
+| 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal slice (displaying a data-only FCM notification) is underway; the full call UI is not started |
 | 3B.10 | iOS/APNs call/notification experience for an incoming ring | Mobile (iOS) repo | Not started (not in this repo) |
 
 ## Notes
 
-- 3B.8 (this repo's contribution) only proves the firmware→AWS IoT leg of
-  the pipeline. It has no dependency on 3B.9/3B.10, but a phone
-  notification will not actually be delivered end-to-end until 3B.6 and
-  3B.7 exist on the backend - see `docs/dev-ring-simulator.md` >
-  "Dependency on Phases 3B.6/3B.7".
+- With 3B.6/3B.7 now deployed in DEV, 3B.8 is the remaining unvalidated
+  link in the chain: a real button press on real hardware has not yet
+  been exercised, so end-to-end delivery of a *physically triggered*
+  notification has not been observed - only synthetic/backend-originated
+  test events have been confirmed accepted (`Sent=1`). Do not describe
+  3B.8 as validated, or the pipeline as proven end-to-end from a real
+  button, until that hardware test actually happens - see
+  `docs/dev-ring-simulator.md` > "Dependency on Phases 3B.6/3B.7" and >
+  Honest status.
 - Historical firmware phase numbers (3B.1, 3B.2, and all non-3B phases
   elsewhere in `CONTEXT.md`) are never renumbered by this document - it
   only adds the 3B.6-3B.10 continuation for cross-repo tracking.
