@@ -127,9 +127,26 @@ const char* wifiDisconnectReasonName(uint8_t reason) {
     }
 }
 
+// Set only from the Wi-Fi event callback below (which the ESP32 Arduino
+// core runs on its own Wi-Fi/event task, not the main loop task) and
+// consumed only from loop() via drainWifiEventSignals(). Forwarding a real
+// connected/got_ip/disconnected outcome into DevMqttSmokeState is a state
+// transition, and doing that directly from a different task than the one
+// that owns/reads DevMqttSmokeState everywhere else would be a genuine
+// concurrency hazard - so the callback only ever records this minimal
+// signal (a plain flag, never a compound operation), and the actual
+// wifiAssociationResult() call happens synchronously from the ordinary,
+// single-threaded main loop instead. The sanitized disconnect reason code
+// is still logged immediately, synchronously, inside the callback itself
+// (as before) purely for diagnostics - it never needs to reach the state
+// machine.
+volatile bool wifiAssociatedEventPending = false;
+volatile bool wifiDisconnectedEventPending = false;
+
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
         const uint8_t reason = info.wifi_sta_disconnected.reason;
+        wifiDisconnectedEventPending = true;
         const char* name = wifiDisconnectReasonName(reason);
         if (name) {
             Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u (%s)\n",
@@ -139,9 +156,27 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
                           static_cast<unsigned>(reason));
         }
     } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+        wifiAssociatedEventPending = true;
         Serial.println("[DEV MQTT] wifi event=connected");
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        wifiAssociatedEventPending = true;
         Serial.println("[DEV MQTT] wifi event=got_ip");
+    }
+}
+
+// Drains whatever the event callback recorded above and forwards it as an
+// explicit, synchronous DevMqttSmokeState::wifiAssociationResult() call -
+// called once per loop() iteration, before connectivity.update(), so a
+// resolved attempt is reflected before the state machine decides its next
+// action for this tick.
+void drainWifiEventSignals(uint32_t now) {
+    if (wifiAssociatedEventPending) {
+        wifiAssociatedEventPending = false;
+        connectivity.wifiAssociationResult(now, true);
+    }
+    if (wifiDisconnectedEventPending) {
+        wifiDisconnectedEventPending = false;
+        connectivity.wifiAssociationResult(now, false);
     }
 }
 
@@ -265,6 +300,7 @@ void loop() {
     }
     if (!transport.isConnected()) subscribed = false;
 
+    drainWifiEventSignals(now);
     const DevSmokeAction action = connectivity.update(
         now, wifiConnected, clockSource.hasValidTime(), transport.isConnected());
     if (connectivity.state() != lastLoggedState) {

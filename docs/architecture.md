@@ -443,11 +443,31 @@ wiring, GPIO rationale, and manual test procedure.
 `dev_ring_simulator_main.cpp`'s Wi-Fi event handler (`onWifiEvent()`),
 per-`DevSmokeAction` log lines, and boot diagnostics
 (`resetReasonName()`) are a deliberate line-for-line duplication of
-`mqtt_smoke_main.cpp`'s own real-hardware-validated logging pattern
-(added after a first real bench boot associated to neither, with no
-diagnostic to explain why - see `docs/dev-ring-simulator.md` > "Real
-bench observation: first boot never associated with Wi-Fi"), not a new
-mechanism. `mqtt_smoke_main.cpp` itself was not modified.
+`mqtt_smoke_main.cpp`'s own logging pattern (added after a first real
+bench boot associated on neither DEV environment, with no diagnostic to
+explain why - see `docs/dev-ring-simulator.md` > "Real bench observation:
+first boot never associated with Wi-Fi"), not a new mechanism.
+
+A subsequent hardware retest with that logging in place showed
+`esp32-c3-dev-ring-simulator` and `esp32-c3-dev-mqtt` failing Wi-Fi
+association identically, exposing a real defect in the shared
+`DevMqttSmokeState` coordinator itself: it authorized reissuing
+`WiFi.begin()` based purely on `!wifiConnected` and an elapsed backoff
+timer, with no way to tell a still-in-progress association attempt apart
+from one that had already given up - which the ESP32 Wi-Fi driver
+punishes by rejecting (and restarting) any `WiFi.begin()` issued while a
+previous attempt is still outstanding. `DevMqttSmokeState` now tracks a
+Wi-Fi association attempt in flight, the same way it already did for NTP,
+resolved only by an explicit `wifiAssociationResult()` call or its own
+separate timeout - see `docs/dev-ring-simulator.md` > "Real bench
+observation: retest reveals a shared concurrent-retry defect" for the
+full mechanism. **This is the one place `mqtt_smoke_main.cpp` was
+modified for Phase 3B.8**: both it and `dev_ring_simulator_main.cpp` now
+forward real Wi-Fi connected/got_ip/disconnected events into the shared
+coordinator (via a minimal signal recorded in the event callback and
+consumed once per `loop()` iteration, to avoid mutating shared state from
+a different task) - the state-machine fix itself lives in exactly one
+place, `mqtt_smoke_state.*`, never duplicated between the two mains.
 
 ## MQTT/mTLS command lifecycle (Phase 2D)
 

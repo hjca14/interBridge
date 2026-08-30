@@ -1158,9 +1158,12 @@ this pass:)*
   real-hardware boot of `esp32-c3-dev-ring-simulator` did not associate
   to Wi-Fi within 120s** (`[DEV RING] local_status=wifi wifi=down
   time=pending mqtt=down outbox_size=0 uptime_s=120`, repeated at every
-  heartbeat), on the same board/network/credentials `esp32-c3-dev-mqtt`
-  already connects successfully with - ruling out SSID/password/network
-  as the explanation. A line-by-line comparison against
+  heartbeat), on the same board/network `esp32-c3-dev-mqtt` was also being
+  tested against, which was assumed at the time to already connect
+  successfully - **this assumption was wrong, see the next follow-up
+  entry below: a retest found `esp32-c3-dev-mqtt` had not actually been
+  re-confirmed on this exact bring-up path, and SSID/password/network are
+  not actually ruled out.** A line-by-line comparison against
   `mqtt_smoke_main.cpp` found the connectivity **logic** already
   equivalent: both drive the identical `DevMqttSmokeState` state machine,
   call `WiFi.mode(WIFI_STA)` + `WiFi.begin()` only on its `ConnectWifi`
@@ -1190,6 +1193,79 @@ this pass:)*
   changing `previous_reset=` value) - **still not validated on real
   hardware**; button behavior, MQTT connectivity, and end-to-end delivery
   from a real press remain unexercised on hardware.
+- **Follow-up fix (same Phase 3B.8 work, before merge): the hardware
+  retest with the diagnostics above revealed a real, shared coordination
+  defect, not just a missing-observability problem.** Both
+  `esp32-c3-dev-ring-simulator` and `esp32-c3-dev-mqtt` showed the
+  identical Wi-Fi association failure on the same session
+  (`wifi event=disconnected reason=2`, `reason=202`, `Wi-Fi connect
+  requested; ... delay_ms=16000`), and `esp32-c3-dev-mqtt`'s own serial
+  log additionally showed `wifi:sta is connecting, return error` /
+  `WiFiSTA.cpp begin(): connect failed!` - meaning **`esp32-c3-dev-mqtt`
+  had never actually been re-confirmed working on this exact bring-up
+  path**; the previous entry's "already connects successfully" framing
+  was wrong, carried over from an earlier, separate bench session. The
+  root cause: `DevMqttSmokeState` (`src/dev/mqtt_smoke_state.*`, shared by
+  both DEV mains) modeled DNS/NTP/MQTT attempts as asynchronous
+  ("in-flight" until an explicit result or timeout) but treated Wi-Fi
+  association as if `!wifiConnected` alone authorized a retry once the
+  ordinary backoff elapsed - with no way to distinguish "still
+  associating" from "gave up." The ESP32 Wi-Fi driver actively rejects
+  (and effectively restarts) a `WiFi.begin()` call issued while a previous
+  attempt is still outstanding, which is exactly what the observed driver
+  log lines show, and which a short-enough backoff could trigger on both
+  DEV environments identically, since they share this one coordinator.
+  Fixed by giving `DevMqttSmokeState` the same in-flight tracking NTP
+  already has for Wi-Fi association: `ConnectWifi` is never reissued while
+  `wifiAttemptInFlight()` is true; the attempt resolves only via an
+  explicit `wifiAssociationResult(nowMs, success)` call (forwarded from a
+  real `ARDUINO_EVENT_WIFI_STA_CONNECTED`/`GOT_IP`/`DISCONNECTED` event) or
+  a new, separate, configurable `wifiAssociationTimeoutMs` (default
+  15000ms, appended as the constructor's last parameter so no existing
+  positional call site broke); a failure or timeout schedules the next
+  backoff-governed retry at resolution time, not at the moment
+  `ConnectWifi` was originally issued. Both `mqtt_smoke_main.cpp` and
+  `dev_ring_simulator_main.cpp` now record the real Wi-Fi event as a
+  minimal `volatile` flag inside `onWifiEvent()` (which the ESP32 Arduino
+  core runs on its own Wi-Fi/event task) and only turn it into an actual
+  `wifiAssociationResult()` call from their own single-threaded `loop()`
+  (`drainWifiEventSignals()`, called once per iteration before
+  `connectivity.update()`) - never mutating the shared state machine
+  directly from the event callback, which would have been a real
+  concurrency hazard. The state-machine fix itself lives in exactly one
+  place (`mqtt_smoke_state.*`); only this small amount of Arduino-main
+  event-forwarding glue is necessarily duplicated per entry point, same as
+  `stateName()`/`safeStatus()`/`NtpClock` already were. 7 new native tests
+  in `test/test_dev_mqtt_state` (23 total in that suite now): `ConnectWifi`
+  issued exactly once and never reissued by rapid updates while pending;
+  an explicit success ends the attempt and the ordinary cascade still
+  advances normally; an explicit failure ends the attempt and schedules
+  the next retry no earlier than its own backoff deadline; a stuck attempt
+  with no event at all is abandoned by its own timeout and allows a later
+  retry; that timeout is wraparound-safe; the existing `RecoverWifi`
+  ladder's own reconnect attempt is equally protected from reissue; and a
+  burst of repeated failure signals for the same attempt never causes more
+  than one `WiFi.begin()`. One pre-existing test
+  (`test_backoff_is_capped_and_deadline_wrap_is_safe`) needed updating to
+  call the new `wifiAssociationResult()` explicitly between attempts,
+  since Wi-Fi retries are no longer resolved implicitly/instantly the way
+  they were before this fix - every other pre-existing test in that suite
+  was unaffected (all of them already transition `wifiConnected` to `true`
+  on the very next call after issuing `ConnectWifi`, which bypasses the
+  new in-flight gate entirely, exactly as intended). Validated in this
+  pass: all 38 native suites (309 assertions) compiled and executed via
+  MSVC, 0 failed; `esp32-c3`, `esp32-c3-dev-mqtt`,
+  `esp32-c3-dev-ring-simulator`, `esp32-c3-si3050-clock-probe`, and
+  `esp32dev-si3050-clock-meter` all compiled with `pio run` (real
+  espressif32/riscv32-esp toolchain). **This fixes the concurrent-retry
+  coordination bug; it does not by itself prove Wi-Fi will now associate**
+  - disconnect reasons 2 (auth expire) and 202 can also indicate a
+  credential/AP-side/signal problem unrelated to this bug, and that must
+  be re-evaluated on a fresh hardware retest, not assumed either way from
+  the evidence gathered so far. GPIO20 remains unreassigned - no evidence
+  ties it to this specific failure. **Still not validated on real
+  hardware**; see `docs/dev-ring-simulator.md`'s "Real bench observation:
+  retest reveals a shared concurrent-retry defect" and Honest status.
 
 ## Future Work
 

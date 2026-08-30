@@ -50,14 +50,213 @@ void test_wifi_loss_requires_all_gates_again() {
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ResolveDns), static_cast<int>(state.update(13, true, true, false)));
 }
 
+// Wi-Fi association is asynchronous (see the wifiAssociationResult() tests
+// below), so - unlike before the fix - a bare failed update() no longer
+// advances the backoff by itself; each attempt must be explicitly resolved
+// via wifiAssociationResult() first, exactly as a real disconnect event
+// would resolve it.
 void test_backoff_is_capped_and_deadline_wrap_is_safe() {
     DevMqttSmokeState state(10, 20);
-    state.update(0, false, false, false);
-    state.update(10, false, false, false);
-    state.update(30, false, false, false);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    state.wifiAssociationResult(0, false);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(10, false, false, false)));
+    state.wifiAssociationResult(10, false);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(30, false, false, false)));
     TEST_ASSERT_EQUAL_UINT32(20, state.retryDelayMs());
     TEST_ASSERT_FALSE(DevMqttSmokeState::deadlineReached(0xfffffff0u, 0x00000005u));
     TEST_ASSERT_TRUE(DevMqttSmokeState::deadlineReached(0x00000006u, 0x00000005u));
+}
+
+// Wi-Fi association itself is asynchronous on real hardware, exactly like
+// NTP/SNTP - the ESP32 Wi-Fi driver actively rejects (and effectively
+// restarts) a WiFi.begin() call issued while a previous attempt is still
+// outstanding ("wifi:sta is connecting, return error" / "WiFiSTA.cpp
+// begin(): connect failed!" observed on real hardware). The bare fact that
+// wifiConnected is not yet true must never by itself authorize reissuing
+// ConnectWifi - see update()'s contract and wifiAssociationResult().
+void test_connect_wifi_issued_once_while_association_pending() {
+    DevMqttSmokeState state(10, 40, 15000, 3, 600000, /*wifiAssociationTimeoutMs=*/1000);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // Many rapid updates while the attempt is pending - well before its own
+    // 1000ms timeout, and past what the ordinary 10ms initial backoff would
+    // have allowed under the pre-fix behavior - must never reissue
+    // ConnectWifi.
+    int connectWifiCount = 0;
+    for (uint32_t t = 1; t < 900; t += 10) {
+        if (state.update(t, false, false, false) == DevSmokeAction::ConnectWifi) {
+            ++connectWifiCount;
+        }
+    }
+    TEST_ASSERT_EQUAL(0, connectWifiCount);
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+}
+
+// An explicit success signal (forwarded from a real
+// ARDUINO_EVENT_WIFI_STA_CONNECTED/GOT_IP event) may arrive before
+// wifiConnected itself is observed true; it only needs to stop treating the
+// attempt as in flight. The ordinary wifiConnected-driven cascade is still
+// what actually advances the state, unchanged from before this fix.
+void test_wifi_association_success_ends_attempt_and_advances_normally() {
+    DevMqttSmokeState state(10, 40);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    state.wifiAssociationResult(1, true);
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ResolveDns),
+                      static_cast<int>(state.update(2, true, false, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForDns), static_cast<int>(state.state()));
+}
+
+// A real failure signal (forwarded from an
+// ARDUINO_EVENT_WIFI_STA_DISCONNECTED event) ends the attempt and schedules
+// the next retry immediately - not at the moment ConnectWifi was originally
+// issued - but that retry still must not fire before its own backoff
+// deadline elapses.
+void test_wifi_association_failure_ends_attempt_and_schedules_retry() {
+    DevMqttSmokeState state(10, 40);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    state.wifiAssociationResult(1, false);
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+
+    // No attempt occurs before the backoff elapses (scheduled from t=1 with
+    // initialRetryMs=10 -> next attempt not before t=11).
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(10, false, false, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(11, false, false, false)));
+}
+
+// If neither a connected/got_ip nor a disconnected event ever arrives, the
+// attempt's own bounded timeout abandons it and schedules a retry, gated on
+// the ordinary backoff deadline exactly like the NTP attempt timeout.
+void test_wifi_association_timeout_ends_stuck_attempt_and_allows_later_retry() {
+    DevMqttSmokeState state(10, 40, 15000, 3, 600000, /*wifiAssociationTimeoutMs=*/5);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // Flight deadline is 0+5=5 - before it, still suppressed, with no
+    // explicit event ever arriving.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(4, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // At the flight deadline, the attempt is abandoned and a retry is
+    // scheduled from this moment (deadline 5 + initialRetryMs 10 = 15) -
+    // not from the original issue time.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(5, false, false, false)));
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(10, false, false, false)));
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+
+    // Once that backoff deadline (15) is reached, exactly one fresh retry
+    // fires and re-arms the flight timer.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(15, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+}
+
+// The association flight timeout deadline reuses the same wrap-safe
+// deadlineReached() comparison as the rest of the state machine - mirrors
+// test_ntp_attempt_timeout_is_wrap_safe's own bootstrap-then-force-the-
+// wrap-transition shape (see that test's comment for why jumping straight
+// from a small bootstrap value to one near the wrap, without first seeding
+// retryAtMs_ from a nearby timestamp via a real state transition, would
+// otherwise be indistinguishable from going backward in time).
+void test_wifi_association_timeout_is_wrap_safe() {
+    DevMqttSmokeState state(1000, 4000, 15000, 3, 600000, /*wifiAssociationTimeoutMs=*/20);
+    state.update(0, false, false, false);
+    state.update(1, true, false, false);
+    state.dnsResult(1, true);
+    state.update(1, true, true, false);
+    state.mqttResult(1, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::Online), static_cast<int>(state.state()));
+
+    const uint32_t nearWrap = 0xFFFFFFF0u; // 16 before millis() would wrap to 0
+    // Forcing a Wi-Fi loss right at nowMs=nearWrap makes enter(WaitingForWifi,
+    // nearWrap) seed retryAtMs_ from a value consistent with the
+    // near-the-wrap timestamps used below.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(nearWrap, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // Flight deadline (nearWrap + 20) wraps past 0xFFFFFFFF to 4.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(nearWrap + 19, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(nearWrap + 20, false, false, false)));
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+}
+
+// The existing Wi-Fi interface recovery ladder (RecoverWifi) must keep
+// working with the new in-flight tracking: the ConnectWifi it authorizes
+// once the real disconnect is observed is protected from reissue exactly
+// like an ordinary attempt.
+void test_wifi_recovery_reconnect_attempt_is_also_protected_from_reissue() {
+    DevMqttSmokeState state(10, 40, 1000, /*wifiRecoveryThreshold=*/1, /*wifiRecoveryCooldownMs=*/1000,
+                            /*wifiAssociationTimeoutMs=*/1000);
+    state.update(0, false, false, false);
+    state.update(1, true, false, false);
+    state.dnsResult(1, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
+                      static_cast<int>(state.update(1, true, true, false)));
+    state.mqttResult(1, false); // single failure reaches threshold=1
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::RecoverWifi),
+                      static_cast<int>(state.update(1, true, true, false)));
+
+    // The real disconnect is observed, releasing ConnectWifi.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(2, false, true, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // The freshly re-armed attempt is protected exactly like an ordinary
+    // one - rapid updates before it resolves must not reissue it.
+    for (uint32_t t = 3; t < 900; t += 10) {
+        TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                          static_cast<int>(state.update(t, false, true, false)));
+    }
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+}
+
+// A burst of multiple disconnect events for the very same attempt (real
+// hardware can emit more than one) must only ever count as a single
+// failure/backoff - never re-arm the timer again or otherwise cause more
+// than one ConnectWifi to fire at the single scheduled deadline.
+void test_repeated_wifi_association_failure_signals_do_not_cause_a_connect_storm() {
+    DevMqttSmokeState state(10, 40);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+
+    state.wifiAssociationResult(1, false);
+    uint32_t retryAtAfterFirstFailure = state.retryAtMs();
+    uint32_t retryDelayAfterFirstFailure = state.retryDelayMs();
+    state.wifiAssociationResult(1, false);
+    state.wifiAssociationResult(1, false);
+    TEST_ASSERT_EQUAL_UINT32(retryAtAfterFirstFailure, state.retryAtMs());
+    TEST_ASSERT_EQUAL_UINT32(retryDelayAfterFirstFailure, state.retryDelayMs());
+
+    int connectWifiCount = 0;
+    for (uint32_t t = 2; t <= retryAtAfterFirstFailure + 5; ++t) {
+        if (state.update(t, false, false, false) == DevSmokeAction::ConnectWifi) {
+            ++connectWifiCount;
+        }
+    }
+    TEST_ASSERT_EQUAL(1, connectWifiCount);
 }
 
 // First ConfigureTime marks the attempt in flight, and it is never reissued
@@ -476,6 +675,13 @@ int main(int, char**) {
     RUN_TEST(test_dns_and_mqtt_failures_back_off_and_recover);
     RUN_TEST(test_wifi_loss_requires_all_gates_again);
     RUN_TEST(test_backoff_is_capped_and_deadline_wrap_is_safe);
+    RUN_TEST(test_connect_wifi_issued_once_while_association_pending);
+    RUN_TEST(test_wifi_association_success_ends_attempt_and_advances_normally);
+    RUN_TEST(test_wifi_association_failure_ends_attempt_and_schedules_retry);
+    RUN_TEST(test_wifi_association_timeout_ends_stuck_attempt_and_allows_later_retry);
+    RUN_TEST(test_wifi_association_timeout_is_wrap_safe);
+    RUN_TEST(test_wifi_recovery_reconnect_attempt_is_also_protected_from_reissue);
+    RUN_TEST(test_repeated_wifi_association_failure_signals_do_not_cause_a_connect_storm);
     RUN_TEST(test_ntp_attempt_marks_in_flight_and_suppresses_reissue_until_timeout);
     RUN_TEST(test_ntp_sync_completion_clears_in_flight_and_continues_to_mqtt);
     RUN_TEST(test_ntp_attempt_timeout_allows_exactly_one_fresh_retry);

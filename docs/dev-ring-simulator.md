@@ -29,9 +29,11 @@ ring detection signal. See Scope and safety below.
   provisioning/BLE, Wi-Fi credential handling, or the production AWS
   IoT composition root. It reuses the DEV MQTT smoke environment's
   connectivity bring-up class, `DevMqttSmokeState`
-  (`src/dev/mqtt_smoke_state.*`, already validated on real hardware - see
-  `docs/mqtt-dev-smoke-test.md`), rather than duplicating that state
-  machine.
+  (`src/dev/mqtt_smoke_state.*`, previously validated on real hardware for
+  several other scenarios - see `docs/mqtt-dev-smoke-test.md` - though a
+  real Wi-Fi-association coordination defect in it was only found via a
+  later `esp32-c3-dev-ring-simulator`/`esp32-c3-dev-mqtt` retest, see
+  below), rather than duplicating that state machine.
 - Publishes **only** through the existing production contract: the topic
   returned by `MqttTopics::eventsIngest()`, `Esp32AwsIotTransport` (AWS IoT
   Basic Ingest, mTLS), and the existing `IEventOutbox`
@@ -110,13 +112,14 @@ exactly as `esp32-c3-dev-mqtt` does. CI compiles this environment against
 the committed placeholder example header only (no real Wi-Fi/AWS
 connection attempted, no hardware flashed) - see `.github/workflows/ci.yml`.
 
-## Manual flash and test procedure (retest pending after the Wi-Fi diagnostics fix)
+## Manual flash and test procedure (retest pending after the concurrent-retry fix)
 
-This has been run on real hardware once - see "Real bench observation:
-first boot never associated with Wi-Fi" below - and the association
-itself did not succeed. A retest with this pass's added diagnostics is
-still needed; see Honest status. The intended procedure, mirroring
-`docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
+This has been run on real hardware twice, and Wi-Fi association has not
+yet succeeded on either attempt - see "Real bench observation: first boot
+never associated with Wi-Fi" and "Real bench observation: retest reveals
+a shared concurrent-retry defect" below. A further retest with this
+pass's coordination fix is still needed; see Honest status. The intended
+procedure, mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
 
 1. Wire the button as shown above.
 2. Generate `include/interbridge_dev_secrets.h` for a DEV device identity
@@ -132,8 +135,11 @@ still needed; see Honest status. The intended procedure, mirroring
     immediately after boot, and then either `[DEV RING] wifi
     event=connected` + `[DEV RING] wifi event=got_ip`, or a `[DEV RING]
     wifi event=disconnected reason=N (...)` line naming the actual
-    disconnect reason. If Wi-Fi still does not associate, this is exactly
-    the evidence the previous attempt lacked - capture it verbatim.
+    disconnect reason. A single `Wi-Fi connect requested` line should now
+    appear per attempt (never a burst while one is still outstanding); if
+    a disconnect reason keeps recurring, that reason code - not a repeat
+    concurrent-retry - is now the thing to diagnose. If Wi-Fi still does
+    not associate, capture the reason code(s) verbatim.
 5. Wait for `[DEV RING] state ... -> online` (Wi-Fi → DNS → NTP → MQTT
    connect, identical cascade to the DEV MQTT smoke test).
 6. Press the button once. Expect, in order:
@@ -215,68 +221,126 @@ progress (mobile repo); the full call UI is separate future work.
 
 ## Real bench observation: first boot never associated with Wi-Fi
 
-A real bench test (clean build, fresh upload, the same ESP32-C3 board,
-Wi-Fi network, and credentials already validated successfully by
-`esp32-c3-dev-mqtt`) produced only:
+A real bench test (clean build, fresh upload, the same ESP32-C3 board and
+Wi-Fi network `esp32-c3-dev-mqtt` was also being tested against) produced
+only:
 
 ```
 [DEV RING] local_status=wifi wifi=down time=pending mqtt=down outbox_size=0 uptime_s=120
 ```
 
 repeated at every 15s heartbeat, for a full 120s: Wi-Fi never associated.
-Because the same network/credentials work for the DEV MQTT smoke
-environment on the same physical board, an SSID/password/network problem
-was ruled out as the explanation - the investigation focused on the
-simulator's own code instead.
+At the time, `esp32-c3-dev-mqtt` had not itself been re-confirmed on this
+specific bring-up path either - see "Real bench observation: retest
+reveals a shared concurrent-retry defect" below, which corrects this.
 
-**What the comparison against `mqtt_smoke_main.cpp` found:** the
-connectivity bring-up *logic* itself was already equivalent - both files
-drive the same `DevMqttSmokeState` state machine, call `WiFi.mode(WIFI_STA)`
-+ `WiFi.begin()` only on its `ConnectWifi` action, use the identical
-retry/backoff policy, call `WiFi.disconnect(false, false)` only on
-`RecoverWifi` (radio stays on, credentials are kept), never call
-`ESP.restart()`, and build with identical flags/board. No functional
-divergence in *when* Wi-Fi actions are authorized was found.
+**What the comparison against `mqtt_smoke_main.cpp` found (at this point
+in the investigation):** the connectivity bring-up *logic* itself looked
+equivalent - both files drive the same `DevMqttSmokeState` state machine,
+call `WiFi.mode(WIFI_STA)` + `WiFi.begin()` only on its `ConnectWifi`
+action, use the identical retry/backoff policy, call
+`WiFi.disconnect(false, false)` only on `RecoverWifi` (radio stays on,
+credentials are kept), never call `ESP.restart()`, and build with
+identical flags/board. **This comparison turned out to be incomplete** -
+see below for the actual defect it missed.
 
-**What was actually missing: observability.** The simulator had no
-`WiFi.onEvent()` handler and none of `mqtt_smoke_main.cpp`'s per-action
+**What was also missing at this point: observability.** The simulator had
+no `WiFi.onEvent()` handler and none of `mqtt_smoke_main.cpp`'s per-action
 log lines (`Wi-Fi connect requested`, DNS/MQTT retry timing, state
 transitions, `wifi recovery requested`) or boot diagnostics
 (`previous_reset=...`). The single 15s heartbeat could show `wifi=down`
-but had no way to reveal *why* - whether `WiFi.begin()` was ever reached,
-whether an association attempt failed with a specific reason (e.g.
-`no_ap_found`/`timeout`), or whether a silent reset loop occurred. This
-pass adds that parity, copying `mqtt_smoke_main.cpp`'s own real-hardware-
-validated pattern verbatim (`onWifiEvent()`, `wifiDisconnectReasonName()`,
-`resetReasonName()`, and a log line for every `DevSmokeAction`) rather
-than inventing a different logging mechanism - see
-`src/dev/dev_ring_simulator_main.cpp`. `mqtt_smoke_main.cpp` itself was
-**not modified** (it is already real-hardware-validated; duplicating its
-small, pure diagnostic helpers into the new file carries far less risk
-than editing it).
+but had no way to reveal *why*. A first pass added that parity, copying
+`mqtt_smoke_main.cpp`'s own logging pattern verbatim (`onWifiEvent()`,
+`wifiDisconnectReasonName()`, `resetReasonName()`, and a log line for
+every `DevSmokeAction`) into `dev_ring_simulator_main.cpp` - see below for
+what the resulting retest actually showed.
 
-**This does not identify a root cause** - it makes the next boot capable
-of showing one. No fix has been guessed at (GPIO20 was considered as a
-possible contributing factor and explicitly not touched or reassigned,
-since there is no evidence tying it to the association failure; see "Why
-GPIO20" above for the pin-budget constraint that produced it). The retest
-in the Manual flash and test procedure above (step 4a in particular) is
-what will actually show whether `WiFi.begin()` fires, whether an
-`ARDUINO_EVENT_WIFI_STA_DISCONNECTED` event ever arrives and with what
-reason code, or whether something else (e.g. a reset loop, visible via a
-changing `previous_reset=` value across reconnects) is happening instead.
+## Real bench observation: retest reveals a shared concurrent-retry defect
+
+With the Wi-Fi diagnostics above in place, a hardware retest of
+**both** `esp32-c3-dev-ring-simulator` **and** `esp32-c3-dev-mqtt` showed
+**the exact same Wi-Fi association failure on both environments**:
+
+```
+[DEV RING] wifi event=disconnected reason=2
+[DEV RING] wifi event=disconnected reason=202
+[DEV RING] Wi-Fi connect requested; ... delay_ms=16000
+```
+
+and, on `esp32-c3-dev-mqtt`:
+
+```
+wifi:sta is connecting, return error
+WiFiSTA.cpp begin(): connect failed!
+```
+
+**This corrects the earlier framing above and in the original 3B.8
+work: `esp32-c3-dev-mqtt` had not actually been re-confirmed working on
+this exact bring-up path at the time - it was only assumed to be fine
+because it had connected successfully in an earlier, separate bench
+session.** SSID/password/network are **not** ruled out as contributing
+factors just because this is a coordination bug - reason 2 (auth expire)
+and reason 202 can also occur with a wrong/expired credential; that
+specific question needs to be re-evaluated after the fix below, on a
+clean retest, not assumed either way from this evidence alone.
+
+**The concrete, code-level defect this evidence exposed:** the shared
+`DevMqttSmokeState` coordinator did not model a Wi-Fi association attempt
+as asynchronous/in-flight the way it already did for NTP - `!wifiConnected`
+alone (i.e. `WiFi.status() != WL_CONNECTED`) was being treated as
+sufficient authorization to reissue `WiFi.begin()` once the ordinary
+backoff deadline elapsed, with no way to tell "still trying" apart from
+"gave up." The ESP32 Wi-Fi driver actively rejects (and effectively
+restarts) a `WiFi.begin()` call issued while a previous attempt is still
+outstanding - exactly `wifi:sta is connecting, return error` /
+`WiFiSTA.cpp begin(): connect failed!` above - so a fast-enough backoff
+could keep interrupting an association that might otherwise have
+succeeded, on **both** DEV environments equally, since they share this
+same coordinator class.
+
+**Fix**: `DevMqttSmokeState` now tracks a Wi-Fi association attempt as
+explicitly in flight (mirroring the existing NTP/SNTP in-flight pattern),
+gates `ConnectWifi` on it, and only schedules the next backoff-governed
+retry once the attempt actually resolves - via a real
+`ARDUINO_EVENT_WIFI_STA_CONNECTED`/`GOT_IP` (success) or
+`ARDUINO_EVENT_WIFI_STA_DISCONNECTED` (failure) event forwarded from the
+caller, or a configurable, separate association timeout if neither
+arrives. Both `mqtt_smoke_main.cpp` and `dev_ring_simulator_main.cpp` now
+forward those events (recorded as a minimal signal in the Wi-Fi event
+callback, which runs on its own task, and only turned into an actual
+`DevMqttSmokeState::wifiAssociationResult()` call from the ordinary,
+single-threaded `loop()`, to avoid a real concurrency hazard) into the
+same, single, shared coordinator - no state logic is duplicated between
+the two mains. See `src/dev/mqtt_smoke_state.*` and its native tests
+(`test/test_dev_mqtt_state`) for the full mechanism.
+
+**This fixes the concurrent-retry coordination bug; it does not yet
+prove Wi-Fi will associate.** Reason 2/202's specific underlying cause
+(credential, AP-side rejection, signal, or something else) has not been
+separately diagnosed and **must be re-evaluated on the next hardware
+retest**, now that the firmware itself will no longer interrupt its own
+association attempts. No fix has been guessed at for GPIO20 either (still
+considered a possible contributing factor only in the sense that it
+remains unvalidated, not because any evidence ties it to this specific
+failure) - see "Why GPIO20" above.
 
 ## Honest status
 
 **Implemented and compiled. `esp32-c3-dev-ring-simulator` has been
-flashed and booted on real hardware once, and Wi-Fi did not associate
-within 120s - see "Real bench observation" above. This pass adds Wi-Fi
-event/diagnostic logging parity with the already-validated
-`esp32-c3-dev-mqtt` so the cause is actually observable on the next boot;
-it does not itself claim the association problem is fixed. A hardware
-retest is still required. Button behavior, MQTT connectivity, and
-end-to-end event delivery from a real physical press remain unvalidated
-on hardware.**
+flashed and booted on real hardware twice, and Wi-Fi has not yet
+associated on either attempt - see both "Real bench observation" sections
+above. The retest also showed `esp32-c3-dev-mqtt` failing the exact same
+way on the same session, which is why this pass fixes a real,
+code-level concurrent-retry defect in the shared `DevMqttSmokeState`
+coordinator (both DEV mains now forward real Wi-Fi
+connected/got_ip/disconnected events into it instead of letting a bare
+backoff timer reissue `WiFi.begin()` while a previous attempt was still
+outstanding) rather than only adding diagnostics. This fix has NOT yet
+been confirmed to make Wi-Fi associate - the specific disconnect reason
+codes observed (2, 202) still need to be re-evaluated on a fresh hardware
+retest, and SSID/credential/network causes are explicitly not ruled out.
+Button behavior, MQTT connectivity, and end-to-end event delivery from a
+real physical press remain unvalidated on hardware.**
 
 - Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
   cover: one press → exactly one `RING_DETECTED`; holding the button
@@ -289,20 +353,32 @@ on hardware.**
   are themselves asserted valid against the real `isValidDeviceId()`
   contract (`ib-` + exactly 32 lowercase hex chars) rather than using an
   arbitrary placeholder string.
-- `pio run -e esp32-c3-dev-ring-simulator` compiles successfully, with no
-  new warnings.
-- `pio run -e esp32-c3`, `pio run -e esp32-c3-dev-mqtt`,
-  `pio run -e esp32-c3-si3050-clock-probe`, and
+- Native unit tests (`test/test_dev_mqtt_state`) cover the new Wi-Fi
+  association in-flight tracking shared by both DEV mains: `ConnectWifi`
+  is issued exactly once per attempt and never reissued by rapid updates
+  while one is pending; an explicit success signal ends the attempt and
+  lets the ordinary cascade advance normally; an explicit failure signal
+  ends the attempt and schedules the next retry (never before its own
+  backoff deadline); a stuck attempt with no event at all is abandoned by
+  its own separate, configurable timeout and allows a later retry; that
+  timeout is `millis()`-wraparound-safe; the existing Wi-Fi interface
+  recovery ladder (`RecoverWifi`) still works and its own reconnect
+  attempt is equally protected from reissue; and a burst of repeated
+  failure signals for the same attempt never causes more than one
+  `WiFi.begin()` at the single scheduled retry.
+- `pio run -e esp32-c3-dev-ring-simulator` and `pio run -e esp32-c3-dev-mqtt`
+  compile successfully, with no new warnings.
+- `pio run -e esp32-c3`, `pio run -e esp32-c3-si3050-clock-probe`, and
   `pio run -e esp32dev-si3050-clock-meter` all still compile successfully
-  and are unaffected in source (only `platformio.ini` gained one new
-  exclusion line per environment to keep `dev_ring_simulator_main.cpp`
-  out of them, from the original 3B.8 commit) - confirming this DEV-only
-  addition does not alter any other build.
-- **Not yet done**: a hardware retest with the new diagnostics, wiring
-  the physical button, and running the rest of the manual procedure
-  above. GPIO20's electrical behavior under `INPUT_PULLUP` on this
-  specific module, the end-to-end AWS IoT delivery, and the offline/
-  reconnect replay have only been exercised through native fakes
-  (`FakeDevRingButtonInput`, `FakeDeviceTransport`), not real hardware -
-  this is true even though 3B.6/3B.7 are now deployed in DEV, since
-  neither of those exercised a real physical button.
+  and are unaffected in source - confirming this fix does not alter any
+  other build.
+- **Not yet done**: a hardware retest with the concurrent-retry fix,
+  wiring the physical button, and running the rest of the manual
+  procedure above. GPIO20's electrical behavior under `INPUT_PULLUP` on
+  this specific module, the actual cause of disconnect reasons 2/202, the
+  end-to-end AWS IoT delivery, and the offline/reconnect replay have only
+  been exercised through native fakes (`FakeDevRingButtonInput`,
+  `FakeDeviceTransport`, direct `DevMqttSmokeState` calls), not real
+  hardware - this is true even though 3B.6/3B.7 are now deployed in DEV,
+  since neither of those exercised a real physical button or this
+  specific Wi-Fi coordination path.

@@ -148,9 +148,21 @@ const char* wifiDisconnectReasonName(uint8_t reason) {
     }
 }
 
+// Set only from the Wi-Fi event callback below (which the ESP32 Arduino
+// core runs on its own Wi-Fi/event task, not the main loop task) and
+// consumed only from loop() via drainWifiEventSignals() - see the
+// identical pattern/rationale in mqtt_smoke_main.cpp (this state machine
+// is shared via DevMqttSmokeState; only this small amount of Arduino-main
+// glue is necessarily duplicated per entry point, same as stateName()/
+// safeStatus()/NtpClock already are). No DevMqttSmokeState method is ever
+// called directly from this callback.
+volatile bool wifiAssociatedEventPending = false;
+volatile bool wifiDisconnectedEventPending = false;
+
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
         const uint8_t reason = info.wifi_sta_disconnected.reason;
+        wifiDisconnectedEventPending = true;
         const char* name = wifiDisconnectReasonName(reason);
         if (name) {
             Serial.printf("[DEV RING] wifi event=disconnected reason=%u (%s)\n",
@@ -160,9 +172,25 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
                           static_cast<unsigned>(reason));
         }
     } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+        wifiAssociatedEventPending = true;
         Serial.println("[DEV RING] wifi event=connected");
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        wifiAssociatedEventPending = true;
         Serial.println("[DEV RING] wifi event=got_ip");
+    }
+}
+
+// Drains whatever the event callback recorded above and forwards it as an
+// explicit, synchronous DevMqttSmokeState::wifiAssociationResult() call -
+// called once per loop() iteration, before connectivity.update().
+void drainWifiEventSignals(uint32_t now) {
+    if (wifiAssociatedEventPending) {
+        wifiAssociatedEventPending = false;
+        connectivity.wifiAssociationResult(now, true);
+    }
+    if (wifiDisconnectedEventPending) {
+        wifiDisconnectedEventPending = false;
+        connectivity.wifiAssociationResult(now, false);
     }
 }
 
@@ -229,6 +257,7 @@ void loop() {
     }
     wasConnected = transport.isConnected();
 
+    drainWifiEventSignals(now);
     const DevSmokeAction action =
         connectivity.update(now, wifiConnected, clockSource.hasValidTime(), transport.isConnected());
     if (connectivity.state() != lastLoggedState) {

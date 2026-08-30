@@ -24,10 +24,18 @@ public:
     // wifiRecoveryCooldownMs: minimum time between two Wi-Fi recoveries, so
     // a long-running local network/ISP outage does not keep bouncing the
     // radio - see wifiRecoveryCooldownActive()/wifiRecoveryCooldownUntilMs().
+    // wifiAssociationTimeoutMs: bounded, configurable ceiling on how long a
+    // single ConnectWifi/WiFi.begin() attempt is trusted to still be
+    // "in flight" before it is abandoned even without an explicit
+    // wifiAssociationResult() call - see update() and
+    // wifiAttemptInFlight(). Deliberately separate from
+    // initialRetryMs/maxRetryMs (the backoff *between* attempts): this is
+    // the ceiling on a single attempt's own duration.
     DevMqttSmokeState(uint32_t initialRetryMs = 1000, uint32_t maxRetryMs = 300000,
                       uint32_t ntpAttemptTimeoutMs = 15000,
                       uint32_t wifiRecoveryThreshold = 3,
-                      uint32_t wifiRecoveryCooldownMs = 600000);
+                      uint32_t wifiRecoveryCooldownMs = 600000,
+                      uint32_t wifiAssociationTimeoutMs = 15000);
 
     // Do not gate this on sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS
     // from the caller: on real hardware that status can stay reset/idle for a
@@ -58,7 +66,49 @@ public:
     // the stale association and ConnectWifi (WiFi.begin()) is guaranteed to
     // actually fire once the disconnect takes effect. See
     // awaitingWifiRecoveryDisconnect().
+    //
+    // Wi-Fi association itself (ConnectWifi/WiFi.begin()) is asynchronous
+    // on real hardware, exactly like NTP/SNTP - the ESP32 Wi-Fi driver
+    // actively rejects (and effectively restarts) a WiFi.begin() call
+    // issued while a previous association attempt is still outstanding
+    // ("wifi:sta is connecting, return error" / "WiFiSTA.cpp begin():
+    // connect failed!" on real hardware), which a naive "just retry once
+    // the ordinary backoff elapses, regardless of wifiConnected" policy
+    // can trigger before the first attempt ever had a chance to resolve.
+    // Once ConnectWifi is issued, this class tracks that attempt as in
+    // flight itself (see wifiAttemptInFlight()) and never reissues it
+    // until exactly one of three things happens: wifiConnected becomes
+    // true (the ordinary success path, unchanged), the caller reports an
+    // explicit outcome via wifiAssociationResult() (forwarded from a real
+    // ARDUINO_EVENT_WIFI_STA_CONNECTED/GOT_IP/DISCONNECTED event), or
+    // wifiAssociationTimeoutMs elapses without either happening. A
+    // reported/observed failure or a timeout schedules the next retry
+    // with the ordinary backoff at that point - never at the moment
+    // ConnectWifi was issued, so a fast-failing attempt does not consume
+    // backoff time it was never actually given.
     DevSmokeAction update(uint32_t nowMs, bool wifiConnected, bool timeValid, bool mqttConnected);
+    // Reports an explicit, caller-observed Wi-Fi association outcome for
+    // the attempt currently in flight (see wifiAttemptInFlight()) -
+    // forwarded from a real Wi-Fi event (ARDUINO_EVENT_WIFI_STA_CONNECTED/
+    // GOT_IP for success, ARDUINO_EVENT_WIFI_STA_DISCONNECTED for
+    // failure), never invoked directly from inside that event callback
+    // itself (the callback may run in a different task/context on real
+    // hardware; the caller must only record a minimal signal there and
+    // forward it into this method from its own single-threaded main
+    // loop). success=true simply stops treating the attempt as in flight
+    // early - the ordinary wifiConnected-driven cascade in update() is
+    // still what actually advances the state once it observes
+    // WL_CONNECTED. success=false ends the attempt and immediately
+    // schedules the next retry with the ordinary backoff (see
+    // scheduleRetry()), rather than waiting for the full
+    // wifiAssociationTimeoutMs to elapse. A call with no attempt
+    // currently in flight (state_ is not WaitingForWifi, or no
+    // ConnectWifi has been issued yet for this attempt) is a no-op - safe
+    // to call from an event handler that may fire outside any pending
+    // attempt (e.g. a late disconnect event after Online, which the
+    // ordinary wifiConnected-driven "!wifiConnected -> WaitingForWifi"
+    // path in update() already handles on its own).
+    void wifiAssociationResult(uint32_t nowMs, bool success);
     // Explicit DNS resolution during the initial WaitingForDns bootstrap
     // stage (before NTP). success=false counts as a connectivity failure -
     // see consecutiveConnectivityFailures().
@@ -83,6 +133,10 @@ public:
     // Whether a ConfigureTime action's SNTP attempt is currently considered
     // in flight (issued, not yet resolved by timeValid or its own timeout).
     bool ntpAttemptInFlight() const;
+    // Whether a ConnectWifi action's association attempt is currently
+    // considered in flight (issued, not yet resolved by wifiConnected,
+    // wifiAssociationResult(), or its own timeout) - see update().
+    bool wifiAttemptInFlight() const;
     // Consecutive DNS-preflight/bootstrap or TLS/socket connectivity
     // failures since the last full MQTT connect+subscribe success. Publish
     // failures are never counted here - RemoteCommandProcessor/
@@ -112,6 +166,9 @@ private:
     bool actionIssued_;
     bool ntpAttemptInFlight_ = false;
     uint32_t ntpAttemptDeadlineMs_ = 0;
+    uint32_t wifiAssociationTimeoutMs_;
+    bool wifiAttemptInFlight_ = false;
+    uint32_t wifiAttemptDeadlineMs_ = 0;
 
     uint32_t wifiRecoveryThreshold_;
     uint32_t wifiRecoveryCooldownMs_;
