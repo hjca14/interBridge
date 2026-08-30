@@ -70,6 +70,35 @@ void test_backoff_is_capped_and_deadline_wrap_is_safe() {
     TEST_ASSERT_TRUE(DevMqttSmokeState::deadlineReached(0x00000006u, 0x00000005u));
 }
 
+// millisUntil() is a diagnostic-logging-only helper (see its declaration) -
+// never used for any retry/backoff decision. Real hardware showed the naive
+// "deadlineMs - nowMs" computation underflow to delay_ms=4294967291/4294967294
+// once ConnectWifi started being logged right at (or a few ms after) its own
+// already-elapsed backoff deadline - which is guaranteed by construction the
+// moment that action fires (deadlineReached() must already be true). Must
+// saturate at 0 instead, and stay correct across the millis() wraparound.
+void test_millis_until_saturates_and_is_wrap_safe() {
+    // Ordinary future deadline: 5000ms remaining.
+    TEST_ASSERT_EQUAL_UINT32(5000, DevMqttSmokeState::millisUntil(15000, 10000));
+
+    // Deadline already reached - exactly now, or a few ms in the past -
+    // must saturate at 0, never underflow via plain unsigned subtraction.
+    TEST_ASSERT_EQUAL_UINT32(0, DevMqttSmokeState::millisUntil(10000, 10000));
+    TEST_ASSERT_EQUAL_UINT32(0, DevMqttSmokeState::millisUntil(10000, 10003));
+
+    // Wraparound, deadline in the past: the deadline (0xFFFFFFFE) is 5ms
+    // before "now" (3) once the wrap is accounted for, even though "now"
+    // numerically wrapped past 0 - must still saturate at 0, not report a
+    // huge number.
+    TEST_ASSERT_EQUAL_UINT32(0, DevMqttSmokeState::millisUntil(0xFFFFFFFEu, 3u));
+
+    // Wraparound, deadline in the future: the deadline (3) is genuinely
+    // 5ms after "now" (0xFFFFFFFE, 2ms before the wrap) once the wrap is
+    // accounted for - must report the real 5ms remaining, not treat the
+    // wrap as "already past".
+    TEST_ASSERT_EQUAL_UINT32(5, DevMqttSmokeState::millisUntil(3u, 0xFFFFFFFEu));
+}
+
 // Wi-Fi association itself is asynchronous on real hardware, exactly like
 // NTP/SNTP - the ESP32 Wi-Fi driver actively rejects (and effectively
 // restarts) a WiFi.begin() call issued while a previous attempt is still
@@ -675,6 +704,7 @@ int main(int, char**) {
     RUN_TEST(test_dns_and_mqtt_failures_back_off_and_recover);
     RUN_TEST(test_wifi_loss_requires_all_gates_again);
     RUN_TEST(test_backoff_is_capped_and_deadline_wrap_is_safe);
+    RUN_TEST(test_millis_until_saturates_and_is_wrap_safe);
     RUN_TEST(test_connect_wifi_issued_once_while_association_pending);
     RUN_TEST(test_wifi_association_success_ends_attempt_and_advances_normally);
     RUN_TEST(test_wifi_association_failure_ends_attempt_and_schedules_retry);

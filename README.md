@@ -163,16 +163,16 @@ smoke environment's connectivity state machine and the existing
 inventing a new one, and never touches the real Si3050 driver stack,
 provisioning, BLE, or production Wi-Fi/AWS composition. Implemented and
 compiled (native tests pass, all PlatformIO environments still build);
-real-hardware boots have not yet associated to Wi-Fi, and a retest
-revealed `esp32-c3-dev-mqtt` failing the exact same way on the same
-session - both DEV mains share `DevMqttSmokeState`, which had a real
-concurrent-retry defect (reissuing `WiFi.begin()` while a previous
-association attempt was still outstanding). That coordinator is now fixed
-to track an association attempt explicitly and resolve it via a real
-Wi-Fi event or a separate timeout, but this has **not yet been confirmed
-to make Wi-Fi associate** - the disconnect reason codes observed (2, 202)
-still need a fresh hardware retest, and SSID/credential/network causes
-are not ruled out. See
+three real-hardware boots have not yet associated to Wi-Fi. A retest
+found `esp32-c3-dev-mqtt` failing the exact same way as the simulator on
+the same session - both DEV mains share `DevMqttSmokeState`, which had a
+real concurrent-retry defect (reissuing `WiFi.begin()` while a previous
+association attempt was still outstanding). A follow-up retest confirmed
+that fix worked (the driver-level "sta is connecting" error is gone), but
+association **still fails with the same disconnect reason codes (2,
+202)** - the concurrent retry was not the sole cause, and this will be
+isolated next with a dedicated WPA2 test hotspot. SSID/credential/network
+causes remain explicitly not ruled out. See
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) for the wiring
 diagram, GPIO rationale, manual test procedure, and the real bench
 observations, and

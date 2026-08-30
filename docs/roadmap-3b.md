@@ -15,7 +15,7 @@ those files for the full record of 3B.1-3B.2.
 | 3B.3-3B.5 | Not tracked in this repository/document | - | Out of scope here |
 | 3B.6 | Backend FCM sender: `telemetry_ingestion` invokes `push_sender`, which delivers a push notification via Firebase Cloud Messaging for `RING_DETECTED` (and related) Basic Ingest events | Backend repo | **Implemented and deployed in DEV** - the backend has accepted a real event end-to-end and recorded `Sent=1` for it |
 | 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | **Implemented and deployed in DEV** |
-| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; two real-hardware boots have not associated to Wi-Fi. A retest showed `esp32-c3-dev-mqtt` failing identically on the same session, exposing a real concurrent-retry defect in the shared `DevMqttSmokeState` Wi-Fi coordinator (now fixed - see `docs/dev-ring-simulator.md`'s two "Real bench observation" sections). The fix has not yet been confirmed to make Wi-Fi associate; the specific disconnect reason codes observed (2, 202) still need re-evaluation on a fresh hardware retest, and SSID/credential/network causes are not ruled out.** |
+| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; three real-hardware boots have not associated to Wi-Fi. The concurrent-retry defect in the shared `DevMqttSmokeState` Wi-Fi coordinator is fixed and confirmed (the driver-level "sta is connecting" error is gone on retest), but association still fails with the same disconnect reasons (2, 202) - auth/credential is now the leading suspect, to be isolated next with a dedicated WPA2 test hotspot. See `docs/dev-ring-simulator.md`'s three "Real bench observation" sections.** |
 | 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal slice (displaying a data-only FCM notification) is underway; the full call UI is not started |
 | 3B.10 | iOS/APNs call/notification experience for an incoming ring | Mobile (iOS) repo | Not started (not in this repo) |
 
@@ -33,13 +33,18 @@ those files for the full record of 3B.1-3B.2.
 - Historical firmware phase numbers (3B.1, 3B.2, and all non-3B phases
   elsewhere in `CONTEXT.md`) are never renumbered by this document - it
   only adds the 3B.6-3B.10 continuation for cross-repo tracking.
-- Neither of 3B.8's two real-hardware boot attempts reached Wi-Fi
+- None of 3B.8's three real-hardware boot attempts reached Wi-Fi
   association, let alone the button/MQTT/event-delivery steps beyond it -
   do not treat 3B.8 as validated, or the 3B.6-3B.7 `Sent=1` confirmation
-  as proof the full chain works from a real button, until a retest with
-  the Wi-Fi coordination fix actually succeeds. The second retest also
-  found `esp32-c3-dev-mqtt` was never actually re-confirmed working on
-  this exact bring-up path either - it had only connected successfully in
-  an earlier, separate bench session, and shares the same coordinator bug
-  the ring simulator hit. Do not assume a DEV environment still connects
-  just because it did once before.
+  as proof the full chain works from a real button, until a retest
+  actually succeeds. The second retest found `esp32-c3-dev-mqtt` was never
+  actually re-confirmed working on this exact bring-up path either - it
+  had only connected successfully in an earlier, separate bench session,
+  and shared the same coordinator bug the ring simulator hit. Do not
+  assume a DEV environment still connects just because it did once before.
+- The third retest confirmed the concurrent-retry fix worked (the
+  driver-level "sta is connecting" error is gone) but association still
+  fails with the same reason codes (2, 202) as before that fix - the
+  concurrent retry was not the sole cause. Next step is isolating this
+  with a dedicated WPA2 test hotspot before assuming any other cause
+  (firmware, credential, or AP-side) fixed or ruled out.

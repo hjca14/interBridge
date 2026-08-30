@@ -315,7 +315,7 @@ void loop() {
             WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
             Serial.printf("[DEV MQTT] Wi-Fi connect requested; next_attempt_ms=%lu delay_ms=%lu\n",
                           static_cast<unsigned long>(connectivity.retryAtMs()),
-                          static_cast<unsigned long>(connectivity.retryAtMs() - now));
+                          static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
             break;
         case DevSmokeAction::ResolveDns: {
             IPAddress resolved;
@@ -326,7 +326,7 @@ void loop() {
             if (!resolvedOk) {
                 Serial.printf("[DEV MQTT] next DNS attempt at_ms=%lu delay_ms=%lu\n",
                               static_cast<unsigned long>(connectivity.retryAtMs()),
-                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+                              static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
             }
             break;
         }
@@ -357,7 +357,7 @@ void loop() {
                 Serial.printf("[DEV MQTT] connectivity_failures=%lu next DNS attempt at_ms=%lu delay_ms=%lu\n",
                               static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
                               static_cast<unsigned long>(connectivity.retryAtMs()),
-                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+                              static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
                 break;
             }
 
@@ -380,7 +380,7 @@ void loop() {
                 Serial.printf("[DEV MQTT] connectivity_failures=%lu next MQTT attempt at_ms=%lu delay_ms=%lu\n",
                               static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
                               static_cast<unsigned long>(connectivity.retryAtMs()),
-                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+                              static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
             }
             break;
         }

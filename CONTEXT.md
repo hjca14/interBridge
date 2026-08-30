@@ -1266,6 +1266,42 @@ this pass:)*
   ties it to this specific failure. **Still not validated on real
   hardware**; see `docs/dev-ring-simulator.md`'s "Real bench observation:
   retest reveals a shared concurrent-retry defect" and Honest status.
+- **Follow-up finding + fix (same Phase 3B.8 work, before merge): a third
+  hardware retest confirmed the concurrent-retry fix worked** - the
+  driver-level `wifi:sta is connecting, return error` error did not
+  recur. **Wi-Fi association still failed, with the same disconnect
+  reasons (2, 202) as before that fix** - meaning the concurrent retry was
+  not the (sole) cause of the original failure. Reason 2/202 has not been
+  root-caused yet; it will be isolated next using a dedicated WPA2 test
+  hotspot with known-good credentials, separate from whatever network the
+  board has been tested against so far. SSID/credential/network causes
+  remain explicitly not ruled out - only the concurrent-retry coordination
+  defect is fixed. The same retest also surfaced an unrelated,
+  diagnostic-only bug: "delay_ms=" log lines showed impossible values
+  (`4294967291`, `4294967294`) from computing `retryAtMs() - now` via
+  plain `uint32_t` subtraction, which underflows whenever the deadline is
+  at or past `now` - guaranteed by construction the instant `ConnectWifi`
+  fires (`deadlineReached()` must already be true then). Fixed with a new
+  `DevMqttSmokeState::millisUntil(deadlineMs, nowMs)` static helper
+  (saturates at 0, wrap-safe via the same signed-subtraction technique as
+  `deadlineReached()`), used at all 8 "delay_ms=" call sites across both
+  DEV mains. **This is display-only - no retry/backoff policy changed**,
+  per explicit instruction not to alter retry policy based on a logging
+  artifact alone. 1 new native test
+  (`test_millis_until_saturates_and_is_wrap_safe` in
+  `test/test_dev_mqtt_state`, 24 tests total in that suite now): ordinary
+  future deadline, deadline already reached (saturates instead of
+  underflowing), and both directions of the `millis()` wraparound.
+  Validated: all 38 native suites (`pio` toolchain's own `pio test -e
+  native` still cannot run natively in this sandbox - same pre-existing
+  no-host-compiler limitation as every prior pass; validated instead via
+  the same locally available MSVC used throughout this work) passed, 0
+  failed; all five required environments (`esp32-c3`,
+  `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`,
+  `esp32-c3-si3050-clock-probe`, `esp32dev-si3050-clock-meter`) compiled
+  via real `pio run`. **Still not validated on real hardware for
+  association success** - see `docs/dev-ring-simulator.md`'s "Real bench
+  observation: concurrent retry gone, auth still fails (reason=2/202)".
 
 ## Future Work
 

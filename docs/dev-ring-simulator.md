@@ -324,23 +324,62 @@ considered a possible contributing factor only in the sense that it
 remains unvalidated, not because any evidence ties it to this specific
 failure) - see "Why GPIO20" above.
 
+## Real bench observation: concurrent retry gone, auth still fails (reason=2/202)
+
+A further hardware retest of the concurrent-retry fix above confirmed it
+worked as intended: **the `wifi:sta is connecting, return error` /
+`WiFiSTA.cpp begin(): connect failed!` driver errors did not recur.**
+`ConnectWifi` is no longer reissued while a previous association attempt
+is still outstanding - the coordination bug is fixed.
+
+**Association still fails, with the same reason codes as before (2, 202)
+even without the concurrent retry.** This means the concurrent-retry bug
+was not the (or not the only) cause of the original association failure.
+Reason 2/202 - most consistent with an authentication/credential-level
+rejection - has not been root-caused yet and is planned to be isolated
+next using a dedicated WPA2 test hotspot (an access point with known-good,
+controlled credentials, separate from the production/office network this
+board was tested against), to determine whether the failure is
+credential-specific, AP-specific, or something else entirely. Do not
+conclude the underlying association problem is fixed - only the
+concurrent-retry coordination defect is.
+
+The same retest also surfaced a second, independent, diagnostic-only bug:
+delay-until-next-retry log lines showed impossible values
+(`delay_ms=4294967291`, `delay_ms=4294967294`) - a `uint32_t` underflow
+from computing `retryAtMs() - now` with plain unsigned subtraction when
+the deadline was already at or slightly past `now` (which is guaranteed
+by construction the moment `ConnectWifi` fires, since that only happens
+once `deadlineReached()` is already true). Fixed with a new
+`DevMqttSmokeState::millisUntil(deadlineMs, nowMs)` helper that saturates
+at 0 and stays correct across the `millis()` wraparound, used everywhere
+a "delay_ms=" diagnostic is logged in both DEV mains. **This is a
+display-only fix** - it does not change any retry/backoff timing or
+policy, only how the remaining time is computed for logging. See
+`test_millis_until_saturates_and_is_wrap_safe` in
+`test/test_dev_mqtt_state` for future-deadline, already-passed-deadline,
+and wraparound coverage.
+
 ## Honest status
 
 **Implemented and compiled. `esp32-c3-dev-ring-simulator` has been
-flashed and booted on real hardware twice, and Wi-Fi has not yet
-associated on either attempt - see both "Real bench observation" sections
-above. The retest also showed `esp32-c3-dev-mqtt` failing the exact same
-way on the same session, which is why this pass fixes a real,
-code-level concurrent-retry defect in the shared `DevMqttSmokeState`
-coordinator (both DEV mains now forward real Wi-Fi
-connected/got_ip/disconnected events into it instead of letting a bare
-backoff timer reissue `WiFi.begin()` while a previous attempt was still
-outstanding) rather than only adding diagnostics. This fix has NOT yet
-been confirmed to make Wi-Fi associate - the specific disconnect reason
-codes observed (2, 202) still need to be re-evaluated on a fresh hardware
-retest, and SSID/credential/network causes are explicitly not ruled out.
-Button behavior, MQTT connectivity, and end-to-end event delivery from a
-real physical press remain unvalidated on hardware.**
+flashed and booted on real hardware three times, and Wi-Fi has not yet
+associated on any attempt - see all three "Real bench observation"
+sections above. The concurrent-retry coordination defect in the shared
+`DevMqttSmokeState` (both DEV mains reissuing `WiFi.begin()` while a
+previous attempt was still outstanding) is confirmed fixed by the third
+retest - the driver-level `wifi:sta is connecting, return error` error is
+gone. Association still fails with the same disconnect reason codes (2,
+202) as before that fix, so the concurrent retry was not the (sole) cause
+of the original failure. Reason 2/202 has not been root-caused yet and
+will be isolated next using a dedicated WPA2 test hotspot with known-good
+credentials, separate from whatever network this board has been tested
+against so far - SSID/credential/network causes remain explicitly not
+ruled out. A separate, diagnostic-only `uint32_t` underflow in the
+"delay_ms=" log lines (`4294967291`, `4294967294` observed) is also fixed
+in this pass - display-only, no retry/backoff policy changed. Button
+behavior, MQTT connectivity, and end-to-end event delivery from a real
+physical press remain unvalidated on hardware.**
 
 - Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
   cover: one press → exactly one `RING_DETECTED`; holding the button
@@ -366,16 +405,20 @@ real physical press remain unvalidated on hardware.**
   attempt is equally protected from reissue; and a burst of repeated
   failure signals for the same attempt never causes more than one
   `WiFi.begin()` at the single scheduled retry.
+- Native unit tests (`test_millis_until_saturates_and_is_wrap_safe` in
+  `test/test_dev_mqtt_state`) cover the delay-display fix: an ordinary
+  future deadline, a deadline already reached (saturates at 0 instead of
+  underflowing), and both directions of the `millis()` wraparound.
 - `pio run -e esp32-c3-dev-ring-simulator` and `pio run -e esp32-c3-dev-mqtt`
   compile successfully, with no new warnings.
 - `pio run -e esp32-c3`, `pio run -e esp32-c3-si3050-clock-probe`, and
   `pio run -e esp32dev-si3050-clock-meter` all still compile successfully
   and are unaffected in source - confirming this fix does not alter any
   other build.
-- **Not yet done**: a hardware retest with the concurrent-retry fix,
-  wiring the physical button, and running the rest of the manual
-  procedure above. GPIO20's electrical behavior under `INPUT_PULLUP` on
-  this specific module, the actual cause of disconnect reasons 2/202, the
+- **Not yet done**: isolating the reason=2/202 root cause with a WPA2 test
+  hotspot, a further hardware retest after that, wiring the physical
+  button, and running the rest of the manual procedure above. GPIO20's
+  electrical behavior under `INPUT_PULLUP` on this specific module, the
   end-to-end AWS IoT delivery, and the offline/reconnect replay have only
   been exercised through native fakes (`FakeDevRingButtonInput`,
   `FakeDeviceTransport`, direct `DevMqttSmokeState` calls), not real

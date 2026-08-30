@@ -152,6 +152,21 @@ public:
 
     static bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs);
 
+    // Wrap-safe "how many ms remain until deadlineMs" for DIAGNOSTIC
+    // LOGGING ONLY (e.g. the callers' own "delay_ms=..." lines) - never
+    // used for any retry/backoff decision, which remains solely
+    // deadlineReached()'s job. Saturates at 0 once the deadline has
+    // already been reached, instead of underflowing to a huge number via
+    // plain unsigned subtraction (deadlineMs - nowMs) when the deadline is
+    // even a few ms in the past - real hardware showed this exact bug as
+    // `delay_ms=4294967291` once ConnectWifi started being issued right
+    // at (or fractionally after) its own backoff deadline, which is
+    // always true by construction the moment that action fires. Same
+    // signed-subtraction wraparound technique as deadlineReached(), so it
+    // shares that function's ~2^31 "already close on the 32-bit circle"
+    // caveat.
+    static uint32_t millisUntil(uint32_t deadlineMs, uint32_t nowMs);
+
 private:
     void enter(DevSmokeState state, uint32_t nowMs);
     void scheduleRetry(uint32_t nowMs);

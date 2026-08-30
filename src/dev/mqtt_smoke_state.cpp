@@ -16,6 +16,11 @@ bool DevMqttSmokeState::deadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
     return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
 }
 
+uint32_t DevMqttSmokeState::millisUntil(uint32_t deadlineMs, uint32_t nowMs) {
+    int32_t remaining = static_cast<int32_t>(deadlineMs - nowMs);
+    return remaining > 0 ? static_cast<uint32_t>(remaining) : 0;
+}
+
 void DevMqttSmokeState::enter(DevSmokeState state, uint32_t nowMs) {
     state_ = state;
     retryDelayMs_ = initialRetryMs_;
