@@ -15,7 +15,7 @@ those files for the full record of 3B.1-3B.2.
 | 3B.3-3B.5 | Not tracked in this repository/document | - | Out of scope here |
 | 3B.6 | Backend FCM sender: `telemetry_ingestion` invokes `push_sender`, which delivers a push notification via Firebase Cloud Messaging for `RING_DETECTED` (and related) Basic Ingest events | Backend repo | **Implemented and deployed in DEV** - the backend has accepted a real event end-to-end and recorded `Sent=1` for it |
 | 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | **Implemented and deployed in DEV** |
-| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; still not validated on real hardware - a physical button has not yet been wired and pressed on a flashed board. See `docs/dev-ring-simulator.md` > Honest status.** |
+| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; a first real-hardware boot did not associate to Wi-Fi within 120s (same board/network/credentials already validated by `esp32-c3-dev-mqtt`). Wi-Fi event/diagnostic logging parity has since been added so the actual cause is observable; a hardware retest is still required. See `docs/dev-ring-simulator.md` > "Real bench observation: first boot never associated with Wi-Fi" and > Honest status.** |
 | 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal slice (displaying a data-only FCM notification) is underway; the full call UI is not started |
 | 3B.10 | iOS/APNs call/notification experience for an incoming ring | Mobile (iOS) repo | Not started (not in this repo) |
 
@@ -33,3 +33,8 @@ those files for the full record of 3B.1-3B.2.
 - Historical firmware phase numbers (3B.1, 3B.2, and all non-3B phases
   elsewhere in `CONTEXT.md`) are never renumbered by this document - it
   only adds the 3B.6-3B.10 continuation for cross-repo tracking.
+- 3B.8's first real-hardware boot attempt did not reach Wi-Fi association,
+  let alone the button/MQTT/event-delivery steps beyond it - do not treat
+  3B.8 as validated, or the 3B.6-3B.7 `Sent=1` confirmation as proof the
+  full chain works from a real button, until a retest with the new Wi-Fi
+  diagnostics actually succeeds.

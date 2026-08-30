@@ -110,11 +110,13 @@ exactly as `esp32-c3-dev-mqtt` does. CI compiles this environment against
 the committed placeholder example header only (no real Wi-Fi/AWS
 connection attempted, no hardware flashed) - see `.github/workflows/ci.yml`.
 
-## Manual flash and test procedure (future, on real hardware)
+## Manual flash and test procedure (retest pending after the Wi-Fi diagnostics fix)
 
-This has **not yet been run on real hardware** - see Honest status below.
-The intended procedure, mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT
-smoke test:
+This has been run on real hardware once - see "Real bench observation:
+first boot never associated with Wi-Fi" below - and the association
+itself did not succeed. A retest with this pass's added diagnostics is
+still needed; see Honest status. The intended procedure, mirroring
+`docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
 
 1. Wire the button as shown above.
 2. Generate `include/interbridge_dev_secrets.h` for a DEV device identity
@@ -123,8 +125,15 @@ smoke test:
    AWS IoT Thing).
 3. `pio run -e esp32-c3-dev-ring-simulator -t upload` and attach the
    serial monitor.
-4. Confirm the boot log line `[DEV RING] button initialized gpio=20
+4. Confirm the boot log lines `[DEV RING] previous_reset=...
+   wifi_config=present` and `[DEV RING] button initialized gpio=20
    (INPUT_PULLUP, active-low)`.
+4a. Watch for `[DEV RING] Wi-Fi connect requested; next_attempt_ms=...`
+    immediately after boot, and then either `[DEV RING] wifi
+    event=connected` + `[DEV RING] wifi event=got_ip`, or a `[DEV RING]
+    wifi event=disconnected reason=N (...)` line naming the actual
+    disconnect reason. If Wi-Fi still does not associate, this is exactly
+    the evidence the previous attempt lacked - capture it verbatim.
 5. Wait for `[DEV RING] state ... -> online` (Wi-Fi → DNS → NTP → MQTT
    connect, identical cascade to the DEV MQTT smoke test).
 6. Press the button once. Expect, in order:
@@ -204,18 +213,70 @@ board - see Honest status below. The minimal slice of **Phase 3B.9**
 needed to actually display a data-only FCM notification on Android is in
 progress (mobile repo); the full call UI is separate future work.
 
+## Real bench observation: first boot never associated with Wi-Fi
+
+A real bench test (clean build, fresh upload, the same ESP32-C3 board,
+Wi-Fi network, and credentials already validated successfully by
+`esp32-c3-dev-mqtt`) produced only:
+
+```
+[DEV RING] local_status=wifi wifi=down time=pending mqtt=down outbox_size=0 uptime_s=120
+```
+
+repeated at every 15s heartbeat, for a full 120s: Wi-Fi never associated.
+Because the same network/credentials work for the DEV MQTT smoke
+environment on the same physical board, an SSID/password/network problem
+was ruled out as the explanation - the investigation focused on the
+simulator's own code instead.
+
+**What the comparison against `mqtt_smoke_main.cpp` found:** the
+connectivity bring-up *logic* itself was already equivalent - both files
+drive the same `DevMqttSmokeState` state machine, call `WiFi.mode(WIFI_STA)`
++ `WiFi.begin()` only on its `ConnectWifi` action, use the identical
+retry/backoff policy, call `WiFi.disconnect(false, false)` only on
+`RecoverWifi` (radio stays on, credentials are kept), never call
+`ESP.restart()`, and build with identical flags/board. No functional
+divergence in *when* Wi-Fi actions are authorized was found.
+
+**What was actually missing: observability.** The simulator had no
+`WiFi.onEvent()` handler and none of `mqtt_smoke_main.cpp`'s per-action
+log lines (`Wi-Fi connect requested`, DNS/MQTT retry timing, state
+transitions, `wifi recovery requested`) or boot diagnostics
+(`previous_reset=...`). The single 15s heartbeat could show `wifi=down`
+but had no way to reveal *why* - whether `WiFi.begin()` was ever reached,
+whether an association attempt failed with a specific reason (e.g.
+`no_ap_found`/`timeout`), or whether a silent reset loop occurred. This
+pass adds that parity, copying `mqtt_smoke_main.cpp`'s own real-hardware-
+validated pattern verbatim (`onWifiEvent()`, `wifiDisconnectReasonName()`,
+`resetReasonName()`, and a log line for every `DevSmokeAction`) rather
+than inventing a different logging mechanism - see
+`src/dev/dev_ring_simulator_main.cpp`. `mqtt_smoke_main.cpp` itself was
+**not modified** (it is already real-hardware-validated; duplicating its
+small, pure diagnostic helpers into the new file carries far less risk
+than editing it).
+
+**This does not identify a root cause** - it makes the next boot capable
+of showing one. No fix has been guessed at (GPIO20 was considered as a
+possible contributing factor and explicitly not touched or reassigned,
+since there is no evidence tying it to the association failure; see "Why
+GPIO20" above for the pin-budget constraint that produced it). The retest
+in the Manual flash and test procedure above (step 4a in particular) is
+what will actually show whether `WiFi.begin()` fires, whether an
+`ARDUINO_EVENT_WIFI_STA_DISCONNECTED` event ever arrives and with what
+reason code, or whether something else (e.g. a reset loop, visible via a
+changing `previous_reset=` value across reconnects) is happening instead.
+
 ## Honest status
 
-**Implemented and compiled. Native tests pass locally; this update also
-fixes two real defects found by CI on the previous commit (a dangling
-reference into a temporary `std::vector` returned by
-`IEventOutbox::pending()`, and test helpers that drove
-`DevRingButtonController` directly instead of through
-`DevRingEventCoordinator::update()`, silently skipping the outbox enqueue
-and then calling `.back()` on an empty container - see
-`test/test_dev_ring_event/test_main.cpp`). Whether this fix is actually
-green on GitHub Actions CI must be confirmed by that run itself - this
-document does not assert a passing CI result on its own.**
+**Implemented and compiled. `esp32-c3-dev-ring-simulator` has been
+flashed and booted on real hardware once, and Wi-Fi did not associate
+within 120s - see "Real bench observation" above. This pass adds Wi-Fi
+event/diagnostic logging parity with the already-validated
+`esp32-c3-dev-mqtt` so the cause is actually observable on the next boot;
+it does not itself claim the association problem is fixed. A hardware
+retest is still required. Button behavior, MQTT connectivity, and
+end-to-end event delivery from a real physical press remain unvalidated
+on hardware.**
 
 - Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
   cover: one press → exactly one `RING_DETECTED`; holding the button
@@ -235,12 +296,13 @@ document does not assert a passing CI result on its own.**
   `pio run -e esp32dev-si3050-clock-meter` all still compile successfully
   and are unaffected in source (only `platformio.ini` gained one new
   exclusion line per environment to keep `dev_ring_simulator_main.cpp`
-  out of them) - confirming this DEV-only addition does not alter any
-  other build.
-- **Not yet done**: flashing a real board, wiring the physical button,
-  and running the manual procedure above. GPIO20's electrical behavior
-  under `INPUT_PULLUP` on this specific module, the end-to-end AWS IoT
-  delivery, and the offline/reconnect replay have only been exercised
-  through native fakes (`FakeDevRingButtonInput`, `FakeDeviceTransport`),
-  not real hardware - this is true even though 3B.6/3B.7 are now deployed
-  in DEV, since neither of those exercised a real physical button.
+  out of them, from the original 3B.8 commit) - confirming this DEV-only
+  addition does not alter any other build.
+- **Not yet done**: a hardware retest with the new diagnostics, wiring
+  the physical button, and running the rest of the manual procedure
+  above. GPIO20's electrical behavior under `INPUT_PULLUP` on this
+  specific module, the end-to-end AWS IoT delivery, and the offline/
+  reconnect replay have only been exercised through native fakes
+  (`FakeDevRingButtonInput`, `FakeDeviceTransport`), not real hardware -
+  this is true even though 3B.6/3B.7 are now deployed in DEV, since
+  neither of those exercised a real physical button.

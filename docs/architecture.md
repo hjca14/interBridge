@@ -440,6 +440,15 @@ like `main.cpp`'s production outbox loop - the same `event_id` survives
 any retry or offline period. See `docs/dev-ring-simulator.md` for the
 wiring, GPIO rationale, and manual test procedure.
 
+`dev_ring_simulator_main.cpp`'s Wi-Fi event handler (`onWifiEvent()`),
+per-`DevSmokeAction` log lines, and boot diagnostics
+(`resetReasonName()`) are a deliberate line-for-line duplication of
+`mqtt_smoke_main.cpp`'s own real-hardware-validated logging pattern
+(added after a first real bench boot associated to neither, with no
+diagnostic to explain why - see `docs/dev-ring-simulator.md` > "Real
+bench observation: first boot never associated with Wi-Fi"), not a new
+mechanism. `mqtt_smoke_main.cpp` itself was not modified.
+
 ## MQTT/mTLS command lifecycle (Phase 2D)
 
 The composition root retains the existing layering: Wi-Fi readiness gates MQTT;

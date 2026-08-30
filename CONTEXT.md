@@ -1154,6 +1154,42 @@ this pass:)*
   unchanged; **the authoritative confirmation is the next GitHub Actions
   run on this branch**, not this local run - see the PR for that run's
   actual result.
+- **Follow-up finding (same Phase 3B.8 work, before merge): the first
+  real-hardware boot of `esp32-c3-dev-ring-simulator` did not associate
+  to Wi-Fi within 120s** (`[DEV RING] local_status=wifi wifi=down
+  time=pending mqtt=down outbox_size=0 uptime_s=120`, repeated at every
+  heartbeat), on the same board/network/credentials `esp32-c3-dev-mqtt`
+  already connects successfully with - ruling out SSID/password/network
+  as the explanation. A line-by-line comparison against
+  `mqtt_smoke_main.cpp` found the connectivity **logic** already
+  equivalent: both drive the identical `DevMqttSmokeState` state machine,
+  call `WiFi.mode(WIFI_STA)` + `WiFi.begin()` only on its `ConnectWifi`
+  action, share the same retry/backoff policy, call
+  `WiFi.disconnect(false, false)` only on `RecoverWifi`, never
+  `ESP.restart()`, and build with identical flags/board - no functional
+  divergence in *when* Wi-Fi actions are authorized was found. What was
+  genuinely missing was **observability**: the simulator had no
+  `WiFi.onEvent()` handler, no boot diagnostics
+  (`previous_reset=`/`resetReasonName()`), and none of
+  `mqtt_smoke_main.cpp`'s per-action log lines (connect-requested,
+  DNS/MQTT retry timing, state transitions, wifi-recovery-requested) - the
+  single 15s heartbeat could show `wifi=down` but nothing about *why*.
+  Fixed by adding that exact logging pattern (copied verbatim from
+  `mqtt_smoke_main.cpp`'s own already-hardware-validated helpers -
+  `onWifiEvent()`, `wifiDisconnectReasonName()`, `resetReasonName()`, and
+  a log line per `DevSmokeAction`) into `dev_ring_simulator_main.cpp`
+  itself, without modifying `mqtt_smoke_main.cpp` at all (it is already
+  validated on real hardware; duplicating a few small, pure diagnostic
+  helpers is lower-risk than editing it). **This closes an observability
+  gap, not a proven functional bug** - no speculative fix (e.g.
+  reassigning GPIO20) was made without hardware evidence tying it to the
+  failure; see `docs/dev-ring-simulator.md` > "Real bench observation:
+  first boot never associated with Wi-Fi" for the full reasoning. A
+  hardware retest with these diagnostics is still required to see the
+  actual disconnect reason (or confirm/rule out a silent reset loop via a
+  changing `previous_reset=` value) - **still not validated on real
+  hardware**; button behavior, MQTT connectivity, and end-to-end delivery
+  from a real press remain unexercised on hardware.
 
 ## Future Work
 

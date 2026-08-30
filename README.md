@@ -162,10 +162,15 @@ smoke environment's connectivity state machine and the existing
 `MqttTopics`/`Esp32AwsIotTransport`/`IEventOutbox` contract rather than
 inventing a new one, and never touches the real Si3050 driver stack,
 provisioning, BLE, or production Wi-Fi/AWS composition. Implemented and
-compiled (native tests pass, all PlatformIO environments still build);
-**not yet validated on real hardware** - see
+compiled (native tests pass, all PlatformIO environments still build); a
+first real-hardware boot did not associate to Wi-Fi within 120s on the
+same board/network/credentials already validated by `esp32-c3-dev-mqtt`,
+which turned out to be a missing-diagnostics problem, not a network one -
+Wi-Fi event/action logging parity with `esp32-c3-dev-mqtt` has since been
+added, and **a hardware retest is still required** - see
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) for the wiring
-diagram, GPIO rationale, and manual test procedure, and
+diagram, GPIO rationale, manual test procedure, and the real bench
+observation, and
 [docs/roadmap-3b.md](docs/roadmap-3b.md) for how this fits with the rest
 of the (cross-repo) ring-notification pipeline.
 

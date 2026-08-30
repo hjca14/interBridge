@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include <esp_sntp.h>
+#include <esp_system.h>
 
 #include "interbridge_dev_secrets.h"
 #include "dev_ring_simulator_config.h"
@@ -36,6 +37,25 @@
 // production: MqttTopics::eventsIngest(), Esp32AwsIotTransport, and the
 // existing IEventOutbox contract - see DevRingEventCoordinator/
 // publishPendingEvents (src/dev/dev_ring_event.*).
+//
+// The Wi-Fi event handler, per-action diagnostic log lines, and boot
+// diagnostics below deliberately mirror mqtt_smoke_main.cpp's own
+// (already real-hardware-validated - see docs/mqtt-dev-smoke-test.md)
+// pattern line for line, rather than inventing a different logging
+// mechanism, after a first bench boot of this environment produced only
+// "wifi=down" heartbeats for 120s with no way to tell whether
+// WiFi.begin() was ever reached, whether an association attempt actually
+// failed (and why), or whether a silent reset loop occurred - none of
+// that was observable before this pass. A full side-by-side comparison
+// of the two files' connectivity bring-up did not find a functional
+// difference: both drive the identical DevMqttSmokeState state machine
+// with WiFi.mode(WIFI_STA) + WiFi.begin() issued only on its ConnectWifi
+// action, the same retry/backoff policy, WiFi.disconnect(false, false)
+// only on RecoverWifi (radio stays on, credentials are kept), no periodic
+// restart, and identical build flags/board. This pass therefore closes an
+// observability gap, not a proven logic bug - see docs/dev-ring-
+// simulator.md > Honest status for what the next real hardware boot
+// still needs to confirm.
 namespace {
 using namespace interbridge;
 constexpr uint16_t kMqttPort = 8883;
@@ -101,6 +121,51 @@ DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
 // which this environment does not need since it never subscribes.
 bool wasConnected = false;
 
+const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout";
+        default: return "other";
+    }
+}
+
+// Names only the specific SDK-defined reason codes observed on real
+// hardware, referencing esp_wifi_types.h's own named constants directly -
+// not a hand-copied duplicate of the whole wifi_err_reason_t enum (which
+// would drift against future core versions). Anything else stays
+// numeric-only in the log line already printed alongside this. Mirrors
+// mqtt_smoke_main.cpp's identical helper verbatim.
+const char* wifiDisconnectReasonName(uint8_t reason) {
+    switch (reason) {
+        case WIFI_REASON_NO_AP_FOUND: return "no_ap_found";
+        case WIFI_REASON_TIMEOUT: return "timeout";
+        default: return nullptr;
+    }
+}
+
+void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+        const uint8_t reason = info.wifi_sta_disconnected.reason;
+        const char* name = wifiDisconnectReasonName(reason);
+        if (name) {
+            Serial.printf("[DEV RING] wifi event=disconnected reason=%u (%s)\n",
+                          static_cast<unsigned>(reason), name);
+        } else {
+            Serial.printf("[DEV RING] wifi event=disconnected reason=%u\n",
+                          static_cast<unsigned>(reason));
+        }
+    } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+        Serial.println("[DEV RING] wifi event=connected");
+    } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        Serial.println("[DEV RING] wifi event=got_ip");
+    }
+}
+
 const char* stateName(DevSmokeState state) {
     switch (state) {
         case DevSmokeState::WaitingForWifi: return "wifi";
@@ -132,6 +197,12 @@ void setup() {
     while (!Serial && !DevMqttSmokeState::deadlineReached(millis(), serialDeadline)) delay(10);
     Serial.println("[DEV RING] bench-only physical ring simulator; not production firmware");
     Serial.println("[DEV RING] local configuration loaded into transient DEV memory (values not logged)");
+    Serial.printf("[DEV RING] previous_reset=%s wifi_config=present\n", resetReasonName(esp_reset_reason()));
+
+    // Registered before the first ConnectWifi action ever fires (that
+    // only happens once loop() runs) so no early disconnect/connect event
+    // can be missed - same ordering as mqtt_smoke_main.cpp.
+    WiFi.onEvent(onWifiEvent);
 
     pinMode(kDevRingButtonPin, INPUT_PULLUP);
     Serial.printf("[DEV RING] button initialized gpio=%u (INPUT_PULLUP, active-low)\n",
@@ -166,37 +237,76 @@ void loop() {
     }
     switch (action) {
         case DevSmokeAction::ConnectWifi:
+            // The state machine authorizes exactly one begin call per retry;
+            // leave interface recovery policy to the Wi-Fi driver for now.
             WiFi.mode(WIFI_STA);
             WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
+            Serial.printf("[DEV RING] Wi-Fi connect requested; next_attempt_ms=%lu delay_ms=%lu\n",
+                          static_cast<unsigned long>(connectivity.retryAtMs()),
+                          static_cast<unsigned long>(connectivity.retryAtMs() - now));
             break;
         case DevSmokeAction::ResolveDns: {
             IPAddress resolved;
             const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
             const bool resolvedOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
             connectivity.dnsResult(now, resolvedOk);
+            Serial.printf("[DEV RING] DNS: %s\n", resolvedOk ? "ready" : "pending");
+            if (!resolvedOk) {
+                Serial.printf("[DEV RING] next DNS attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.retryAtMs()),
+                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+            }
             break;
         }
         case DevSmokeAction::ConfigureTime:
             clockSource.syncStarted();
             configTime(0, 0, "pool.ntp.org", "time.google.com");
+            Serial.println("[DEV RING] time sync requested");
             break;
         case DevSmokeAction::ConnectMqtt: {
+            // DNS preflight, same rationale as mqtt_smoke_main.cpp: a
+            // Wi-Fi association surviving does not prove the resolver is
+            // actually working - resolve explicitly, once, before ever
+            // attempting the heavier TLS/socket connect.
             const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
             IPAddress preflightResolved;
             const bool dnsOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, preflightResolved) == 1;
+            Serial.printf("[DEV RING] network preflight dns=%s\n", dnsOk ? "ok" : "failed");
             if (!dnsOk) {
                 connectivity.networkPreflightFailed(now);
+                Serial.printf("[DEV RING] connectivity_failures=%lu next DNS attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
+                              static_cast<unsigned long>(connectivity.retryAtMs()),
+                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
                 break;
             }
+
             const bool connected =
                 clockSource.hasValidTime() && transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
             connectivity.mqttResult(now, connected);
             safeStatus("MQTT connect", connected);
+            if (!connected) {
+                Serial.printf("[DEV RING] connectivity_failures=%lu next MQTT attempt at_ms=%lu delay_ms=%lu\n",
+                              static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
+                              static_cast<unsigned long>(connectivity.retryAtMs()),
+                              static_cast<unsigned long>(connectivity.retryAtMs() - now));
+            }
             break;
         }
         case DevSmokeAction::RecoverWifi:
+            // Authorized only after several consecutive DNS/TLS connectivity
+            // failures with Wi-Fi already associated - a conservative,
+            // cooldown-limited escalation, never a periodic reboot and
+            // never ESP.restart().
+            Serial.println("[DEV RING] wifi recovery requested");
             if (transport.isConnected()) transport.disconnect();
+            // wifioff=false keeps the radio on; eraseap=false keeps the
+            // stored Wi-Fi credentials - only the current association is
+            // dropped. The ordinary ConnectWifi/backoff flow (unchanged)
+            // re-associates from here.
             WiFi.disconnect(false, false);
+            Serial.printf("[DEV RING] wifi recovery cooldown until_ms=%lu\n",
+                          static_cast<unsigned long>(connectivity.wifiRecoveryCooldownUntilMs()));
             break;
         case DevSmokeAction::None: break;
     }
