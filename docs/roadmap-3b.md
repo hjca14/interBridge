@@ -15,7 +15,7 @@ those files for the full record of 3B.1-3B.2.
 | 3B.3-3B.5 | Not tracked in this repository/document | - | Out of scope here |
 | 3B.6 | Backend FCM sender: `telemetry_ingestion` invokes `push_sender`, which delivers a push notification via Firebase Cloud Messaging for `RING_DETECTED` (and related) Basic Ingest events | Backend repo | **Implemented and deployed in DEV** - the backend has accepted a real event end-to-end and recorded `Sent=1` for it |
 | 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | **Implemented and deployed in DEV** |
-| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; four real-hardware boots have not associated to Wi-Fi. The concurrent-retry Wi-Fi coordinator defect is fixed and confirmed. A WPA2 test hotspot retest produced a different failure (reason=201, AP not found) than the home network (reason=2/202, auth rejected) - neither root-caused. Sanitized SSID/password-length/placeholder diagnostics and a controlled, rate-limited Wi-Fi scan have been added to distinguish these causes on the next retest. See `docs/dev-ring-simulator.md`'s four "Real bench observation" sections.** |
+| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; five real-hardware boots so far. The concurrent-retry Wi-Fi coordinator defect is fixed and confirmed. The first four boots failed to associate (reason=201 on a WPA2 test hotspot, reason=2/202 on the home network, neither root-caused); the fifth found that disconnecting the button from GPIO20 let Wi-Fi associate cleanly to `Online`, and reconnecting it to GPIO20 dropped Wi-Fi again - the button has moved to GPIO4 for this reason. A retest confirming GPIO4 and isolating the remaining reason codes is still required. See `docs/dev-ring-simulator.md`'s five "Real bench observation" sections.** |
 | 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal slice (displaying a data-only FCM notification) is underway; the full call UI is not started |
 | 3B.10 | iOS/APNs call/notification experience for an incoming ring | Mobile (iOS) repo | Not started (not in this repo) |
 
@@ -58,3 +58,18 @@ those files for the full record of 3B.1-3B.2.
   the next retest - see `docs/dev-ring-simulator.md` > "Wi-Fi config and
   scan diagnostics". Do not assume the credential or either AP is correct
   until that retest actually confirms it.
+- A fifth test found a real, reproducible cause unrelated to credentials
+  or either AP: with the ring-simulator button physically disconnected
+  from GPIO20, Wi-Fi associated all the way to `Online`; reconnecting it
+  to GPIO20 disconnected Wi-Fi again. The exact physical mechanism is
+  still unconfirmed (alternate pin function, this mounting, this board
+  sample, or RF/electrical interference are all still possible), and
+  whether GPIO20 also explains the earlier reason=201/2/202 failures is
+  not established - only that removing it let the firmware reach
+  `Online` at least once. GPIO20 is no longer used for the ring
+  simulator's button; it now uses GPIO4 (a deliberate, DEV-only overlap
+  with the Si3050's DRX pin - safe only because this environment never
+  touches the real Si3050). See `docs/dev-ring-simulator.md` > "Real
+  bench observation: GPIO20 causes Wi-Fi to disconnect". A further
+  retest on GPIO4 is required before treating Wi-Fi association as
+  solved.

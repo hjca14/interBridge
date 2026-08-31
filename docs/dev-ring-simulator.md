@@ -51,7 +51,7 @@ ring detection signal. See Scope and safety below.
                  ESP32-C3 Super Mini
                 +---------------------+
                 |                     |
-                |   GPIO20 (RX0) o----+-----+
+                |    GPIO4 (DRX) o----+-----+
                 |                     |     |
                 |                 GND o--+  |
                 +---------------------+  |  |
@@ -64,13 +64,19 @@ ring detection signal. See Scope and safety below.
                                      +------------+
 ```
 
-- One leg of a momentary push button to **GPIO20**, the other leg to
+- One leg of a momentary push button to **GPIO4**, the other leg to
   **GND**.
-- No external resistor needed: `pinMode(GPIO20, INPUT_PULLUP)` enables the
+- No external resistor needed: `pinMode(GPIO4, INPUT_PULLUP)` enables the
   ESP32-C3's internal pull-up. The pin reads **HIGH when released** and
   **LOW when pressed** (active-low).
 
-### Why GPIO20, and why this is provisional
+> **GPIO4 supersedes an earlier GPIO20 choice** after real hardware
+> showed GPIO20 reliably disconnects Wi-Fi on this specific bench
+> assembly - see "Real bench observation: GPIO20 causes Wi-Fi to
+> disconnect" below before assuming GPIO4 (or any pin on this board) is
+> risk-free either.
+
+### Why GPIO4, and why this is provisional
 
 The validated bench board (generic 4 MB ESP32-C3 Super Mini, see
 `platformio.ini`/`CONTEXT.md`) exposes only 15 GPIOs total: 0-10 and
@@ -78,21 +84,56 @@ The validated bench board (generic 4 MB ESP32-C3 Super Mini, see
 
 | Pins | Committed to |
 |---|---|
-| 0, 1, 2, 3, 4, 5, 6, 7, 8, 10 | Real Si3050 wiring (`src/intercom/si3050/si3050_pins.h`) |
-| 9 | BOOT/download-mode strap |
-| 18, 19 | Native USB D-/D+ (serial console) |
-| 20, 21 | *Documentation-reserved only* for a future physical config/reset button and status LED (`kSi3050ReservedPinButton`/`kSi3050ReservedPinStatusLed`) - **neither is implemented in any current code path** (`Esp32ButtonInput`/`Esp32StatusIndicator` remain unassigned stubs) |
+| 0, 1, 2, 3, **4**, 5, 6, 7, 8, 10 | Real Si3050 wiring (`src/intercom/si3050/si3050_pins.h`) - GPIO4 is the Si3050's DRX line (`kSi3050PinPcmDrx`) |
+| 2, 8, 9 | BOOT/strapping pins - excluded |
+| 18, 19 | Native USB D-/D+ (serial console) - reserved |
+| 20, 21 | *Documentation-reserved only* for a future physical config/reset button and status LED (`kSi3050ReservedPinButton`/`kSi3050ReservedPinStatusLed`), **and ruled out for this bench rig by a real hardware test** - GPIO20 reliably disconnected Wi-Fi when the button was wired to it; see the observation below. GPIO21 was not itself tested but is avoided out of the same caution. |
 
-That leaves no genuinely free GPIO on this specific board. The explicit,
-user-approved decision for this DEV-only environment is to temporarily
-reuse **GPIO20**, scoped exclusively to `esp32-c3-dev-ring-simulator` (see
-`src/dev/dev_ring_simulator_config.h`, which also compile-time-asserts
-this pin never collides with a real Si3050/BOOT/USB pin). This is **not**
-a production pin assignment. It must be revisited once the Si3050 and the
-final board - including the real physical config/reset button - are
-integrated together on the same physical unit; at that point GPIO20 may
-no longer be free for this simulator and a different (or no) GPIO should
-be chosen.
+That leaves no pin on this board free of *some* real or planned use.
+GPIO20 was the first choice (documented as provisional from the start),
+but a real bench test found it disconnects Wi-Fi association on this
+specific assembly - see "Real bench observation: GPIO20 causes Wi-Fi to
+disconnect" below. The current, explicit choice is **GPIO4**
+(`kSi3050PinPcmDrx`, the Si3050's DRX line) - a deliberate overlap with
+one real Si3050 pin, safe **only** because `esp32-c3-dev-ring-simulator`
+never compiles or initializes any Si3050 code and no Si3050 is
+physically attached to the board during this bench test (see Scope and
+safety above). `src/dev/dev_ring_simulator_config.h` compile-time-asserts
+the button pin is exactly this one approved overlap - not any other
+Si3050 pin, and not the BOOT/USB pins. This is **not** a production pin
+assignment and must be revisited once the Si3050 and the final board -
+including the real physical config/reset button - are integrated
+together on the same physical unit.
+
+## Real bench observation: GPIO20 causes Wi-Fi to disconnect
+
+A controlled hardware test isolated a real, reproducible correlation
+between the GPIO20 button wiring and Wi-Fi association, independent of
+credentials, AP, or the Wi-Fi coordination fixes above:
+
+- **Button/GPIO20 physically disconnected**: the firmware associated and
+  connected all the way through, Wi-Fi → DNS → NTP → MQTT → `Online`.
+- **Button reconnected to GPIO20**: Wi-Fi disconnected again.
+
+This is the first time in this investigation that a change *not* related
+to credentials, the AP, or the shared Wi-Fi coordinator produced a clean
+association. **This does not, by itself, explain the earlier reason=2/
+202/201 disconnects** (that thread remains open - see the "Real bench
+observation" sections above), and it does **not** prove *why* GPIO20
+causes this. Plausible, still-unconfirmed explanations include an
+alternate silicon function on GPIO20 on this specific module (it is one
+of the two pins conventionally mapped to hardware UART0, even though this
+firmware's console runs over native USB-CDC instead), something specific
+to this button/wiring's physical mounting, a pinout quirk of this
+particular board sample, or electrical/RF interference from the wire
+run. **The correlation itself - disconnected wiring associates cleanly,
+reconnecting it disconnects Wi-Fi - was reproduced and is sufficient to
+abandon GPIO20 (and, out of caution, GPIO21) for this specific bench rig,
+without waiting for a root cause.** Nothing about the real Si3050 pin map
+(`src/intercom/si3050/si3050_pins.h`) or production firmware is affected
+by this - GPIO20/21 remain exactly as documented there (reserved for a
+future config/reset button and status LED); only this DEV-only
+simulator's OWN button pin choice changed.
 
 ## Build
 
@@ -112,13 +153,21 @@ exactly as `esp32-c3-dev-mqtt` does. CI compiles this environment against
 the committed placeholder example header only (no real Wi-Fi/AWS
 connection attempted, no hardware flashed) - see `.github/workflows/ci.yml`.
 
-## Manual flash and test procedure (retest pending with the new Wi-Fi diagnostics)
+## Manual flash and test procedure (retest pending on GPIO4)
 
-This has been run on real hardware four times, and Wi-Fi association has
-not yet succeeded on any attempt - see all four "Real bench observation"
-sections below. A further retest with this pass's SSID/password/scan
-diagnostics is still needed; see Honest status. The intended procedure,
-mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
+This has been run on real hardware five times. The first four never
+associated - see the four earlier "Real bench observation" sections
+below. **The fifth reached `Online` (Wi-Fi → DNS → NTP → MQTT) for the
+first time in this investigation, with the button physically
+disconnected from GPIO20** - and lost Wi-Fi again as soon as the button
+was reconnected to GPIO20 (see "Real bench observation: GPIO20 causes
+Wi-Fi to disconnect"). This is a strong, but not yet conclusive, signal
+that GPIO20 itself - not the credential or the AP - was contributing to
+the earlier failures. The button now moves to GPIO4 for this DEV-only
+simulator; a further retest confirming both the button on GPIO4 *and* a
+full Wi-Fi→MQTT→`Online` connection together is still needed - see
+Honest status. The intended procedure, mirroring
+`docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
 
 1. Wire the button as shown above.
 2. Generate `include/interbridge_dev_secrets.h` for a DEV device identity
@@ -128,7 +177,7 @@ mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
 3. `pio run -e esp32-c3-dev-ring-simulator -t upload` and attach the
    serial monitor.
 4. Confirm the boot log lines `[DEV RING] previous_reset=...` and
-   `[DEV RING] button initialized gpio=20 (INPUT_PULLUP, active-low)`.
+   `[DEV RING] button initialized gpio=4 (INPUT_PULLUP, active-low)`.
 4a. Confirm `[DEV RING] config=valid ssid_bytes=N password_bytes=N
     placeholder=false` right after boot - `config=invalid` or
     `placeholder=true` here means the compiled binary does not actually
@@ -332,10 +381,12 @@ prove Wi-Fi will associate.** Reason 2/202's specific underlying cause
 (credential, AP-side rejection, signal, or something else) has not been
 separately diagnosed and **must be re-evaluated on the next hardware
 retest**, now that the firmware itself will no longer interrupt its own
-association attempts. No fix has been guessed at for GPIO20 either (still
-considered a possible contributing factor only in the sense that it
-remains unvalidated, not because any evidence ties it to this specific
-failure) - see "Why GPIO20" above.
+association attempts. No fix had been guessed at for GPIO20 at this point
+in the investigation (it was only flagged as unvalidated, not because any
+evidence tied it to this specific failure). **Update: a later test did
+find real evidence tying GPIO20 to Wi-Fi disconnection - see "Real bench
+observation: GPIO20 causes Wi-Fi to disconnect" further below, which
+supersedes this paragraph's "no evidence" framing.**
 
 ## Real bench observation: concurrent retry gone, auth still fails (reason=2/202)
 
@@ -456,32 +507,102 @@ credential/AP conclusion is drawn by this pass.** A hardware retest with
 these diagnostics against both the WPA2 test hotspot and the home network
 is still required.
 
+### Pre-retest review: three defects found before ever flashing the diagnostics above
+
+A review of the diagnostics above, done before the planned hardware
+retest, found three real defects - none discovered by hardware yet, all
+fixed here so the retest measures the intended behavior:
+
+1. **The association timeout could be silently shortened by the scan
+   itself.** `DevMqttSmokeState::update()` armed `wifiAttemptInFlight_`'s
+   deadline (`nowMs + wifiAssociationTimeoutMs_`) at the moment
+   `ConnectWifi` was issued - before the caller's handler ran the
+   (possibly multi-second, blocking) diagnostic scan and only then called
+   the real `WiFi.begin()`. A slow scan would eat into the timeout budget
+   before association had even started. Fixed with a new
+   `DevMqttSmokeState::wifiAssociationStarted(nowMs)`, called with a
+   freshly-read `millis()` immediately alongside the real `WiFi.begin()`
+   (after any scan), which re-arms the deadline from that real start
+   time. The provisional deadline `update()` still sets at issue time is
+   now documented as exactly that - provisional, meant to be superseded.
+   No change to backoff or to when `ConnectWifi` is authorized.
+2. **A failed scan call was indistinguishable from a scan that
+   legitimately found zero networks.** `WiFi.scanNetworks()` returning a
+   negative `WIFI_SCAN_*` code was being fed into the same summarizer as
+   a successful scan with an empty result list, so both ended up logging
+   `networks_found=0 configured_ssid_found=false` - impossible to tell
+   apart. `WifiScanSummary` now carries an explicit `status` (`Success`/
+   `Failed`) plus a sanitized `errorCode`; `formatWifiScanLine()` prints
+   `scan_status=failed error=N` and omits `configured_ssid_found`/`rssi`/
+   `channel`/`auth` entirely in that case, rather than printing
+   misleading zeros/false - and this status is preserved in
+   `lastWifiScanSummary`, so every later repeated line (heartbeat,
+   pre-`WiFi.begin()`) keeps reporting it correctly, not just the one
+   log line printed at scan time.
+3. **`diagnoseCredentialField()` took `const std::string&`, so passing
+   the raw `INTERBRIDGE_DEV_WIFI_SSID`/`_PASSWORD` macros allocated a
+   fresh heap copy of the secret on every call** - and this function
+   runs on every heartbeat tick while Wi-Fi is down, potentially for as
+   long as the device stays offline. Changed to `std::string_view` (a
+   non-owning view, standard since C++17, which this project already
+   targets) for both `value` and `placeholder` - passing a `const char*`
+   literal now constructs a zero-allocation view instead. Only the
+   returned formatted line (pure metadata: lengths/booleans, never the
+   secret) is still a real `std::string`.
+
+New native tests for all three: the association timeout tracks the real
+`WiFi.begin()` time via `wifiAssociationStarted()` (and is a no-op with
+nothing in flight); a scan that succeeds with zero networks is
+distinguishable from a failed scan, and the failed status/error survives
+being formatted again much later; `diagnoseCredentialField()` is called
+directly against a `std::string_view` constructed from a raw `const
+char*` (a test that would fail to *compile*, not just fail an assertion,
+if the no-copy property ever regressed). See
+`test_wifi_association_started_rearms_timeout_from_the_real_begin_time`/
+`test_wifi_association_started_is_noop_when_nothing_in_flight` in
+`test/test_dev_mqtt_state`, and
+`test_valid_scan_with_zero_networks_differs_from_failed_scan`/
+`test_failed_scan_status_persists_across_repeated_formatting`/
+`test_diagnose_credential_field_works_from_a_non_owning_view_without_copying`
+in `test/test_dev_wifi_diagnostics`.
+
 ## Honest status
 
 **Implemented and compiled. `esp32-c3-dev-ring-simulator` has been
-flashed and booted on real hardware four times, and Wi-Fi has not yet
-associated on any attempt - see all four "Real bench observation"
-sections above. The concurrent-retry coordination defect in the shared
-`DevMqttSmokeState` (both DEV mains reissuing `WiFi.begin()` while a
-previous attempt was still outstanding) is confirmed fixed - the
-driver-level `wifi:sta is connecting, return error` error is gone.
-Association still fails: reason 2/202 (auth-stage rejection) persists
-unchanged on the home network, and a fourth retest against a dedicated
-WPA2 test hotspot produced a *different* failure, reason=201
-(`no_ap_found`) - the ESP32 never saw that access point at all. Neither
-result has been root-caused. This pass adds sanitized SSID/password
-length + placeholder-detection diagnostics and a controlled, rate-limited
-Wi-Fi scan (reported before every `WiFi.begin()`, at boot, and in the
-heartbeat while Wi-Fi is down) specifically to make the next retest able
-to distinguish "wrong credential bytes reached the binary" from "the
-ESP32 genuinely never received a beacon for that SSID" from "a real
-match was rejected at authentication" - it does not itself draw either
-conclusion. SSID/credential/AP correctness remain explicitly not
-confirmed either way. A separate, diagnostic-only `uint32_t` underflow in
-the "delay_ms=" log lines (`4294967291`, `4294967294` observed) is also
-fixed - display-only, no retry/backoff policy changed. Button behavior,
-MQTT connectivity, and end-to-end event delivery from a real physical
-press remain unvalidated on hardware.**
+flashed and booted on real hardware five times - see all five "Real
+bench observation" sections above. The concurrent-retry coordination
+defect in the shared `DevMqttSmokeState` (both DEV mains reissuing
+`WiFi.begin()` while a previous attempt was still outstanding) is
+confirmed fixed - the driver-level `wifi:sta is connecting, return
+error` error is gone. Wi-Fi association itself failed on the first four
+attempts (reason 2/202 on the home network, reason=201 against a WPA2
+test hotspot) and has **not been root-caused** for either network. The
+fifth test found a real, reproducible cause unrelated to credentials or
+either AP: with the button physically disconnected from GPIO20, the
+firmware associated cleanly all the way to `Online`; reconnecting the
+button to GPIO20 disconnected Wi-Fi again. **GPIO20 is no longer treated
+as a safe/neutral choice for this bench rig** - the button has moved to
+GPIO4 (a deliberate, DEV-only overlap with the Si3050's DRX pin, safe
+only because this environment never touches the real Si3050). The exact
+physical mechanism behind the GPIO20 finding is still unconfirmed
+(alternate pin function, this specific mounting, board-sample pinout, or
+RF/electrical interference are all still possible), and whether GPIO20
+was *also* the explanation for the earlier reason=2/202/201 failures is
+not established either - only that disconnecting it let the firmware
+reach `Online` at least once. A further hardware retest with the button
+now on GPIO4 is required before treating Wi-Fi association, the
+credential, or either AP as working end to end. Separately, this pass
+also fixed a diagnostic-only `uint32_t` underflow in the "delay_ms="
+log lines (`4294967291`, `4294967294` observed - display-only, no
+retry/backoff policy changed) and, in a pre-retest review before ever
+flashing the new SSID/password/scan diagnostics, three further defects -
+see "Pre-retest review" above - so the association timeout now correctly
+starts from the real `WiFi.begin()` time rather than before the scan, a
+failed scan is never confused with a scan that validly found zero
+networks, and the credential diagnostic no longer copies the Wi-Fi
+password onto the heap on every heartbeat tick. Button behavior, MQTT
+connectivity, and end-to-end event delivery from a real physical press
+remain unvalidated on hardware.**
 
 - Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
   cover: one press → exactly one `RING_DETECTED`; holding the button
@@ -504,37 +625,45 @@ press remain unvalidated on hardware.**
   its own separate, configurable timeout and allows a later retry; that
   timeout is `millis()`-wraparound-safe; the existing Wi-Fi interface
   recovery ladder (`RecoverWifi`) still works and its own reconnect
-  attempt is equally protected from reissue; and a burst of repeated
-  failure signals for the same attempt never causes more than one
-  `WiFi.begin()` at the single scheduled retry.
+  attempt is equally protected from reissue; a burst of repeated failure
+  signals for the same attempt never causes more than one `WiFi.begin()`
+  at the single scheduled retry; and (26 tests total in this suite now)
+  `wifiAssociationStarted()` correctly re-arms the timeout from the real
+  begin time when called after simulated scan delay, and is a no-op with
+  nothing in flight.
 - Native unit tests (`test_millis_until_saturates_and_is_wrap_safe` in
   `test/test_dev_mqtt_state`) cover the delay-display fix: an ordinary
   future deadline, a deadline already reached (saturates at 0 instead of
   underflowing), and both directions of the `millis()` wraparound.
-- Native unit tests (`test/test_dev_wifi_diagnostics`, 9 tests) cover the
-  new Wi-Fi config/scan diagnostics: placeholder detection, correct byte
+- Native unit tests (`test/test_dev_wifi_diagnostics`, 12 tests) cover the
+  Wi-Fi config/scan diagnostics: placeholder detection, correct byte
   lengths, a config summary that is only `valid` when both fields are
   non-empty and non-placeholder, a scan summary that correctly finds/does
   not find the configured SSID among fake scan results (including
-  RSSI/channel/auth extraction), and - run through the entire pipeline
-  with distinctive marker SSID/password/network-name strings - that the
-  formatted diagnostic lines never contain any of those secret/name
-  values, only the derived facts about them.
+  RSSI/channel/auth extraction), a scan that validly found zero networks
+  staying distinguishable from a failed scan call (with the failed
+  status/error surviving repeated formatting later), `diagnoseCredentialField()`
+  working directly against a `std::string_view` with no owning-`std::string`
+  copy required, and - run through the entire pipeline with distinctive
+  marker SSID/password/network-name strings - that the formatted
+  diagnostic lines never contain any of those secret/name values, only
+  the derived facts about them.
 - `pio run -e esp32-c3-dev-ring-simulator` and `pio run -e esp32-c3-dev-mqtt`
   compile successfully, with no new warnings.
 - `pio run -e esp32-c3`, `pio run -e esp32-c3-si3050-clock-probe`, and
   `pio run -e esp32dev-si3050-clock-meter` all still compile successfully
   and are unaffected in source - confirming this fix does not alter any
   other build.
-- **Not yet done**: a hardware retest with the new SSID/password/scan
-  diagnostics (against both the WPA2 test hotspot and the home network),
-  isolating the reason=201 and reason=2/202 root causes, wiring the
-  physical button, and running the rest of the manual procedure above.
-  GPIO20's electrical behavior under `INPUT_PULLUP` on this specific
-  module, the end-to-end AWS IoT delivery, and the offline/reconnect
-  replay have only been exercised through native fakes
-  (`FakeDevRingButtonInput`, `FakeDeviceTransport`, direct
-  `DevMqttSmokeState` calls), not real hardware - this is true even
-  though 3B.6/3B.7 are now deployed in DEV, since neither of those
-  exercised a real physical button or this
+- **Not yet done**: a hardware retest with the button now wired to GPIO4
+  instead of GPIO20, with the new SSID/password/scan diagnostics, against
+  both the WPA2 test hotspot and the home network - to confirm GPIO4
+  itself does not reproduce GPIO20's disconnect behavior, and to isolate
+  the still-open reason=201 and reason=2/202 root causes (now that GPIO20
+  is a known confound rather than a neutral variable). GPIO4's electrical
+  behavior under `INPUT_PULLUP` on this specific module, the end-to-end
+  AWS IoT delivery, and the offline/reconnect replay have only been
+  exercised through native fakes (`FakeDevRingButtonInput`,
+  `FakeDeviceTransport`, direct `DevMqttSmokeState` calls), not real
+  hardware - this is true even though 3B.6/3B.7 are now deployed in DEV,
+  since neither of those exercised a real physical button or this
   specific Wi-Fi coordination path.

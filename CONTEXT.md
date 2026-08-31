@@ -1374,6 +1374,94 @@ this pass:)*
   hotspot isolates a different failure mode (reason=201)" and "Wi-Fi
   config and scan diagnostics" for the full record. **Still not validated
   on real hardware.**
+- **Follow-up fix (same Phase 3B.8 work, before the planned hardware
+  retest, before merge): a pre-retest review of the diagnostics above
+  found and fixed three real defects, none yet observed on hardware.**
+  (1) `DevMqttSmokeState::update()` armed the Wi-Fi association attempt's
+  in-flight deadline at the moment `ConnectWifi` was issued - before the
+  caller's handler ran the (possibly multi-second, blocking) diagnostic
+  scan and only then called the real `WiFi.begin()`, so a slow scan could
+  silently consume part of the association timeout before association
+  even started. Fixed with a new `DevMqttSmokeState::wifiAssociationStarted(nowMs)`,
+  called by both DEV mains with a freshly-read `millis()` immediately
+  alongside the real `WiFi.begin()` (after any scan), re-arming the
+  deadline from that real start time; `update()`'s own deadline at issue
+  time is now explicitly documented as provisional. No change to backoff
+  or to when `ConnectWifi` is authorized. (2) A failed `WiFi.scanNetworks()`
+  call (negative return) was being summarized identically to a scan that
+  legitimately found zero networks - both logged
+  `networks_found=0 configured_ssid_found=false`, indistinguishable.
+  `WifiScanSummary` now carries an explicit `status`
+  (`WifiScanStatus::Success`/`Failed`) and a sanitized `errorCode`;
+  `formatWifiScanLine()` prints `scan_status=failed error=N` and omits
+  `configured_ssid_found`/`rssi`/`channel`/`auth` entirely rather than
+  misleading zeros/false, and this status persists correctly in
+  `lastWifiScanSummary` across every later repeated line (heartbeat,
+  pre-`WiFi.begin()`), not just the line printed at scan time. (3)
+  `diagnoseCredentialField()` took `const std::string&`, so passing the
+  raw `INTERBRIDGE_DEV_WIFI_SSID`/`_PASSWORD` macros allocated a fresh
+  heap copy of the secret on every call - and this runs on every
+  heartbeat tick while Wi-Fi is down, for as long as the device stays
+  offline. Changed to `std::string_view` (standard since C++17, which
+  this project already targets) for both `value` and `placeholder` -
+  passing a `const char*` literal now constructs a zero-allocation view;
+  only the returned formatted line (pure metadata) is still a real
+  `std::string`. 5 new native tests: 2 in `test/test_dev_mqtt_state`
+  (`wifiAssociationStarted()` correctly re-arms the timeout from a
+  simulated post-scan begin time, and is a no-op with nothing in flight -
+  26 tests total in that suite now) and 3 in
+  `test/test_dev_wifi_diagnostics` (a valid zero-network scan
+  distinguishable from a failed one; the failed status/error surviving
+  repeated formatting much later; `diagnoseCredentialField()` called
+  directly against a `std::string_view` built from a raw `const char*` -
+  a test that would fail to *compile*, not just fail an assertion, if the
+  no-copy property ever regressed - 12 tests total in that suite now).
+  Validated: all 39 native suites passed via the same locally available
+  MSVC used throughout this work (`pio test -e native` itself still
+  cannot run in this sandbox); all five required environments compiled
+  via real `pio run`. **Still purely diagnostic and pre-retest - no
+  credential/AP root cause is claimed fixed or ruled out, and this has
+  not been flashed to real hardware.**
+- **Follow-up finding + fix (same Phase 3B.8 work, before merge): a fifth
+  hardware test found a real, reproducible cause of the Wi-Fi failures
+  unrelated to credentials or either access point - the button's GPIO20
+  wiring itself.** With the button physically disconnected from GPIO20,
+  the firmware associated cleanly all the way to `Online` (Wi-Fi → DNS →
+  NTP → MQTT) - the first full success in this entire investigation;
+  reconnecting the button to GPIO20 disconnected Wi-Fi again. The exact
+  physical mechanism is **not** established (a candidate silicon
+  function on GPIO20, this specific button/wiring's mounting, a pinout
+  quirk of this board sample, or electrical/RF interference are all
+  still open), and this does not by itself prove GPIO20 was *also* the
+  cause of the earlier reason=201/2/202 disconnects recorded above - only
+  that removing it let the firmware reach `Online` at least once. The
+  correlation was reproduced (disconnect → succeeds, reconnect → fails)
+  and is treated as sufficient to abandon GPIO20 for this bench rig
+  without waiting for a root cause. Since this board has no other free
+  GPIO (see the exhaustive pin-budget accounting already in
+  `dev_ring_simulator_config.h`), and GPIO21 was never itself tested but
+  is avoided out of the same caution, the only remaining option is a
+  deliberate overlap with one real Si3050 pin - safe here specifically
+  because `esp32-c3-dev-ring-simulator` never compiles or initializes any
+  Si3050 code and no Si3050 is physically attached during this bench
+  test. `kDevRingButtonPin` now equals `kSi3050PinPcmDrx` (GPIO4); the
+  header's `static_assert`s were changed from "not equal to any Si3050
+  pin" to "equal to exactly this one approved overlap," so any future
+  edit to the button pin must deliberately update that assertion too -
+  it cannot silently drift to an unreviewed pin. **The real Si3050 pin
+  map (`src/intercom/si3050/si3050_pins.h`) and production firmware are
+  completely untouched** - this only changes which pin this DEV-only
+  bench button uses. No test files needed updating (none referenced the
+  GPIO number directly - they exercise `IDevRingButtonInput`/
+  `DevRingEventCoordinator` through fakes, never the real pin). Docs
+  (`docs/dev-ring-simulator.md`'s wiring diagram/"Why GPIO4" section and
+  a new "Real bench observation: GPIO20 causes Wi-Fi to disconnect",
+  `docs/roadmap-3b.md`, `README.md`) updated with this honestly: GPIO20
+  disconnected → `Online`; GPIO20 reconnected → Wi-Fi dropped; cause not
+  isolated; GPIO4 requires its own hardware retest before being trusted
+  either. Validated: all 39 native suites passed via MSVC; all five
+  required environments compiled via real `pio run`. **Still not
+  validated on real hardware with the button on GPIO4.**
 
 ## Future Work
 

@@ -7,40 +7,58 @@
 namespace interbridge {
 
 // Phase 3B.8 bench-only DEV physical ring simulator GPIO. See
-// docs/dev-ring-simulator.md for the full wiring diagram and rationale.
+// docs/dev-ring-simulator.md for the full wiring diagram and rationale,
+// including the real-hardware evidence that ruled out GPIO20 (see "Real
+// bench observation: GPIO20 causes Wi-Fi to disconnect").
 //
 // The validated bench board ("generic 4 MB ESP32-C3 Super Mini", see
 // platformio.ini/CONTEXT.md) exposes only 15 GPIOs total: 0-10 and 18-21.
-// Of those, si3050_pins.h already commits GPIO0-8/10 to the real Si3050
-// wiring, GPIO9 is the BOOT/download-mode strap, and GPIO18/19 are the
-// native USB D-/D+ pair used for the serial console (ARDUINO_USB_MODE=1 +
-// ARDUINO_USB_CDC_ON_BOOT=1). That leaves only GPIO20/21, both of which
-// are *documentation-reserved only* (kSi3050ReservedPinButton/
-// kSi3050ReservedPinStatusLed) for a future physical config/reset button
-// and status LED - neither is implemented in any current code path
-// (Esp32ButtonInput/Esp32StatusIndicator remain unassigned stubs, see
-// hardware/button.cpp / hardware/status_indicator.cpp).
+// Of those:
+//   - GPIO2, GPIO8, GPIO9 are excluded here as BOOT/strapping pins.
+//   - GPIO18/19 are the native USB D-/D+ pair (serial console) and stay
+//     reserved.
+//   - GPIO20/21 were the first choice (both are otherwise only
+//     *documentation-reserved*, for a future physical config/reset
+//     button and status LED - kSi3050ReservedPinButton/
+//     kSi3050ReservedPinStatusLed - neither implemented in any current
+//     code path). A real bench test wiring the button to GPIO20 reliably
+//     disconnected Wi-Fi association (WaitingForWifi -> ... -> Online
+//     with the button unplugged; Wi-Fi dropped again as soon as it was
+//     reconnected to GPIO20) - see docs/dev-ring-simulator.md. The exact
+//     physical cause (an alternate silicon pin function, this specific
+//     button/wiring's mounting, this board's particular pinout, or
+//     electrical/RF interference) has NOT been isolated - only the
+//     correlation itself was reproduced, which is enough to abandon
+//     GPIO20 (and, out of caution, GPIO21) for this bench rig without
+//     waiting for a root cause.
+//   - GPIO0-8/10 are already committed to the real Si3050 wiring
+//     (si3050_pins.h).
 //
-// Explicit, user-approved decision for THIS DEV-only environment only:
-// temporarily reuse GPIO20 for the bench ring-simulator button, scoped
-// exclusively to esp32-c3-dev-ring-simulator. This is NOT a production
-// pin assignment and must be revisited once the Si3050 and the final
-// board/config-reset-button are integrated on the same physical unit -
-// see CONTEXT.md > Open Questions.
-constexpr uint8_t kDevRingButtonPin = 20;
+// With GPIO20/21 ruled out, the only remaining option on this board is a
+// deliberate, explicit overlap with one real Si3050 pin. This is safe
+// ONLY because this specific DEV-only environment
+// (esp32-c3-dev-ring-simulator) never compiles or initializes any
+// Si3050/RingDetector/PCM-clock code, and no Si3050 is physically
+// attached to the board while this bench test runs (see "Scope and
+// safety" in docs/dev-ring-simulator.md). GPIO4 (kSi3050PinPcmDrx, the
+// Si3050's DRX line) is the explicitly approved overlap - never any
+// other Si3050 pin, and never in any environment that does touch the
+// real Si3050. This is NOT a production pin assignment and must be
+// revisited once the Si3050 and the final board (with the real
+// config/reset button) are integrated on the same physical unit - see
+// CONTEXT.md > Open Questions.
+constexpr uint8_t kDevRingButtonPin = kSi3050PinPcmDrx;
 
-// Compile-time guard: this DEV-only pin must never silently collide with
-// a real Si3050 wire, the BOOT strap, or the USB D-/D+ pair. It is
-// deliberately NOT checked against kSi3050ReservedPinButton/
-// kSi3050ReservedPinStatusLed - reusing one of those two specific
-// reserved-but-unimplemented pins is the documented, approved choice
-// above, not an oversight.
-static_assert(kDevRingButtonPin != kSi3050PinPclk && kDevRingButtonPin != kSi3050PinFsync &&
-                  kDevRingButtonPin != kSi3050PinSpiMiso && kDevRingButtonPin != kSi3050PinPcmDtx &&
-                  kDevRingButtonPin != kSi3050PinPcmDrx && kDevRingButtonPin != kSi3050PinReset &&
-                  kDevRingButtonPin != kSi3050PinSpiSclk && kDevRingButtonPin != kSi3050PinSpiMosi &&
-                  kDevRingButtonPin != kSi3050PinRgdt && kDevRingButtonPin != kSi3050PinSpiCs,
-              "DEV ring simulator button GPIO must never collide with a real Si3050 pin");
+// Compile-time guard: this DEV-only pin must be exactly the one
+// explicitly-approved Si3050 overlap above - GPIO4/kSi3050PinPcmDrx -
+// never silently drift to any other Si3050 pin, the BOOT strap, or the
+// USB D-/D+ pair. Changing kDevRingButtonPin to anything else requires
+// deliberately updating this assertion too, which is the point: no
+// future edit can silently pick an unreviewed pin.
+static_assert(kDevRingButtonPin == kSi3050PinPcmDrx,
+              "DEV ring simulator button GPIO must be the one explicitly-approved Si3050 overlap "
+              "(GPIO4/kSi3050PinPcmDrx) - see docs/dev-ring-simulator.md for why GPIO20/21 were ruled out on real "
+              "hardware and why only this specific overlap is considered safe");
 static_assert(kDevRingButtonPin != kSi3050ReservedPinBoot && kDevRingButtonPin != kSi3050ReservedPinUsbDMinus &&
                   kDevRingButtonPin != kSi3050ReservedPinUsbDPlus,
               "DEV ring simulator button GPIO must never collide with BOOT/USB pins");

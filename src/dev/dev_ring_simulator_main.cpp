@@ -209,8 +209,12 @@ void logWifiConfigAndScanSummary(uint32_t now) {
 void performWifiScan(uint32_t now) {
     WiFi.mode(WIFI_STA);
     const int16_t count = WiFi.scanNetworks();
-    std::vector<WifiScanNetwork> networks;
-    if (count > 0) {
+    if (count < 0) {
+        // Distinct from a scan that succeeded but found zero networks -
+        // see makeFailedWifiScanSummary()/formatWifiScanLine().
+        lastWifiScanSummary = makeFailedWifiScanSummary(static_cast<int32_t>(count));
+    } else {
+        std::vector<WifiScanNetwork> networks;
         networks.reserve(static_cast<size_t>(count));
         for (int16_t i = 0; i < count; ++i) {
             WifiScanNetwork network;
@@ -220,10 +224,8 @@ void performWifiScan(uint32_t now) {
             network.authType = sanitizedAuthModeName(WiFi.encryptionType(i));
             networks.push_back(std::move(network));
         }
-    } else if (count < 0) {
-        Serial.printf("[DEV RING] wifi scan failed err=%d\n", static_cast<int>(count));
+        lastWifiScanSummary = summarizeWifiScan(networks, INTERBRIDGE_DEV_WIFI_SSID);
     }
-    lastWifiScanSummary = summarizeWifiScan(networks, INTERBRIDGE_DEV_WIFI_SSID);
     WiFi.scanDelete();
     lastWifiScanAtMs = now;
     wifiScanEverRun = true;
@@ -368,6 +370,12 @@ void loop() {
 
             // The state machine authorizes exactly one begin call per retry;
             // leave interface recovery policy to the Wi-Fi driver for now.
+            // A fresh timestamp, not the possibly-stale `now` from the top
+            // of this loop() iteration - the rescan above may have taken
+            // real, blocking time, and wifiAssociationStarted() must
+            // re-arm the association timeout from the real begin moment.
+            const uint32_t associationStartMs = millis();
+            connectivity.wifiAssociationStarted(associationStartMs);
             WiFi.mode(WIFI_STA);
             WiFi.begin(INTERBRIDGE_DEV_WIFI_SSID, INTERBRIDGE_DEV_WIFI_PASSWORD);
             Serial.printf("[DEV RING] Wi-Fi connect requested; next_attempt_ms=%lu delay_ms=%lu\n",

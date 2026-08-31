@@ -118,6 +118,11 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
         if (!actionIssued_ && deadlineReached(nowMs, retryAtMs_)) {
             actionIssued_ = true;
             wifiAttemptInFlight_ = true;
+            // Provisional - the caller is expected to call
+            // wifiAssociationStarted() immediately alongside its actual
+            // WiFi.begin() (after any pre-association work, e.g. a
+            // diagnostic scan, that this issuing call itself cannot see
+            // or account for) to re-arm this from the real begin time.
             wifiAttemptDeadlineMs_ = nowMs + wifiAssociationTimeoutMs_;
             return DevSmokeAction::ConnectWifi;
         }
@@ -178,6 +183,11 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
         enter(timeValid ? DevSmokeState::WaitingForMqtt : DevSmokeState::WaitingForTime, nowMs);
     }
     return DevSmokeAction::None;
+}
+
+void DevMqttSmokeState::wifiAssociationStarted(uint32_t nowMs) {
+    if (!wifiAttemptInFlight_) return;
+    wifiAttemptDeadlineMs_ = nowMs + wifiAssociationTimeoutMs_;
 }
 
 void DevMqttSmokeState::wifiAssociationResult(uint32_t nowMs, bool success) {

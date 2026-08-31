@@ -87,6 +87,19 @@ public:
     // ConnectWifi was issued, so a fast-failing attempt does not consume
     // backoff time it was never actually given.
     DevSmokeAction update(uint32_t nowMs, bool wifiConnected, bool timeValid, bool mqttConnected);
+    // Re-arms the in-flight attempt's own association timeout deadline
+    // from nowMs - call this immediately alongside the caller's actual
+    // WiFi.begin(), after any pre-association work that might take real
+    // time (e.g. a diagnostic Wi-Fi scan performed between the
+    // ConnectWifi action and the real WiFi.begin() call). Without this,
+    // update() itself provisionally arms the deadline from the moment
+    // ConnectWifi was issued (see update()'s implementation) - a blocking
+    // scan performed after that would otherwise silently consume part of
+    // the association timeout before association even started. A no-op
+    // if no attempt is currently in flight (mirrors
+    // wifiAssociationResult()'s guard) - safe to call unconditionally
+    // right before every WiFi.begin().
+    void wifiAssociationStarted(uint32_t nowMs);
     // Reports an explicit, caller-observed Wi-Fi association outcome for
     // the attempt currently in flight (see wifiAttemptInFlight()) -
     // forwarded from a real Wi-Fi event (ARDUINO_EVENT_WIFI_STA_CONNECTED/

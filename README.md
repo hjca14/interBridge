@@ -154,7 +154,7 @@ association) - see [docs/mqtt-dev-smoke-test.md](docs/mqtt-dev-smoke-test.md)'s
 ## DEV physical ring simulator (Phase 3B.8)
 
 A separate `esp32-c3-dev-ring-simulator` PlatformIO environment lets a
-momentary button (GPIO20, `INPUT_PULLUP`, wired to GND - see
+momentary button (**GPIO4**, `INPUT_PULLUP`, wired to GND - see
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md)) publish a real
 `RING_DETECTED` `DeviceEvent` through the exact same AWS IoT Basic Ingest
 pipeline production uses, so the downstream notification pipeline can be
@@ -164,21 +164,20 @@ smoke environment's connectivity state machine and the existing
 inventing a new one, and never touches the real Si3050 driver stack,
 provisioning, BLE, or production Wi-Fi/AWS composition. Implemented and
 compiled (native tests pass, all PlatformIO environments still build);
-four real-hardware boots have not yet associated to Wi-Fi. A retest found
-`esp32-c3-dev-mqtt` failing the exact same way as the simulator on the
-same session - both DEV mains share `DevMqttSmokeState`, which had a real
-concurrent-retry defect (reissuing `WiFi.begin()` while a previous
-association attempt was still outstanding), now fixed and confirmed (the
-driver-level "sta is connecting" error is gone). Association still fails:
-the home network keeps failing with disconnect reason 2/202 (an
-auth-stage rejection), while a further retest against a dedicated WPA2
-test hotspot produced a *different* reason, 201 (the ESP32 never saw that
-AP at all) - neither is root-caused. Sanitized SSID/password
-byte-length/placeholder-match diagnostics and a controlled, rate-limited
-Wi-Fi scan (logged before every `WiFi.begin()`, at boot, and in the
-heartbeat while Wi-Fi is down) have been added to distinguish these
-causes on the next retest; SSID/credential/AP correctness remain
-explicitly not confirmed either way. See
+five real-hardware boots so far. A shared `DevMqttSmokeState`
+concurrent-retry Wi-Fi defect (reissuing `WiFi.begin()` while a previous
+attempt was outstanding, affecting `esp32-c3-dev-mqtt` too) is fixed and
+confirmed. Association itself failed on the first four boots (reason
+2/202 on the home network, reason=201 against a WPA2 test hotspot,
+neither root-caused) - but the fifth boot found a real cause unrelated to
+credentials: **with the button disconnected from GPIO20, Wi-Fi associated
+cleanly to `Online`; reconnecting it to GPIO20 dropped Wi-Fi again.**
+GPIO20 is no longer used for this reason - the button now lives on
+**GPIO4** (a deliberate DEV-only overlap with the Si3050's DRX pin, safe
+only because this environment never touches the real Si3050). A further
+retest confirming GPIO4 doesn't reproduce the same problem, and isolating
+the underlying reason=201/2/202 causes, is still required; SSID/
+credential/AP correctness remain explicitly not confirmed either way. See
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) for the wiring
 diagram, GPIO rationale, manual test procedure, and the real bench
 observations, and

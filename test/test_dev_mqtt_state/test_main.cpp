@@ -199,6 +199,52 @@ void test_wifi_association_timeout_ends_stuck_attempt_and_allows_later_retry() {
     TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
 }
 
+// update() itself only provisionally arms the association timeout from
+// the moment ConnectWifi is issued - a caller that performs real work
+// (e.g. a blocking diagnostic Wi-Fi scan) between that action and its
+// actual WiFi.begin() call must re-arm the deadline via
+// wifiAssociationStarted() at the real begin time, so the scan's own
+// duration is never silently deducted from the association timeout
+// budget.
+void test_wifi_association_started_rearms_timeout_from_the_real_begin_time() {
+    DevMqttSmokeState state(10, 40, 15000, 3, 600000, /*wifiAssociationTimeoutMs=*/100);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // Simulate a blocking scan that took 60ms before WiFi.begin() actually
+    // fired - re-arm the timeout from that real begin time (60), not the
+    // original issue time (0).
+    state.wifiAssociationStarted(60);
+
+    // Without the re-arm, the original deadline (0+100=100) would already
+    // have been reached by t=100; with it, the real deadline is 60+100=160,
+    // so the attempt must still be in flight at t=100.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(100, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(159, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    // At the re-armed deadline (160), the timeout finally fires.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(160, false, false, false)));
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+}
+
+// A wifiAssociationStarted() call with no attempt currently in flight
+// (e.g. called defensively/unconditionally by a caller that isn't sure)
+// must be a harmless no-op - never arms a phantom deadline or otherwise
+// disturbs the ordinary cascade.
+void test_wifi_association_started_is_noop_when_nothing_in_flight() {
+    DevMqttSmokeState state(10, 40);
+    state.wifiAssociationStarted(5000);
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+}
+
 // The association flight timeout deadline reuses the same wrap-safe
 // deadlineReached() comparison as the rest of the state machine - mirrors
 // test_ntp_attempt_timeout_is_wrap_safe's own bootstrap-then-force-the-
@@ -709,6 +755,8 @@ int main(int, char**) {
     RUN_TEST(test_wifi_association_success_ends_attempt_and_advances_normally);
     RUN_TEST(test_wifi_association_failure_ends_attempt_and_schedules_retry);
     RUN_TEST(test_wifi_association_timeout_ends_stuck_attempt_and_allows_later_retry);
+    RUN_TEST(test_wifi_association_started_rearms_timeout_from_the_real_begin_time);
+    RUN_TEST(test_wifi_association_started_is_noop_when_nothing_in_flight);
     RUN_TEST(test_wifi_association_timeout_is_wrap_safe);
     RUN_TEST(test_wifi_recovery_reconnect_attempt_is_also_protected_from_reissue);
     RUN_TEST(test_repeated_wifi_association_failure_signals_do_not_cause_a_connect_storm);

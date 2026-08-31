@@ -1,5 +1,7 @@
 #include <unity.h>
 
+#include <string_view>
+
 #include "../../src/dev/dev_wifi_diagnostics.h"
 
 using namespace interbridge;
@@ -98,8 +100,67 @@ void test_scan_does_not_find_configured_ssid() {
 
 void test_empty_scan_reports_zero_networks_and_not_found() {
     WifiScanSummary summary = summarizeWifiScan({}, "HomeNetwork");
+    TEST_ASSERT_TRUE(summary.status == WifiScanStatus::Success);
     TEST_ASSERT_EQUAL(0, static_cast<int>(summary.networksFound));
     TEST_ASSERT_FALSE(summary.configuredSsidFound);
+}
+
+// A scan that succeeded but genuinely found zero networks must be
+// distinguishable from a scan call that itself failed - both would
+// otherwise look identical ("networks_found=0
+// configured_ssid_found=false") to anything reading only those two
+// fields, which is exactly the ambiguity this status field closes.
+void test_valid_scan_with_zero_networks_differs_from_failed_scan() {
+    WifiScanSummary validZero = summarizeWifiScan({}, "AnySsid");
+    WifiScanSummary failed = makeFailedWifiScanSummary(-2);
+
+    TEST_ASSERT_TRUE(validZero.status == WifiScanStatus::Success);
+    TEST_ASSERT_TRUE(failed.status == WifiScanStatus::Failed);
+
+    std::string validLine = formatWifiScanLine(validZero, 100);
+    std::string failedLine = formatWifiScanLine(failed, 100);
+    TEST_ASSERT_TRUE(validLine.find("scan_status=success") != std::string::npos);
+    TEST_ASSERT_TRUE(validLine.find("networks_found=0") != std::string::npos);
+    TEST_ASSERT_TRUE(failedLine.find("scan_status=failed") != std::string::npos);
+    TEST_ASSERT_TRUE(failedLine.find("error=-2") != std::string::npos);
+    // A failed scan never prints configured_ssid_found/networks_found at
+    // all - they would be meaningless (the scan itself never completed),
+    // not just false/zero.
+    TEST_ASSERT_TRUE(failedLine.find("configured_ssid_found") == std::string::npos);
+    TEST_ASSERT_TRUE(failedLine.find("networks_found") == std::string::npos);
+}
+
+// The failed-scan status/error must keep showing up correctly every time
+// the same stored summary is reformatted later (e.g. once at scan time,
+// then again from every subsequent heartbeat/pre-WiFi.begin() log line
+// while Wi-Fi stays down) - not just on the first read right after the
+// scan failed.
+void test_failed_scan_status_persists_across_repeated_formatting() {
+    WifiScanSummary failed = makeFailedWifiScanSummary(-2);
+    std::string firstRead = formatWifiScanLine(failed, 0);
+    std::string muchLaterRead = formatWifiScanLine(failed, 999999);
+    TEST_ASSERT_TRUE(firstRead.find("scan_status=failed") != std::string::npos);
+    TEST_ASSERT_TRUE(firstRead.find("error=-2") != std::string::npos);
+    TEST_ASSERT_TRUE(muchLaterRead.find("scan_status=failed") != std::string::npos);
+    TEST_ASSERT_TRUE(muchLaterRead.find("error=-2") != std::string::npos);
+    TEST_ASSERT_TRUE(muchLaterRead.find("scan_age_ms=999999") != std::string::npos);
+}
+
+// diagnoseCredentialField() must work directly against a non-owning view
+// - constructed here from a raw const char*, never from an owning
+// std::string - proving (not just documenting) that no std::string copy
+// of the secret is required to call it. If this function's signature
+// ever regressed back to `const std::string&`, this line would fail to
+// compile (std::string_view has no implicit conversion to std::string),
+// making that regression a build failure here rather than a silent
+// runtime behavior change.
+void test_diagnose_credential_field_works_from_a_non_owning_view_without_copying() {
+    const char* rawSsid = "RawCStringSsidValue";
+    std::string_view view(rawSsid);
+    CredentialFieldDiagnostics diag = diagnoseCredentialField(view, kSsidPlaceholder);
+    TEST_ASSERT_EQUAL(static_cast<int>(view.size()), static_cast<int>(diag.lengthBytes));
+    TEST_ASSERT_FALSE(diag.matchesPlaceholder);
+    TEST_ASSERT_FALSE(diag.empty);
 }
 
 // The formatted scan line must never include any network's SSID/name -
@@ -116,6 +177,7 @@ void test_scan_line_never_includes_network_names() {
     std::string lineFound = formatWifiScanLine(found, 1234);
     TEST_ASSERT_TRUE(lineFound.find("HomeNetworkSecretName") == std::string::npos);
     TEST_ASSERT_TRUE(lineFound.find("NeighborNetworkSecretName") == std::string::npos);
+    TEST_ASSERT_TRUE(lineFound.find("scan_status=success") != std::string::npos);
     TEST_ASSERT_TRUE(lineFound.find("configured_ssid_found=true") != std::string::npos);
     TEST_ASSERT_TRUE(lineFound.find("scan_age_ms=1234") != std::string::npos);
 
@@ -138,6 +200,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_scan_finds_configured_ssid);
     RUN_TEST(test_scan_does_not_find_configured_ssid);
     RUN_TEST(test_empty_scan_reports_zero_networks_and_not_found);
+    RUN_TEST(test_valid_scan_with_zero_networks_differs_from_failed_scan);
+    RUN_TEST(test_failed_scan_status_persists_across_repeated_formatting);
+    RUN_TEST(test_diagnose_credential_field_works_from_a_non_owning_view_without_copying);
     RUN_TEST(test_scan_line_never_includes_network_names);
     return UNITY_END();
 }
