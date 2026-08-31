@@ -19,15 +19,21 @@
 #include "dev_ring_event.h"
 #include "mqtt_smoke_state.h"
 #include "dev_wifi_diagnostics.h"
+#include "dev_disabled_hardware.h"
+#include "dev_command_diagnostics.h"
 #include "../hardware/clock.h"
 #include "../hardware/ntp_sync_state.h"
 #include "../core/random_id.h"
 #include "../core/version.h"
+#include "../intercom/intercom.h"
 #include "../network/health_reporter.h"
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
+#include "../protocol/command_cache.h"
+#include "../protocol/command_handler.h"
 #include "../protocol/event_outbox.h"
 #include "../protocol/messages.h"
+#include "../protocol/remote_command_processor.h"
 #include "../storage/credential_store.h"
 #include "../storage/memory_store.h"
 
@@ -42,6 +48,17 @@
 // production: MqttTopics::eventsIngest(), Esp32AwsIotTransport, and the
 // existing IEventOutbox contract - see DevRingEventCoordinator/
 // publishPendingEvents (src/dev/dev_ring_event.*).
+//
+// Cumulative DEV integration pass: this environment now also subscribes to
+// the commands topic and processes them through the exact same
+// RemoteCommandProcessor/CommandHandler/dedup/DisabledHardware/
+// DisabledSystemControl composition esp32-c3-dev-mqtt already uses (see
+// dev_disabled_hardware.h/dev_command_diagnostics.h) - not a second
+// implementation. A valid OPEN_DOOR still only ever reaches ACCEPTED then
+// REJECTED/CAPABILITY_DISABLED; nothing here actuates a door or performs a
+// system action. See docs/dev-ring-simulator.md > "Command processing
+// (Phase 3B.8 cumulative pass)" and CONTEXT.md's DEV environment evolution
+// rule.
 //
 // The Wi-Fi event handler, per-action diagnostic log lines, and boot
 // diagnostics below deliberately mirror mqtt_smoke_main.cpp's own
@@ -130,6 +147,19 @@ DevRingButtonController buttonController(buttonInput);
 DevRingEventCoordinator ringCoordinator(buttonController, randomSource, eventOutbox, INTERBRIDGE_DEV_DEVICE_ID);
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 Esp32AwsIotTransport transport(connectionConfig(), credentials);
+// Command-processing composition, identical to mqtt_smoke_main.cpp's own
+// (same InMemoryDedupCache/DisabledHardware/Intercom/DisabledSystemControl/
+// CommandHandler/RemoteCommandProcessor classes, not a second
+// implementation) - see docs/dev-ring-simulator.md > "Command processing
+// (Phase 3B.8 cumulative pass)". A valid OPEN_DOOR still only ever reaches
+// ACCEPTED then REJECTED/CAPABILITY_DISABLED; no door/system action is
+// ever genuinely actuated by this bench firmware.
+InMemoryDedupCache dedupCache;
+DisabledHardware hardware;
+Intercom intercom(hardware);
+DisabledSystemControl systemControl;
+CommandHandler commandHandler(INTERBRIDGE_DEV_DEVICE_ID, clockSource, dedupCache, intercom, systemControl);
+RemoteCommandProcessor processor(INTERBRIDGE_DEV_DEVICE_ID, transport, commandHandler, topics);
 DevMqttSmokeState connectivity;
 // Same presence contract mqtt_smoke_main.cpp publishes (HealthReport via
 // Basic Ingest, see publishHealth() below) - added after a real bench
@@ -144,13 +174,12 @@ DevMqttSmokeState connectivity;
 HealthReporter healthReporter(kDevHealthIntervalMs);
 uint32_t heartbeatAt = 0;
 DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
-// Tracks whether the transport was connected as of the previous loop
-// iteration, so a session invalidation (see
-// Esp32AwsIotTransport::isConnected()) is torn down exactly once instead
-// of calling transport.disconnect() on every tick while already
-// disconnected - mirrors mqtt_smoke_main.cpp's `subscribed` bookkeeping,
-// which this environment does not need since it never subscribes.
-bool wasConnected = false;
+// Whether the command topic is currently subscribed - mirrors
+// mqtt_smoke_main.cpp's identical `subscribed` bookkeeping exactly: it
+// both gates a stale-session teardown (see loop()'s top block) and, once
+// this pass adds real command processing, must be re-established after
+// every reconnect, never assumed to survive one.
+bool subscribed = false;
 
 const char* resetReasonName(esp_reset_reason_t reason) {
     switch (reason) {
@@ -378,6 +407,9 @@ void setup() {
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb([](struct timeval*) { clockSource.syncCompleted(millis()); });
+    processor.setDiagnosticCallback([](const CommandDiagnostic &event) {
+        logCommandDiagnostic("[DEV RING]", event);
+    });
 }
 
 void loop() {
@@ -385,16 +417,19 @@ void loop() {
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
     if ((!wifiConnected || !clockSource.hasValidTime()) && transport.isConnected()) {
         transport.disconnect();
-    } else if (!transport.isConnected() && wasConnected) {
-        // A publish/poll failure already invalidated the session (see
-        // Esp32AwsIotTransport::isConnected()) - tear down explicitly so
-        // the next attempt never reuses a stale socket, same defensive
-        // pattern as mqtt_smoke_main.cpp. Gated on wasConnected so this
-        // only fires once per invalidation, not every tick while already
-        // disconnected.
+        subscribed = false;
+    } else if (!transport.isConnected() && subscribed) {
+        // Wi-Fi/time are still fine, but a publish/subscribe/poll failure
+        // already invalidated the MQTT/TLS session (see
+        // Esp32AwsIotTransport::isConnected()). Tear it down explicitly so
+        // the next ConnectMqtt attempt never reuses a stale socket/session,
+        // instead of only discovering this implicitly on the next connect() -
+        // same defensive pattern as mqtt_smoke_main.cpp.
+        Serial.println("[DEV RING] transport session invalidated; tearing down before reconnect");
         transport.disconnect();
+        subscribed = false;
     }
-    wasConnected = transport.isConnected();
+    if (!transport.isConnected()) subscribed = false;
 
     drainWifiEventSignals(now);
     const DevSmokeAction action =
@@ -464,9 +499,20 @@ void loop() {
 
             const bool connected =
                 clockSource.hasValidTime() && transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
-            connectivity.mqttResult(now, connected);
-            safeStatus("MQTT connect", connected);
-            if (!connected) {
+            if (connected) {
+                subscribed = processor.subscribe();
+                safeStatus("command QoS1 subscription", subscribed);
+                if (!subscribed) {
+                    transport.disconnect();
+                } else {
+                    healthReporter.forceNextPublish();
+                    Serial.printf("[DEV RING] reconnected; pending_responses=%u\n",
+                                  static_cast<unsigned>(processor.pendingResponseCount()));
+                }
+            }
+            connectivity.mqttResult(now, connected && subscribed);
+            safeStatus("MQTT connect", connected && subscribed);
+            if (!connected || !subscribed) {
                 Serial.printf("[DEV RING] connectivity_failures=%lu next MQTT attempt at_ms=%lu delay_ms=%lu\n",
                               static_cast<unsigned long>(connectivity.consecutiveConnectivityFailures()),
                               static_cast<unsigned long>(connectivity.retryAtMs()),
@@ -503,6 +549,7 @@ void loop() {
 
     if (transport.isConnected()) {
         transport.poll();
+        processor.processPending();
         if (eventOutbox.size() > 0) {
             size_t publishedCount = publishPendingEvents(eventOutbox, transport, topics.eventsIngest());
             if (publishedCount > 0) {

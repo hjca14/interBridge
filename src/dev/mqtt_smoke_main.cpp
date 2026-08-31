@@ -17,10 +17,10 @@
 #include "interbridge_dev_secrets.h"
 #include "mqtt_smoke_state.h"
 #include "dev_wifi_diagnostics.h"
+#include "dev_disabled_hardware.h"
+#include "dev_command_diagnostics.h"
 #include "../hardware/clock.h"
 #include "../hardware/ntp_sync_state.h"
-#include "../hardware/gpio.h"
-#include "../hardware/system_control.h"
 #include "../intercom/intercom.h"
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
@@ -68,16 +68,6 @@ public:
 private:
     NtpSyncState syncState_;
 };
-class DisabledHardware final : public IHardwareIO {
-public:
-    bool readLineState() override { return false; }
-    bool setDoorOutput(bool) override { return false; }
-};
-class DisabledSystemControl final : public ISystemControl {
-public:
-    void restart() override {}
-};
-
 AwsIotConnectionConfig connectionConfig() {
     AwsIotConnectionConfig config;
     config.endpoint = INTERBRIDGE_DEV_AWS_ENDPOINT;
@@ -339,51 +329,7 @@ void setup() {
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb(onTimeSynchronized);
     processor.setDiagnosticCallback([](const CommandDiagnostic &event) {
-        switch (event.stage) {
-            case CommandDiagnosticStage::Received:
-                // No seq yet here - it is assigned once the command reaches
-                // the front of the queue and starts processing (see the
-                // stages below), not at raw MQTT delivery time.
-                Serial.println("[DEV MQTT] command received"); break;
-            case CommandDiagnosticStage::ValidationPassed:
-                Serial.printf("[DEV MQTT] time validation ok seq=%lu age_s=%lld remaining_s=%lld\n",
-                              static_cast<unsigned long>(event.commandSeq),
-                              static_cast<long long>(event.ageSeconds),
-                              static_cast<long long>(event.remainingSeconds)); break;
-            case CommandDiagnosticStage::Rejected:
-                Serial.printf("[DEV MQTT] command rejected seq=%lu code=%s\n",
-                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
-            case CommandDiagnosticStage::AcceptedPublished:
-                Serial.printf("[DEV MQTT] ACCEPTED published seq=%lu\n",
-                              static_cast<unsigned long>(event.commandSeq)); break;
-            case CommandDiagnosticStage::AcceptedPending:
-                Serial.printf("[DEV MQTT] ACCEPTED publish failed; still queued seq=%lu\n",
-                              static_cast<unsigned long>(event.commandSeq)); break;
-            case CommandDiagnosticStage::AcceptedPublishFailed:
-                Serial.printf("[DEV MQTT] ACCEPTED publish failed; still queued seq=%lu\n",
-                              static_cast<unsigned long>(event.commandSeq)); break;
-            case CommandDiagnosticStage::TerminalPublished:
-                // event.safeCode here is the device's own terminal status/error code
-                // (e.g. CAPABILITY_DISABLED), never a transport/publish artifact.
-                Serial.printf("[DEV MQTT] terminal published seq=%lu code=%s\n",
-                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
-            case CommandDiagnosticStage::TerminalDeferred:
-                // ACCEPTED already published; this is an intentional
-                // one-iteration defer, not a failure - no publish was even
-                // attempted yet for the terminal.
-                Serial.printf("[DEV MQTT] terminal deferred (queued for next iteration) seq=%lu code=%s\n",
-                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
-            case CommandDiagnosticStage::TerminalQueuedBehindAccepted:
-                // ACCEPTED itself failed (see the AcceptedPending line above);
-                // the terminal is only queued behind it, not attempted yet.
-                Serial.printf("[DEV MQTT] terminal queued behind pending ACCEPTED seq=%lu code=%s\n",
-                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
-            case CommandDiagnosticStage::TerminalPublishFailed:
-                // A real publish attempt happened and failed - the transport
-                // layer already logged the sanitized mqtt_err=N for it.
-                Serial.printf("[DEV MQTT] terminal publish failed; still queued seq=%lu code=%s\n",
-                              static_cast<unsigned long>(event.commandSeq), event.safeCode); break;
-        }
+        logCommandDiagnostic("[DEV MQTT]", event);
     });
 }
 

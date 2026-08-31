@@ -511,6 +511,23 @@ transition traversed MQTT/backend/FCM to an Android notification. GPIO4
 remains a DEV-only provisional overlap with Si3050 DRX; no Si3050 was
 connected or initialized, and no production pinout changed.
 
+**Cumulative integration follow-up:** that validated run exposed a real
+gap - `esp32-c3-dev-ring-simulator` had adopted `DevMqttSmokeState` but
+never `esp32-c3-dev-mqtt`'s command-processing composition, so a real
+`OPEN_DOOR` was never received on this environment. Fixed by reusing the
+same `RemoteCommandProcessor`/`CommandHandler`/`InMemoryDedupCache`/
+`DisabledHardware`/`DisabledSystemControl` composition unchanged - shared
+via two new small headers, `src/dev/dev_disabled_hardware.h` (the
+non-actuating hardware/system-control stand-ins, previously duplicated
+inline only in `mqtt_smoke_main.cpp`) and `src/dev/dev_command_diagnostics.h/.cpp`
+(the per-stage command diagnostic log wording, previously an inline lambda
+in `mqtt_smoke_main.cpp`) - so the two DEV entry points share exactly one
+copy of both instead of being able to silently diverge again. `Online` is
+now reached only after a successful command-topic subscription, mirroring
+`esp32-c3-dev-mqtt` exactly (see `docs/dev-ring-simulator.md` > "Command
+processing"). See CONTEXT.md's DEV environment evolution rule (Technical
+Debt) for the general principle this follows.
+
 ## MQTT/mTLS command lifecycle (Phase 2D)
 
 The composition root retains the existing layering: Wi-Fi readiness gates MQTT;

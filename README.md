@@ -181,6 +181,21 @@ diagram, bench test history, and manual test procedure, and
 [docs/roadmap-3b.md](docs/roadmap-3b.md) for how this fits with the rest
 of the (cross-repo) ring-notification pipeline.
 
+A follow-up pass closed a real gap found after that hardware run: this
+environment had never adopted `esp32-c3-dev-mqtt`'s own command-processing
+composition, so a real `OPEN_DOOR` sent from the app was never received or
+processed while this firmware was loaded. It now reuses that exact,
+already-hardware-validated composition (`RemoteCommandProcessor`/
+`CommandHandler`/dedup/`DisabledHardware`/`DisabledSystemControl`, shared
+via `src/dev/dev_disabled_hardware.h`/`dev_command_diagnostics.h`, not a
+second implementation) alongside the unchanged `RING_DETECTED`/health
+path. A valid `OPEN_DOOR` still only ever reaches `ACCEPTED` then
+`REJECTED/CAPABILITY_DISABLED` - no door/system action is genuinely
+performed. This specific combination has not yet been retested on real
+hardware - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Command
+processing (Phase 3B.8 cumulative pass)".
+
 ## Si3050/Si3011-19 firmware foundation (Phase 3A + 3B.2 PCM clock)
 
 `src/intercom/si3050/` is a hardware-independent, natively-tested

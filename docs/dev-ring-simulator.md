@@ -202,6 +202,58 @@ separately (see `docs/roadmap-3b.md`):
   applies the user's/app's notification preferences before deciding
   whether/how to notify. **Implemented and deployed in DEV.**
 
+## Command processing (Phase 3B.8 cumulative pass)
+
+The end-to-end 3B.8 hardware run (see Bench test history below) proved
+`RING_DETECTED`/health, but this environment did not yet subscribe to the
+commands topic at all - a real `OPEN_DOOR` sent from the app while this
+firmware was loaded was never received, let alone processed, because
+nothing on the device was listening. This gap existed only because
+`esp32-c3-dev-ring-simulator` had never adopted `esp32-c3-dev-mqtt`'s own
+already-real-hardware-validated command-processing composition (see
+`docs/mqtt-dev-smoke-test.md`).
+
+This pass adds it, reusing the exact same classes `esp32-c3-dev-mqtt`
+already uses - `RemoteCommandProcessor`, `CommandHandler`,
+`InMemoryDedupCache`, and the non-actuating `DisabledHardware`/
+`DisabledSystemControl` pair (now shared from
+`src/dev/dev_disabled_hardware.h` so the two DEV entry points cannot
+silently diverge on this guarantee) - not a second implementation. The
+per-stage diagnostic log wording is likewise shared, from
+`src/dev/dev_command_diagnostics.h/.cpp`. `esp32-c3-dev-ring-simulator`
+now:
+
+- subscribes to `interbridge/{device_id}/commands` (QoS 1) on every
+  successful MQTT connect, exactly like `esp32-c3-dev-mqtt` - a failed
+  subscription now tears the connection down and retries, the same
+  `subscribed` bookkeeping `esp32-c3-dev-mqtt` already uses, so a dropped
+  subscription is never silently left unresolved after a reconnect;
+- drains and processes commands every loop iteration via
+  `processor.processPending()`, on the same one-response-publish-per-call
+  discipline documented in `docs/mqtt-dev-smoke-test.md`;
+- still only reaches `DoorOpenCapability::Disabled` (`CommandHandler`'s own
+  compile-time constant, shared, not overridden here) - a valid `OPEN_DOOR`
+  still only ever produces `ACCEPTED` then `REJECTED/CAPABILITY_DISABLED`.
+  No door, relay, DTMF, GPIO, or system action is genuinely performed.
+
+**What this closes, and what it does not**: `RING_DETECTED`
+publishing/health/connectivity are byte-for-byte unchanged from the
+already-validated 3B.8 run - this pass only adds the command path
+alongside them, never modifies them. What is proven automatically: all 39
+native Unity suites (unchanged logic - `CommandHandler`,
+`RemoteCommandProcessor`, dedup, `DevRingEventCoordinator`,
+`DevRingButtonController`, `HealthReporter`, `DevMqttSmokeState`, and every
+other existing suite) still pass, and all three affected PlatformIO
+environments (`esp32-c3`, `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`)
+compile cleanly with this composition. What is **not** proven
+automatically, and still needs a real ESP32 retest: that
+`esp32-c3-dev-ring-simulator` actually subscribes successfully on real
+AWS IoT Core, actually receives a real `OPEN_DOOR` command, and actually
+publishes `ACCEPTED` then `REJECTED/CAPABILITY_DISABLED` back - this exact
+combination (ring simulator + commands) has never run on real hardware.
+`RING_DETECTED`/health continuing to work correctly alongside it also has
+not been re-confirmed on real hardware since this pass.
+
 ## Manual flash and test procedure
 
 The end-to-end test is complete and does not require a Linker Button
@@ -229,10 +281,13 @@ not physically validated here:
    configured_ssid_found=true|false ...` right before the first
    `WiFi.begin()` - this scan runs exactly once per boot; a reboot is
    required to refresh it.
-6. Wait for `[DEV RING] state ... -> online` (Wi-Fi → DNS → NTP → MQTT).
-   If association fails, capture the `[DEV RING] wifi event=disconnected
-   reason=N (...)` line(s) verbatim alongside the `config=`/`wifi scan`
-   lines from steps 4-5.
+6. Wait for `[DEV RING] state ... -> online` (Wi-Fi → DNS → NTP → MQTT →
+   command subscription - `Online` is now reached only after
+   `[DEV RING] command QoS1 subscription: ok`, same as `esp32-c3-dev-mqtt`;
+   a failed subscription logs `: failed`, tears the connection down, and
+   retries). If association fails, capture the `[DEV RING] wifi
+   event=disconnected reason=N (...)` line(s) verbatim alongside the
+   `config=`/`wifi scan` lines from steps 4-5.
 7. Press the button once (do not hold). Expect, in order:
    - `[DEV RING] valid press detected; RING_DETECTED enqueued`
    - `[DEV RING] publish confirmed count=1 remaining=0`
@@ -251,6 +306,22 @@ not physically validated here:
     60s once online, and check whether the app now reflects the device
     as present - see "Online status" above for what this does and does
     not confirm.
+12. Send a protocol-v1 `OPEN_DOOR` command on that exact device's commands
+    topic (same procedure as `docs/mqtt-dev-smoke-test.md` step 5). Expect,
+    in order: `[DEV RING] command received`, `[DEV RING] time validation ok
+    seq=... age_s=... remaining_s=...`, `[DEV RING] ACCEPTED published
+    seq=...`, then (deferred to the next loop iteration)
+    `[DEV RING] terminal published seq=... code=CAPABILITY_DISABLED`.
+    Verify no `COMPLETED`, `DOOR_OPENED`, DTMF, GPIO, relay, pulse, key, or
+    restart action - only the protocol-v1 `ACCEPTED` then
+    `REJECTED/CAPABILITY_DISABLED` responses on the responses topic.
+13. Send the exact same `command_id` again: confirm the terminal response
+    is replayed from the dedup cache (`CommandHandler`'s existing
+    duplicate-protection path), not reprocessed.
+14. Confirm a `RING_DETECTED` press (step 7) and an `OPEN_DOOR` command
+    (step 12) both work correctly within the same boot, in either order -
+    the two paths (event outbox vs. command processor) must not interfere
+    with each other.
 
 ## Bench test history
 
@@ -353,6 +424,14 @@ off-hook, bidirectional calls, production firmware, real BLE onboarding, or
 the complete full-screen/call UI. Automated tests still cover debounce,
 repeated-edge, offline queue/replay, and stable-`event_id` behavior, but
 those cases were not exercised physically in this run.
+
+**This run predates the "Command processing" pass above** (command
+subscription/`OPEN_DOOR` handling did not exist on this environment yet at
+the time of this hardware run). `CommandHandler`/`RemoteCommandProcessor`
+are themselves hardware-validated - on `esp32-c3-dev-mqtt`, see
+`docs/mqtt-dev-smoke-test.md` - but this specific composition (ring
+simulator + commands together) has not yet been retested on real hardware;
+see "Command processing" above for exactly what remains open.
 
 GPIO4 is only a provisional DEV overlay with `kSi3050PinPcmDrx` (DRX). The
 overlap was safe for this test solely because the isolated simulator does

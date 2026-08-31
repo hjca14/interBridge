@@ -1566,6 +1566,40 @@ this pass:)*
   connected. It neither changes production pinout nor permits simultaneous
   button/DRX use; the final board must decide the assignment. A future Linker
   Button evaluation is optional and separate from closing 3B.8.
+- **DEV environment divergence found and fixed after the 3B.8 hardware
+  validation above: `esp32-c3-dev-ring-simulator` never subscribed to the
+  commands topic.** The firmware currently loaded for the 3B.8 hardware run
+  was compiled from that environment; it validated Wi-Fi/NTP/MQTT/health/
+  `RING_DETECTED` end to end, but a real `OPEN_DOOR` sent from the app was
+  never received - `esp32-c3-dev-ring-simulator` had adopted
+  `esp32-c3-dev-mqtt`'s connectivity bring-up (`DevMqttSmokeState`) but
+  never its command-processing composition
+  (`RemoteCommandProcessor`/`CommandHandler`/dedup/`DisabledHardware`/
+  `DisabledSystemControl`), which was already real-hardware-validated on
+  `esp32-c3-dev-mqtt` (`docs/mqtt-dev-smoke-test.md`). Fixed by reusing that
+  exact composition unchanged - not a second implementation - shared via
+  two new tiny headers (`src/dev/dev_disabled_hardware.h`,
+  `src/dev/dev_command_diagnostics.h/.cpp`) so `esp32-c3-dev-mqtt` and
+  `esp32-c3-dev-ring-simulator` can no longer silently diverge on this
+  guarantee again. A valid `OPEN_DOOR` still only ever reaches `ACCEPTED`
+  then `REJECTED/CAPABILITY_DISABLED`; no door/system action is genuinely
+  performed. See `docs/dev-ring-simulator.md` > "Command processing (Phase
+  3B.8 cumulative pass)" for the full diagnosis, what changed, and exactly
+  what still needs a real-hardware retest (this specific combination -
+  ring simulator + commands - has never run on real hardware).
+
+  **DEV environment evolution rule** (new, general going forward): the
+  canonical DEV integration environment (`esp32-c3-dev-ring-simulator`, as
+  the most complete one, and `esp32-c3-dev-mqtt` before it) must stay
+  *cumulative* - it must preserve every previously-validated, still-
+  compatible capability (Wi-Fi, NTP, AWS IoT MQTT/mTLS, health reports,
+  event publishing/outbox, command subscription/processing) rather than
+  silently losing one when a new capability is added. Strictly isolated,
+  narrow-purpose experiments (e.g. the Si3050 clock probe pair) are exempt
+  and may stay minimal on purpose - they are deliberately never meant to
+  accumulate capabilities from the other DEV environments. GPIO4/
+  `RING_DETECTED` remains only a temporary DEV substitute for the real
+  Si3050-based ring detector, not a production mechanism.
 
 ## Future Work
 
