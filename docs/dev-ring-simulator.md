@@ -112,14 +112,13 @@ exactly as `esp32-c3-dev-mqtt` does. CI compiles this environment against
 the committed placeholder example header only (no real Wi-Fi/AWS
 connection attempted, no hardware flashed) - see `.github/workflows/ci.yml`.
 
-## Manual flash and test procedure (retest pending after the concurrent-retry fix)
+## Manual flash and test procedure (retest pending with the new Wi-Fi diagnostics)
 
-This has been run on real hardware twice, and Wi-Fi association has not
-yet succeeded on either attempt - see "Real bench observation: first boot
-never associated with Wi-Fi" and "Real bench observation: retest reveals
-a shared concurrent-retry defect" below. A further retest with this
-pass's coordination fix is still needed; see Honest status. The intended
-procedure, mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
+This has been run on real hardware four times, and Wi-Fi association has
+not yet succeeded on any attempt - see all four "Real bench observation"
+sections below. A further retest with this pass's SSID/password/scan
+diagnostics is still needed; see Honest status. The intended procedure,
+mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
 
 1. Wire the button as shown above.
 2. Generate `include/interbridge_dev_secrets.h` for a DEV device identity
@@ -128,18 +127,32 @@ procedure, mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
    AWS IoT Thing).
 3. `pio run -e esp32-c3-dev-ring-simulator -t upload` and attach the
    serial monitor.
-4. Confirm the boot log lines `[DEV RING] previous_reset=...
-   wifi_config=present` and `[DEV RING] button initialized gpio=20
-   (INPUT_PULLUP, active-low)`.
-4a. Watch for `[DEV RING] Wi-Fi connect requested; next_attempt_ms=...`
-    immediately after boot, and then either `[DEV RING] wifi
-    event=connected` + `[DEV RING] wifi event=got_ip`, or a `[DEV RING]
-    wifi event=disconnected reason=N (...)` line naming the actual
-    disconnect reason. A single `Wi-Fi connect requested` line should now
-    appear per attempt (never a burst while one is still outstanding); if
-    a disconnect reason keeps recurring, that reason code - not a repeat
-    concurrent-retry - is now the thing to diagnose. If Wi-Fi still does
-    not associate, capture the reason code(s) verbatim.
+4. Confirm the boot log lines `[DEV RING] previous_reset=...` and
+   `[DEV RING] button initialized gpio=20 (INPUT_PULLUP, active-low)`.
+4a. Confirm `[DEV RING] config=valid ssid_bytes=N password_bytes=N
+    placeholder=false` right after boot - `config=invalid` or
+    `placeholder=true` here means the compiled binary does not actually
+    hold the credential the operator intended, before Wi-Fi is even
+    attempted. Compare `ssid_bytes=N` against the real SSID's expected
+    UTF-8 byte length (an apostrophe or accented character changes this
+    from the plain character count).
+4b. Watch for `[DEV RING] wifi scan networks_found=N
+    configured_ssid_found=true|false rssi=N channel=N auth=... scan_age_ms=N`
+    right before the first `WiFi.begin()`. `configured_ssid_found=false`
+    with `networks_found` clearly non-zero means the ESP32's own scan
+    never saw a beacon for that exact SSID (out of range, wrong band, or
+    the configured SSID string does not match reality) - a strong signal
+    before ever attempting association.
+4c. Watch for `[DEV RING] Wi-Fi connect requested; next_attempt_ms=...`
+    immediately after, and then either `[DEV RING] wifi event=connected`
+    + `[DEV RING] wifi event=got_ip`, or a `[DEV RING] wifi
+    event=disconnected reason=N (...)` line naming the actual disconnect
+    reason. A single `Wi-Fi connect requested` line should appear per
+    attempt (never a burst while one is still outstanding); if a
+    disconnect reason keeps recurring, that reason code - not a repeat
+    concurrent-retry - is the thing to diagnose. If Wi-Fi still does not
+    associate, capture the reason code(s) verbatim alongside the
+    `config=`/`wifi scan` lines from steps 4a/4b.
 5. Wait for `[DEV RING] state ... -> online` (Wi-Fi → DNS → NTP → MQTT
    connect, identical cascade to the DEV MQTT smoke test).
 6. Press the button once. Expect, in order:
@@ -360,26 +373,115 @@ policy, only how the remaining time is computed for logging. See
 `test/test_dev_mqtt_state` for future-deadline, already-passed-deadline,
 and wraparound coverage.
 
+## Real bench observation: WPA2 test hotspot isolates a different failure mode (reason=201)
+
+A further retest against a dedicated WPA2 test hotspot (a personal
+iPhone's Personal Hotspot, "Henrique's iPhone") produced a **different**
+disconnect reason than the home network: **`reason=201`
+(`WIFI_REASON_NO_AP_FOUND`)** - the ESP32 never saw an access point
+matching the configured SSID at all, as opposed to reason 2/202 (an
+authentication-stage rejection) on the home network, which persisted
+unchanged.
+
+**This does not yet distinguish "the configured SSID string is wrong"
+from "the ESP32 genuinely never received a beacon for that network"** -
+both would produce `no_ap_found`, and the diagnostics available at the
+time (Wi-Fi association events, retry timing) could not tell them apart.
+Plausible, still-unconfirmed explanations include the hotspot not
+broadcasting on a channel/band the ESP32-C3 scans (2.4 GHz only),
+being out of range, a typo when the credentials header was generated, or
+some other credential-pipeline issue. **This finding is exactly why this
+pass adds the sanitized SSID/password byte-length + placeholder check and
+the controlled Wi-Fi scan (see below)** - together they can now show
+whether the compiled binary actually holds the SSID/password bytes the
+operator intended (length/placeholder facts, never the values) and
+whether the ESP32's own scan sees the target AP at all, and with what
+signal/channel/auth type, *before* any association is even attempted.
+
+**Nothing here confirms the credential or either access point is
+correct.** Reason 2/202 on the home network remains an unexplained
+authentication failure; reason=201 on the test hotspot remains an
+unexplained "AP not found." A further hardware retest with the new
+diagnostics below is required before drawing a conclusion either way.
+
+## Wi-Fi config and scan diagnostics (SSID/password length, placeholder check, controlled scan)
+
+To close the gap the observation above exposed, both DEV mains now log,
+sanitized, never including the raw SSID/password value or any other
+network's name:
+
+- **At boot, before every `WiFi.begin()`, and in the heartbeat while
+  Wi-Fi is down** (so this is visible even if the serial monitor is
+  attached well after boot and missed the earlier prints):
+  `config=valid|invalid ssid_bytes=N password_bytes=N placeholder=true|false` -
+  `valid` requires both fields non-empty and neither still equal to
+  `include/interbridge_dev_secrets.example.h`'s placeholder text;
+  `placeholder=true` means at least one field is still the unmodified
+  example value (the header was generated but not actually filled in, or
+  never regenerated after a `git clean`/fresh checkout).
+- The same three log points also repeat the **last known Wi-Fi scan
+  summary**: `networks_found=N configured_ssid_found=true|false rssi=N
+  channel=N auth=... scan_age_ms=N` - RSSI/channel/auth are only ever the
+  configured SSID's own values (if it was found); no other network's SSID
+  is ever logged or retained.
+- **The scan itself never runs before every association attempt** (it is
+  a multi-second blocking operation - see `WiFi.scanNetworks()`'s default
+  synchronous mode - and repeating it every retry would meaningfully slow
+  down reconnection). It runs once on the very first `ConnectWifi`, and
+  is repeated only after a 5-minute interval or 5 consecutive explicit
+  association failures accumulate - see `kWifiRescanIntervalMs`/
+  `kWifiRescanFailureThreshold` in both mains. A scan is always fully
+  synchronous with (and strictly precedes) the `WiFi.begin()` call in the
+  same `ConnectWifi` handler - by construction, the two can never overlap.
+- The pure comparison/formatting logic (`diagnoseCredentialField()`,
+  `summarizeCredentialConfig()`, `summarizeWifiScan()`, and both line
+  formatters) lives in a new shared, native-testable module,
+  `src/dev/dev_wifi_diagnostics.*`, used unmodified by both
+  `mqtt_smoke_main.cpp` and `dev_ring_simulator_main.cpp` - only the
+  Arduino-only glue (reading `WiFi.SSID()`/`RSSI()`/`channel()`/
+  `encryptionType()`, calling `WiFi.scanNetworks()`, and the actual
+  `Serial.print` calls) is duplicated per main, same pattern as
+  `DevMqttSmokeState`'s other callers. See
+  `test/test_dev_wifi_diagnostics` for the native coverage, including two
+  tests that run distinctive marker SSID/password strings through the
+  entire pipeline and assert they never appear in the formatted output.
+- `scripts/generate_dev_secrets_header.ps1` now also rejects an SSID or
+  password that still exactly matches the example header's placeholder
+  text, reports only the generated SSID/password byte lengths (never the
+  values) after writing, and validates that all seven expected macros
+  appear exactly once in the file before it is written.
+
+**This is diagnostics only - no retry/backoff policy changed, and no
+credential/AP conclusion is drawn by this pass.** A hardware retest with
+these diagnostics against both the WPA2 test hotspot and the home network
+is still required.
+
 ## Honest status
 
 **Implemented and compiled. `esp32-c3-dev-ring-simulator` has been
-flashed and booted on real hardware three times, and Wi-Fi has not yet
-associated on any attempt - see all three "Real bench observation"
+flashed and booted on real hardware four times, and Wi-Fi has not yet
+associated on any attempt - see all four "Real bench observation"
 sections above. The concurrent-retry coordination defect in the shared
 `DevMqttSmokeState` (both DEV mains reissuing `WiFi.begin()` while a
-previous attempt was still outstanding) is confirmed fixed by the third
-retest - the driver-level `wifi:sta is connecting, return error` error is
-gone. Association still fails with the same disconnect reason codes (2,
-202) as before that fix, so the concurrent retry was not the (sole) cause
-of the original failure. Reason 2/202 has not been root-caused yet and
-will be isolated next using a dedicated WPA2 test hotspot with known-good
-credentials, separate from whatever network this board has been tested
-against so far - SSID/credential/network causes remain explicitly not
-ruled out. A separate, diagnostic-only `uint32_t` underflow in the
-"delay_ms=" log lines (`4294967291`, `4294967294` observed) is also fixed
-in this pass - display-only, no retry/backoff policy changed. Button
-behavior, MQTT connectivity, and end-to-end event delivery from a real
-physical press remain unvalidated on hardware.**
+previous attempt was still outstanding) is confirmed fixed - the
+driver-level `wifi:sta is connecting, return error` error is gone.
+Association still fails: reason 2/202 (auth-stage rejection) persists
+unchanged on the home network, and a fourth retest against a dedicated
+WPA2 test hotspot produced a *different* failure, reason=201
+(`no_ap_found`) - the ESP32 never saw that access point at all. Neither
+result has been root-caused. This pass adds sanitized SSID/password
+length + placeholder-detection diagnostics and a controlled, rate-limited
+Wi-Fi scan (reported before every `WiFi.begin()`, at boot, and in the
+heartbeat while Wi-Fi is down) specifically to make the next retest able
+to distinguish "wrong credential bytes reached the binary" from "the
+ESP32 genuinely never received a beacon for that SSID" from "a real
+match was rejected at authentication" - it does not itself draw either
+conclusion. SSID/credential/AP correctness remain explicitly not
+confirmed either way. A separate, diagnostic-only `uint32_t` underflow in
+the "delay_ms=" log lines (`4294967291`, `4294967294` observed) is also
+fixed - display-only, no retry/backoff policy changed. Button behavior,
+MQTT connectivity, and end-to-end event delivery from a real physical
+press remain unvalidated on hardware.**
 
 - Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
   cover: one press → exactly one `RING_DETECTED`; holding the button
@@ -409,19 +511,30 @@ physical press remain unvalidated on hardware.**
   `test/test_dev_mqtt_state`) cover the delay-display fix: an ordinary
   future deadline, a deadline already reached (saturates at 0 instead of
   underflowing), and both directions of the `millis()` wraparound.
+- Native unit tests (`test/test_dev_wifi_diagnostics`, 9 tests) cover the
+  new Wi-Fi config/scan diagnostics: placeholder detection, correct byte
+  lengths, a config summary that is only `valid` when both fields are
+  non-empty and non-placeholder, a scan summary that correctly finds/does
+  not find the configured SSID among fake scan results (including
+  RSSI/channel/auth extraction), and - run through the entire pipeline
+  with distinctive marker SSID/password/network-name strings - that the
+  formatted diagnostic lines never contain any of those secret/name
+  values, only the derived facts about them.
 - `pio run -e esp32-c3-dev-ring-simulator` and `pio run -e esp32-c3-dev-mqtt`
   compile successfully, with no new warnings.
 - `pio run -e esp32-c3`, `pio run -e esp32-c3-si3050-clock-probe`, and
   `pio run -e esp32dev-si3050-clock-meter` all still compile successfully
   and are unaffected in source - confirming this fix does not alter any
   other build.
-- **Not yet done**: isolating the reason=2/202 root cause with a WPA2 test
-  hotspot, a further hardware retest after that, wiring the physical
-  button, and running the rest of the manual procedure above. GPIO20's
-  electrical behavior under `INPUT_PULLUP` on this specific module, the
-  end-to-end AWS IoT delivery, and the offline/reconnect replay have only
-  been exercised through native fakes (`FakeDevRingButtonInput`,
-  `FakeDeviceTransport`, direct `DevMqttSmokeState` calls), not real
-  hardware - this is true even though 3B.6/3B.7 are now deployed in DEV,
-  since neither of those exercised a real physical button or this
+- **Not yet done**: a hardware retest with the new SSID/password/scan
+  diagnostics (against both the WPA2 test hotspot and the home network),
+  isolating the reason=201 and reason=2/202 root causes, wiring the
+  physical button, and running the rest of the manual procedure above.
+  GPIO20's electrical behavior under `INPUT_PULLUP` on this specific
+  module, the end-to-end AWS IoT delivery, and the offline/reconnect
+  replay have only been exercised through native fakes
+  (`FakeDevRingButtonInput`, `FakeDeviceTransport`, direct
+  `DevMqttSmokeState` calls), not real hardware - this is true even
+  though 3B.6/3B.7 are now deployed in DEV, since neither of those
+  exercised a real physical button or this
   specific Wi-Fi coordination path.

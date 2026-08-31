@@ -1302,6 +1302,78 @@ this pass:)*
   via real `pio run`. **Still not validated on real hardware for
   association success** - see `docs/dev-ring-simulator.md`'s "Real bench
   observation: concurrent retry gone, auth still fails (reason=2/202)".
+- **Follow-up finding + fix (same Phase 3B.8 work, before merge): a fourth
+  hardware retest against a dedicated WPA2 test hotspot (an iPhone's
+  Personal Hotspot, "Henrique's iPhone") produced a *different* failure
+  than the home network** - `reason=201` (`WIFI_REASON_NO_AP_FOUND`,
+  meaning the ESP32 never saw a beacon for that SSID at all), while the
+  home network kept failing with `reason=2`/`202` (an auth-stage
+  rejection) unchanged. Neither is root-caused. The credential path was
+  reviewed: both DEV mains read `INTERBRIDGE_DEV_WIFI_SSID`/
+  `_PASSWORD` directly from `include/interbridge_dev_secrets.h` straight
+  into `WiFi.begin()` - there is no other credential source - but the
+  only existing diagnostic (`wifi_config=present`) only proved *some*
+  header existed, never that the compiled binary actually held the
+  intended byte values. Added, sanitized, never logging the raw
+  SSID/password value or any other network's name: (1) a credential
+  config summary - `config=valid|invalid ssid_bytes=N password_bytes=N
+  placeholder=true|false` (`valid` requires both fields non-empty and
+  neither still equal to `include/interbridge_dev_secrets.example.h`'s
+  placeholder text) - and (2) a controlled Wi-Fi scan summary -
+  `networks_found=N configured_ssid_found=true|false rssi=N channel=N
+  auth=... scan_age_ms=N`, where RSSI/channel/auth are only ever the
+  configured SSID's own values if present; no other network's SSID is
+  ever retained or logged. Per explicit follow-up instruction, both lines
+  are logged not just once at boot but repeated before every
+  `WiFi.begin()` and from the heartbeat while Wi-Fi is down, since the
+  serial monitor is often attached only after boot and would otherwise
+  miss them. The scan itself is never repeated before every attempt (a
+  multi-second blocking operation via `WiFi.scanNetworks()`'s default
+  synchronous mode) - only the first-ever `ConnectWifi` always scans;
+  later attempts rescan only after a 5-minute interval or 5 consecutive
+  explicit association failures accumulate (`kWifiRescanIntervalMs`/
+  `kWifiRescanFailureThreshold`), and a scan is always fully synchronous
+  with, and strictly precedes, the `WiFi.begin()` call in the same
+  `ConnectWifi` handler - never concurrent with association by
+  construction, and no retry/backoff policy was touched. The pure
+  comparison/formatting logic
+  (`diagnoseCredentialField()`/`summarizeCredentialConfig()`/
+  `summarizeWifiScan()`/both line formatters) lives in a new shared,
+  native-testable module, `src/dev/dev_wifi_diagnostics.*`, used
+  unmodified by both `mqtt_smoke_main.cpp` and
+  `dev_ring_simulator_main.cpp` - only the small Arduino-only glue
+  (reading `WiFi.SSID()`/`RSSI()`/`channel()`/`encryptionType()`, calling
+  `WiFi.scanNetworks()`, the `Serial.print` calls) is duplicated per main,
+  same pattern as `DevMqttSmokeState`'s other callers.
+  `scripts/generate_dev_secrets_header.ps1` now also rejects an SSID/
+  password that still exactly matches the example header's placeholder,
+  reports only the generated SSID/password byte lengths (via
+  `[Text.Encoding]::UTF8.GetByteCount`, matching what the compiled C++
+  macro actually holds - never `.Length`, which counts UTF-16 code units
+  and would misreport a multi-byte SSID) after writing, and validates
+  that all seven expected macros appear exactly once in the generated
+  content before it is ever written to disk. 9 new native tests in
+  `test/test_dev_wifi_diagnostics` (39 suites total now): placeholder
+  detection, correct byte lengths, a config summary that is `valid` only
+  when both fields are non-empty and non-placeholder, scan-summary
+  found/not-found matching (including RSSI/channel/auth extraction), and
+  - run through the entire pipeline with distinctive marker
+  SSID/password/network-name strings - that the formatted diagnostic
+  lines never contain any of those secret/name values. Validated: all 39
+  native suites passed via the same locally available MSVC used
+  throughout this work (`pio test -e native` itself still cannot run in
+  this sandbox - same pre-existing no-host-compiler limitation); all five
+  required environments compiled via real `pio run`; the PS1 script's new
+  logic (placeholder rejection, UTF-8 byte counting including a
+  multi-byte code point, escaping, macro-uniqueness validation) was
+  exercised via a standalone throwaway harness reproducing each snippet,
+  since running the real script would have overwritten the operator's
+  live local DEV secrets file. **This is diagnostics only - no
+  credential/AP root cause is claimed fixed or ruled out by this pass.**
+  See `docs/dev-ring-simulator.md`'s "Real bench observation: WPA2 test
+  hotspot isolates a different failure mode (reason=201)" and "Wi-Fi
+  config and scan diagnostics" for the full record. **Still not validated
+  on real hardware.**
 
 ## Future Work
 

@@ -397,3 +397,20 @@ native tests (via a real local MSVC compile-and-run of
 `esp32-c3`/`esp32-c3-dev-mqtt` - **it has not been re-tested on real
 hardware yet**, since the original 110-minute-outage recovery ladder itself
 hadn't been bench-validated when this race was found.
+
+## Real bench observation: shared Wi-Fi association coordination bug (Phase 3B.8 investigation)
+
+`DevMqttSmokeState` - and therefore `esp32-c3-dev-mqtt`, which owns it as
+much as `esp32-c3-dev-ring-simulator` does - turned out to have a real
+Wi-Fi association coordination defect (reissuing `WiFi.begin()` while a
+previous attempt was still outstanding, which the ESP32 driver rejects)
+found and fixed during the Phase 3B.8 ring-simulator bring-up, plus a
+`uint32_t` underflow in this harness's own "delay_ms=" diagnostic lines,
+plus new sanitized SSID/password-length/placeholder and Wi-Fi-scan
+diagnostics added to both DEV mains after a WPA2 test hotspot retest
+surfaced a disconnect reason (`201`, AP not found) this harness's own
+prior diagnostics could not explain. None of this is duplicated here -
+see `docs/dev-ring-simulator.md`'s "Real bench observation" sections (all
+four of them) and "Wi-Fi config and scan diagnostics" for the full
+investigation, fixes, and honest current status (association has not yet
+succeeded on either DEV environment as of that writing).

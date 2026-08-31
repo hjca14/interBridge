@@ -461,13 +461,37 @@ Wi-Fi association attempt in flight, the same way it already did for NTP,
 resolved only by an explicit `wifiAssociationResult()` call or its own
 separate timeout - see `docs/dev-ring-simulator.md` > "Real bench
 observation: retest reveals a shared concurrent-retry defect" for the
-full mechanism. **This is the one place `mqtt_smoke_main.cpp` was
-modified for Phase 3B.8**: both it and `dev_ring_simulator_main.cpp` now
+full mechanism. This was the first place `mqtt_smoke_main.cpp` was
+modified for Phase 3B.8 (previously untouched, on the theory that
+duplicating its logging into the new file was lower-risk than editing an
+already-validated one - that theory held only until a real defect was
+found *in* the shared class both files call into, which could only be
+fixed in one place): both it and `dev_ring_simulator_main.cpp` now
 forward real Wi-Fi connected/got_ip/disconnected events into the shared
 coordinator (via a minimal signal recorded in the event callback and
 consumed once per `loop()` iteration, to avoid mutating shared state from
 a different task) - the state-machine fix itself lives in exactly one
 place, `mqtt_smoke_state.*`, never duplicated between the two mains.
+
+A further hardware retest (against a dedicated WPA2 test hotspot, see
+`docs/dev-ring-simulator.md`) showed a *different* failure than the home
+network (`reason=201`/`no_ap_found` vs. `reason=2`/`202`), which the
+existing diagnostics could not explain: `wifi_config=present` only proved
+some secrets header existed, never that the compiled binary held the
+intended SSID/password bytes, and there was no visibility into what the
+ESP32's own Wi-Fi scan actually saw. `src/dev/dev_wifi_diagnostics.*` is
+a new shared, native-testable module (`diagnoseCredentialField()`/
+`summarizeCredentialConfig()`/`summarizeWifiScan()`/two line formatters)
+used unmodified by both DEV mains, reporting only byte-length/empty/
+placeholder-match facts about the SSID/password and a scan summary
+(network count, and the configured SSID's own RSSI/channel/auth type if
+found) - never the raw SSID/password value or any other network's name.
+Repeated at boot, before every `WiFi.begin()`, and from the heartbeat
+while Wi-Fi is down (so a serial monitor attached late still sees it);
+the scan itself is deliberately rate-limited (first attempt only, then
+gated on a time interval or a consecutive-failure count) and always
+completes strictly before the `WiFi.begin()` call in the same handler, so
+it can never run concurrently with association.
 
 ## MQTT/mTLS command lifecycle (Phase 2D)
 

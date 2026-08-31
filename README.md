@@ -58,7 +58,7 @@ the full device/cloud protocol specification.
 src/         Firmware source: core, hardware, intercom, audio, storage,
              provisioning, network, protocol, aws, ota.
 include/     Reserved for shared public headers (unused so far).
-test/        Native unit tests (Unity), one PlatformIO test per directory (38 suites).
+test/        Native unit tests (Unity), one PlatformIO test per directory (39 suites).
 docs/        Architecture documentation and the communication protocol spec.
 platformio.ini
 CONTEXT.md   Operational memory of the project — read this first.
@@ -86,14 +86,15 @@ pio device monitor -b 115200
 ## Running tests
 
 ```bash
-# Run all native unit tests (38 suites: state machine, events, intercom,
+# Run all native unit tests (39 suites: state machine, events, intercom,
 # MQTT topics, command parsing/handling/dedup, event outbox, reconnect
 # backoff, button, device identity, persistent storage, Device Shadow,
 # AWS IoT Jobs, OTA, health telemetry, provisioning (BLE-first onboarding
 # state machine), BLE advertisement/security mode, status indicator,
 # Fleet Provisioning, factory reset, MQTT transport, DEV MQTT smoke
 # state, Si3050 bring-up controller, Si3050 ring detector, Si3050 clock
-# probe math, DEV ring simulator button/event (Phase 3B.8), ...)
+# probe math, DEV ring simulator button/event, DEV Wi-Fi diagnostics
+# (Phase 3B.8), ...)
 pio test -e native
 ```
 
@@ -163,16 +164,21 @@ smoke environment's connectivity state machine and the existing
 inventing a new one, and never touches the real Si3050 driver stack,
 provisioning, BLE, or production Wi-Fi/AWS composition. Implemented and
 compiled (native tests pass, all PlatformIO environments still build);
-three real-hardware boots have not yet associated to Wi-Fi. A retest
-found `esp32-c3-dev-mqtt` failing the exact same way as the simulator on
-the same session - both DEV mains share `DevMqttSmokeState`, which had a
-real concurrent-retry defect (reissuing `WiFi.begin()` while a previous
-association attempt was still outstanding). A follow-up retest confirmed
-that fix worked (the driver-level "sta is connecting" error is gone), but
-association **still fails with the same disconnect reason codes (2,
-202)** - the concurrent retry was not the sole cause, and this will be
-isolated next with a dedicated WPA2 test hotspot. SSID/credential/network
-causes remain explicitly not ruled out. See
+four real-hardware boots have not yet associated to Wi-Fi. A retest found
+`esp32-c3-dev-mqtt` failing the exact same way as the simulator on the
+same session - both DEV mains share `DevMqttSmokeState`, which had a real
+concurrent-retry defect (reissuing `WiFi.begin()` while a previous
+association attempt was still outstanding), now fixed and confirmed (the
+driver-level "sta is connecting" error is gone). Association still fails:
+the home network keeps failing with disconnect reason 2/202 (an
+auth-stage rejection), while a further retest against a dedicated WPA2
+test hotspot produced a *different* reason, 201 (the ESP32 never saw that
+AP at all) - neither is root-caused. Sanitized SSID/password
+byte-length/placeholder-match diagnostics and a controlled, rate-limited
+Wi-Fi scan (logged before every `WiFi.begin()`, at boot, and in the
+heartbeat while Wi-Fi is down) have been added to distinguish these
+causes on the next retest; SSID/credential/AP correctness remain
+explicitly not confirmed either way. See
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) for the wiring
 diagram, GPIO rationale, manual test procedure, and the real bench
 observations, and

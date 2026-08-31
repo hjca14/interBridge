@@ -12,8 +12,11 @@
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <string>
+#include <vector>
 #include "interbridge_dev_secrets.h"
 #include "mqtt_smoke_state.h"
+#include "dev_wifi_diagnostics.h"
 #include "../hardware/clock.h"
 #include "../hardware/ntp_sync_state.h"
 #include "../hardware/gpio.h"
@@ -40,6 +43,20 @@ constexpr uint32_t kHeartbeatMs = 15000;
 // DEV backend considers a device stale after 120s. Publishing halfway through
 // that window leaves one missed-report margin without using the 15s log cadence.
 constexpr uint32_t kDevHealthIntervalMs = 60u * 1000u;
+
+// Must match include/interbridge_dev_secrets.example.h exactly - see
+// diagnoseCredentialField()'s doc comment.
+constexpr const char* kWifiSsidPlaceholder = "REPLACE_WITH_WIFI_SSID";
+constexpr const char* kWifiPasswordPlaceholder = "REPLACE_WITH_WIFI_PASSWORD";
+// A Wi-Fi scan is never repeated before every ConnectWifi attempt (it
+// would add several blocking seconds to every retry) - only the very
+// first attempt always scans, and later attempts rescan only after this
+// interval elapses or this many consecutive association failures
+// accumulate, so the diagnostic can notice "the AP moved/changed channel"
+// or "we've been failing a while" without turning into a per-attempt
+// scan storm. See the ConnectWifi handler in loop().
+constexpr uint32_t kWifiRescanIntervalMs = 300000; // 5 minutes
+constexpr uint32_t kWifiRescanFailureThreshold = 5;
 
 class NtpClock final : public IClock {
 public:
@@ -127,6 +144,96 @@ const char* wifiDisconnectReasonName(uint8_t reason) {
     }
 }
 
+// Sanitized, closed-set label for a scan result's auth mode - referencing
+// esp_wifi_types.h's own named wifi_auth_mode_t constants directly (same
+// no-hand-copied-drift rationale as wifiDisconnectReasonName() above).
+// Auth mode is a public AP property (broadcast in every beacon frame),
+// never secret - "sanitized" here just means a small, stable label set
+// instead of a raw driver enum value.
+const char* sanitizedAuthModeName(wifi_auth_mode_t mode) {
+    switch (mode) {
+        case WIFI_AUTH_OPEN: return "open";
+        case WIFI_AUTH_WEP: return "wep";
+        case WIFI_AUTH_WPA_PSK: return "wpa_psk";
+        case WIFI_AUTH_WPA2_PSK: return "wpa2_psk";
+        case WIFI_AUTH_WPA_WPA2_PSK: return "wpa_wpa2_psk";
+        case WIFI_AUTH_WPA2_ENTERPRISE: return "wpa2_enterprise";
+        case WIFI_AUTH_WPA3_PSK: return "wpa3_psk";
+        case WIFI_AUTH_WPA2_WPA3_PSK: return "wpa2_wpa3_psk";
+        case WIFI_AUTH_WAPI_PSK: return "wapi_psk";
+        default: return "unknown";
+    }
+}
+
+// Last completed scan's summary, its timestamp, and whether one has run
+// yet at all - kept so the same sanitized line can be repeated later
+// (before every WiFi.begin(), and in the heartbeat while Wi-Fi is down)
+// without rescanning every time; see performWifiScan()'s call sites for
+// the rescan-gating policy. consecutiveWifiAssociationFailures counts
+// only explicit ARDUINO_EVENT_WIFI_STA_DISCONNECTED events (see
+// drainWifiEventSignals()) - a stuck attempt resolved only by
+// DevMqttSmokeState's own internal association timeout, with no event
+// ever arriving, is not counted here (a narrower diagnostic-only signal
+// than DevMqttSmokeState's unrelated consecutiveConnectivityFailures(),
+// which tracks DNS/MQTT failures instead and is never touched by this).
+WifiScanSummary lastWifiScanSummary;
+uint32_t lastWifiScanAtMs = 0;
+bool wifiScanEverRun = false;
+uint32_t consecutiveWifiAssociationFailures = 0;
+
+std::string credentialConfigLine() {
+    auto ssidDiag = diagnoseCredentialField(INTERBRIDGE_DEV_WIFI_SSID, kWifiSsidPlaceholder);
+    auto passwordDiag = diagnoseCredentialField(INTERBRIDGE_DEV_WIFI_PASSWORD, kWifiPasswordPlaceholder);
+    return formatCredentialConfigLine(summarizeCredentialConfig(ssidDiag, passwordDiag));
+}
+
+// Logs the sanitized credential-config line and the last known scan
+// summary (with a freshly computed age) - called at boot, right before
+// every WiFi.begin(), and from the heartbeat while Wi-Fi is down, so this
+// stays visible even if the serial monitor is attached well after boot
+// and missed the earlier prints.
+void logWifiConfigAndScanSummary(uint32_t now) {
+    Serial.printf("[DEV MQTT] %s\n", credentialConfigLine().c_str());
+    if (!wifiScanEverRun) {
+        Serial.println("[DEV MQTT] wifi scan not_yet_run=true");
+        return;
+    }
+    const uint32_t scanAgeMs = DevMqttSmokeState::millisUntil(now, lastWifiScanAtMs);
+    Serial.printf("[DEV MQTT] wifi scan %s\n", formatWifiScanLine(lastWifiScanSummary, scanAgeMs).c_str());
+}
+
+// Synchronous/blocking Wi-Fi scan (WiFi.scanNetworks() with its default
+// async=false) - only ever called from the ConnectWifi handler in loop(),
+// strictly before that same call's WiFi.begin(), so it can never overlap
+// with an association attempt: the two are sequential statements in the
+// same single-threaded function call, not concurrent by construction.
+void performWifiScan(uint32_t now) {
+    WiFi.mode(WIFI_STA);
+    const int16_t count = WiFi.scanNetworks();
+    std::vector<WifiScanNetwork> networks;
+    if (count > 0) {
+        networks.reserve(static_cast<size_t>(count));
+        for (int16_t i = 0; i < count; ++i) {
+            WifiScanNetwork network;
+            network.ssid = std::string(WiFi.SSID(i).c_str());
+            network.rssi = WiFi.RSSI(i);
+            network.channel = WiFi.channel(i);
+            network.authType = sanitizedAuthModeName(WiFi.encryptionType(i));
+            networks.push_back(std::move(network));
+        }
+    } else if (count < 0) {
+        // WIFI_SCAN_FAILED (or similar) - the scan itself did not
+        // complete successfully, distinct from a scan that genuinely
+        // found zero networks.
+        Serial.printf("[DEV MQTT] wifi scan failed err=%d\n", static_cast<int>(count));
+    }
+    lastWifiScanSummary = summarizeWifiScan(networks, INTERBRIDGE_DEV_WIFI_SSID);
+    WiFi.scanDelete();
+    lastWifiScanAtMs = now;
+    wifiScanEverRun = true;
+    consecutiveWifiAssociationFailures = 0;
+}
+
 // Set only from the Wi-Fi event callback below (which the ESP32 Arduino
 // core runs on its own Wi-Fi/event task, not the main loop task) and
 // consumed only from loop() via drainWifiEventSignals(). Forwarding a real
@@ -172,10 +279,12 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void drainWifiEventSignals(uint32_t now) {
     if (wifiAssociatedEventPending) {
         wifiAssociatedEventPending = false;
+        consecutiveWifiAssociationFailures = 0;
         connectivity.wifiAssociationResult(now, true);
     }
     if (wifiDisconnectedEventPending) {
         wifiDisconnectedEventPending = false;
+        ++consecutiveWifiAssociationFailures;
         connectivity.wifiAssociationResult(now, false);
     }
 }
@@ -198,12 +307,17 @@ const char* stateName(DevSmokeState state) {
 void heartbeat(uint32_t now) {
     if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
     heartbeatAt = now + kHeartbeatMs;
+    const bool wifiUp = WiFi.status() == WL_CONNECTED;
     Serial.printf("[DEV MQTT] local_status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu heap_free=%u heap_min=%u stack_words=%u\n",
-                  stateName(connectivity.state()), WiFi.status() == WL_CONNECTED ? "up" : "down",
+                  stateName(connectivity.state()), wifiUp ? "up" : "down",
                   clockSource.hasValidTime() ? "valid" : "pending",
                   transport.isConnected() ? "up" : "down",
                   static_cast<unsigned long>(now / 1000), ESP.getFreeHeap(), ESP.getMinFreeHeap(),
                   static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+    // Repeats the sanitized credential/scan summary while Wi-Fi is down, so
+    // it stays visible even if the serial monitor is attached well after
+    // boot and missed the setup()/ConnectWifi prints.
+    if (!wifiUp) logWifiConfigAndScanSummary(now);
 }
 
 void publishHealth(uint32_t now) {
@@ -227,9 +341,9 @@ void setup() {
     while (!Serial && !DevMqttSmokeState::deadlineReached(millis(), serialDeadline)) delay(10);
     Serial.println("[DEV MQTT] production-path harness; physical actions disabled");
     Serial.println("[DEV MQTT] local configuration loaded into transient DEV memory (values not logged)");
-    Serial.printf("[DEV MQTT] previous_reset=%s wifi_config=present\n",
-                  resetReasonName(esp_reset_reason()));
+    Serial.printf("[DEV MQTT] previous_reset=%s\n", resetReasonName(esp_reset_reason()));
     WiFi.onEvent(onWifiEvent);
+    logWifiConfigAndScanSummary(millis());
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb(onTimeSynchronized);
@@ -308,7 +422,21 @@ void loop() {
         lastLoggedState = connectivity.state();
     }
     switch (action) {
-        case DevSmokeAction::ConnectWifi:
+        case DevSmokeAction::ConnectWifi: {
+            // Never scan before every attempt (it would add several
+            // blocking seconds to every retry) - only the very first
+            // attempt ever always scans (wifiScanEverRun starts false);
+            // later attempts rescan only after kWifiRescanIntervalMs
+            // elapses or kWifiRescanFailureThreshold consecutive
+            // association failures accumulate. Either way, this call is
+            // strictly sequential with (and completes fully before) the
+            // WiFi.begin() below - never concurrent with association.
+            const bool shouldRescan = !wifiScanEverRun ||
+                DevMqttSmokeState::deadlineReached(now, lastWifiScanAtMs + kWifiRescanIntervalMs) ||
+                consecutiveWifiAssociationFailures >= kWifiRescanFailureThreshold;
+            if (shouldRescan) performWifiScan(now);
+            logWifiConfigAndScanSummary(now);
+
             // The state machine authorizes exactly one begin call per retry;
             // leave interface recovery policy to the Wi-Fi driver for now.
             WiFi.mode(WIFI_STA);
@@ -317,6 +445,7 @@ void loop() {
                           static_cast<unsigned long>(connectivity.retryAtMs()),
                           static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
             break;
+        }
         case DevSmokeAction::ResolveDns: {
             IPAddress resolved;
             const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();

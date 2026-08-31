@@ -15,7 +15,7 @@ those files for the full record of 3B.1-3B.2.
 | 3B.3-3B.5 | Not tracked in this repository/document | - | Out of scope here |
 | 3B.6 | Backend FCM sender: `telemetry_ingestion` invokes `push_sender`, which delivers a push notification via Firebase Cloud Messaging for `RING_DETECTED` (and related) Basic Ingest events | Backend repo | **Implemented and deployed in DEV** - the backend has accepted a real event end-to-end and recorded `Sent=1` for it |
 | 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | **Implemented and deployed in DEV** |
-| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; three real-hardware boots have not associated to Wi-Fi. The concurrent-retry defect in the shared `DevMqttSmokeState` Wi-Fi coordinator is fixed and confirmed (the driver-level "sta is connecting" error is gone on retest), but association still fails with the same disconnect reasons (2, 202) - auth/credential is now the leading suspect, to be isolated next with a dedicated WPA2 test hotspot. See `docs/dev-ring-simulator.md`'s three "Real bench observation" sections.** |
+| **3B.8** | **Bench-only DEV physical ring simulator: a momentary button on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Implemented and compiled; four real-hardware boots have not associated to Wi-Fi. The concurrent-retry Wi-Fi coordinator defect is fixed and confirmed. A WPA2 test hotspot retest produced a different failure (reason=201, AP not found) than the home network (reason=2/202, auth rejected) - neither root-caused. Sanitized SSID/password-length/placeholder diagnostics and a controlled, rate-limited Wi-Fi scan have been added to distinguish these causes on the next retest. See `docs/dev-ring-simulator.md`'s four "Real bench observation" sections.** |
 | 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal slice (displaying a data-only FCM notification) is underway; the full call UI is not started |
 | 3B.10 | iOS/APNs call/notification experience for an incoming ring | Mobile (iOS) repo | Not started (not in this repo) |
 
@@ -45,6 +45,16 @@ those files for the full record of 3B.1-3B.2.
 - The third retest confirmed the concurrent-retry fix worked (the
   driver-level "sta is connecting" error is gone) but association still
   fails with the same reason codes (2, 202) as before that fix - the
-  concurrent retry was not the sole cause. Next step is isolating this
-  with a dedicated WPA2 test hotspot before assuming any other cause
-  (firmware, credential, or AP-side) fixed or ruled out.
+  concurrent retry was not the sole cause.
+- A fourth retest against a dedicated WPA2 test hotspot ("Henrique's
+  iPhone" Personal Hotspot) produced a *different* failure - reason=201
+  (`no_ap_found`), meaning the ESP32 never saw that access point at all -
+  while the home network still failed with reason=2/202 (an auth-stage
+  rejection). Neither is root-caused, and this does not confirm or rule
+  out a credential-pipeline bug, a range/band issue, or an AP-side
+  rejection. Sanitized SSID/password byte-length + placeholder-match
+  diagnostics and a controlled Wi-Fi scan (reported before every
+  `WiFi.begin()`) have been added specifically to distinguish these on
+  the next retest - see `docs/dev-ring-simulator.md` > "Wi-Fi config and
+  scan diagnostics". Do not assume the credential or either AP is correct
+  until that retest actually confirms it.
