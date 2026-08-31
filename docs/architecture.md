@@ -319,9 +319,10 @@ Two PlatformIO environments exist:
   45 `.cpp` files) together with Unity tests under `test/` (32 suites),
   using the host's own C++ compiler.
 
-`main.cpp`, `dev/mqtt_smoke_main.cpp`, and `network/wifi.cpp` are excluded
-from the `native` build (via `build_src_filter` in `platformio.ini`)
-because they include Arduino-only headers unconditionally. Every other
+`main.cpp`, `dev/mqtt_smoke_main.cpp`, `dev/dev_ring_simulator_main.cpp`,
+and `network/wifi.cpp` are excluded from the `native` build (via
+`build_src_filter` in `platformio.ini`) because they include Arduino-only
+headers unconditionally. Every other
 file - including
 `hardware/clock.cpp`, `hardware/button.cpp`, `hardware/system_control.cpp`,
 `core/random_id.cpp`, and `hardware/gpio.cpp` - compiles natively because
@@ -419,6 +420,93 @@ hardware and system-control dependencies are explicitly non-actuating. Ignored D
 credentials live only in a transient `MemoryStore`; this is not reboot persistence.
 Production NVS, BLE/Fleet Provisioning, and onboarding remain pending.
 
+## DEV physical ring simulator isolation (Phase 3B.8)
+
+`src/dev/dev_ring_simulator_main.cpp` is compiled only by
+`esp32-c3-dev-ring-simulator`, gated behind
+`INTERBRIDGE_DEV_RING_SIMULATOR`; it is excluded from `esp32-c3`,
+`esp32-c3-dev-mqtt`, and both Si3050 clock probe environments, and none of
+those are linked into it. It reuses `DevMqttSmokeState` for connectivity
+bring-up (same Wi-Fi → DNS → NTP → MQTT cascade as the DEV MQTT smoke
+harness above) instead of duplicating it. Two hardware-independent,
+natively-tested classes carry the actual bench logic:
+`DevRingButtonController` (`src/dev/dev_ring_button.*`) debounces the
+physical button and emits a one-shot pulse only on the released-to-pressed
+edge; `DevRingEventCoordinator` + `publishPendingEvents()`
+(`src/dev/dev_ring_event.*`) turn that pulse into a `RING_DETECTED`
+`DeviceEvent`, enqueue it into a `MemoryEventOutbox`, and drain that
+outbox against `Esp32AwsIotTransport`/`MqttTopics::eventsIngest()` exactly
+like `main.cpp`'s production outbox loop - the same `event_id` survives
+any retry or offline period. See `docs/dev-ring-simulator.md` for the
+wiring, GPIO rationale, and manual test procedure.
+
+`dev_ring_simulator_main.cpp`'s Wi-Fi event handler (`onWifiEvent()`),
+per-`DevSmokeAction` log lines, and boot diagnostics
+(`resetReasonName()`) are a deliberate line-for-line duplication of
+`mqtt_smoke_main.cpp`'s own logging pattern (added after a first real
+bench boot associated on neither DEV environment, with no diagnostic to
+explain why - see `docs/dev-ring-simulator.md` > Bench test history),
+not a new mechanism.
+
+A subsequent hardware retest with that logging in place showed
+`esp32-c3-dev-ring-simulator` and `esp32-c3-dev-mqtt` failing Wi-Fi
+association identically, exposing a real defect in the shared
+`DevMqttSmokeState` coordinator itself: it authorized reissuing
+`WiFi.begin()` based purely on `!wifiConnected` and an elapsed backoff
+timer, with no way to tell a still-in-progress association attempt apart
+from one that had already given up - which the ESP32 Wi-Fi driver
+punishes by rejecting (and restarting) any `WiFi.begin()` issued while a
+previous attempt is still outstanding. `DevMqttSmokeState` now tracks a
+Wi-Fi association attempt in flight, the same way it already did for NTP,
+resolved only by an explicit `wifiAssociationResult()` call or its own
+separate timeout - see `docs/dev-ring-simulator.md` > Bench test history
+for the full mechanism. This was the first place `mqtt_smoke_main.cpp` was
+modified for Phase 3B.8 (previously untouched, on the theory that
+duplicating its logging into the new file was lower-risk than editing an
+already-validated one - that theory held only until a real defect was
+found *in* the shared class both files call into, which could only be
+fixed in one place): both it and `dev_ring_simulator_main.cpp` now
+forward real Wi-Fi connected/got_ip/disconnected events into the shared
+coordinator (via a minimal signal recorded in the event callback and
+consumed once per `loop()` iteration, to avoid mutating shared state from
+a different task) - the state-machine fix itself lives in exactly one
+place, `mqtt_smoke_state.*`, never duplicated between the two mains.
+
+A further hardware retest (against a dedicated WPA2 test hotspot, see
+`docs/dev-ring-simulator.md`) showed a *different* failure than the home
+network (`reason=201`/`no_ap_found` vs. `reason=2`/`202`), which the
+existing diagnostics could not explain: `wifi_config=present` only proved
+some secrets header existed, never that the compiled binary held the
+intended SSID/password bytes, and there was no visibility into what the
+ESP32's own Wi-Fi scan actually saw. `src/dev/dev_wifi_diagnostics.*` is
+a new shared, native-testable module (`diagnoseCredentialField()`/
+`summarizeCredentialConfig()`/`summarizeWifiScan()`/two line formatters)
+used unmodified by both DEV mains, reporting only byte-length/empty/
+placeholder-match facts about the SSID/password and a scan summary
+(network count, and the configured SSID's own RSSI/channel/auth type if
+found) - never the raw SSID/password value or any other network's name.
+Repeated at boot, before every `WiFi.begin()`, and from the heartbeat
+while Wi-Fi is down (so a serial monitor attached late still sees it);
+the scan itself runs exactly once per boot (a rate-limited retry/interval
+policy was tried and then simplified away after a real test showed
+`WiFi.scanNetworks()` itself returning an error after several
+association attempts - the scan is a bench diagnostic, not part of the
+product), and always completes strictly before the `WiFi.begin()` call in
+the same handler, so it can never run concurrently with association.
+
+A later real bench test found a further, unrelated issue: the physical
+component wired to `esp32-c3-dev-ring-simulator`'s button is a Linker
+Button module (active-high, `VCC`/`GND`/`SIG`), not the dry, active-low
+contact the firmware and docs had assumed - `Esp32DevRingButtonInput` now
+reads it as plain `INPUT` (no pull-up), active-high, and the button moved
+from GPIO20 to GPIO4 (see `docs/dev-ring-simulator.md` > Bench test
+history for why GPIO20 was abandoned and what that test does and does
+not prove). The same test showed local connectivity (`state ... ->
+online`) without the companion app reflecting the device as present, so
+`dev_ring_simulator_main.cpp` gained the identical periodic `HealthReport`
+publish `mqtt_smoke_main.cpp` already sends (`MqttTopics::healthIngest()`,
+QoS `AtMostOnce`) - unconfirmed against the actual backend/app presence
+mechanism, which lives outside this repo.
 
 ## MQTT/mTLS command lifecycle (Phase 2D)
 

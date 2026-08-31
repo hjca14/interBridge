@@ -1063,6 +1063,486 @@ this pass:)*
   result remains unchanged, as do Wi-Fi/BLE/MQTT/AWS/provisioning/reconnection, the
   clock probe environments (kept as bench regression), and PR #17's IDF5
   approach (not reintroduced).
+- **Phase 3B.8: bench-only DEV physical ring simulator added** (a
+  momentary button on the ESP32-C3 publishes a real `RING_DETECTED`
+  `DeviceEvent` through the existing production AWS IoT Basic Ingest
+  pipeline, for bench-testing the downstream notification pipeline
+  without a real Si3050/intercom line - see `docs/dev-ring-simulator.md`
+  and `docs/roadmap-3b.md`). A new isolated environment,
+  `esp32-c3-dev-ring-simulator`, gated behind
+  `INTERBRIDGE_DEV_RING_SIMULATOR`, mutually exclusive (via
+  `build_src_filter`) with `esp32-c3`, `esp32-c3-dev-mqtt`, and both
+  Si3050 clock probe environments. It reuses `DevMqttSmokeState`
+  (`src/dev/mqtt_smoke_state.*`, already bench-validated - see
+  `docs/mqtt-dev-smoke-test.md`) for Wi-Fi/DNS/NTP/MQTT connectivity
+  bring-up rather than duplicating it, and publishes exclusively through
+  `MqttTopics::eventsIngest()` + `Esp32AwsIotTransport` +
+  `MemoryEventOutbox` (the same production `IEventOutbox`
+  contract) - no second MQTT client, no parallel topic. Two new
+  hardware-independent, natively-tested classes: `DevRingButtonController`
+  (`src/dev/dev_ring_button.*` - debounces a momentary button and emits a
+  one-shot "ring requested" pulse only on the released-to-pressed edge,
+  never while held, with an additional short post-event lockout against
+  contact-bounce bursts) and `DevRingEventCoordinator` +
+  `publishPendingEvents()` (`src/dev/dev_ring_event.*` - builds the
+  `DeviceEvent`/`event_id` and enqueues it, then drains the outbox against
+  the transport exactly like `main.cpp`'s `updateNetwork()` loop, so a
+  retry or an offline press never regenerates the `event_id`/payload).
+  Never touches the real Si3050 driver stack, `RingDetector`, PCM clock,
+  provisioning, BLE, or production Wi-Fi/AWS credentials/composition -
+  `main.cpp` is completely excluded from this environment's build.
+  GPIO20 was chosen for the button (`src/dev/dev_ring_simulator_config.h`,
+  with compile-time `static_assert`s against colliding with any real
+  Si3050/BOOT/USB pin): the validated bench board only exposes 15 GPIOs
+  total, and GPIO0-8/10/9/18/19 are already committed to
+  Si3050/BOOT/USB - GPIO20 is a **documentation-reserved-only, currently
+  unimplemented** pin (`kSi3050ReservedPinButton`; `Esp32ButtonInput` has
+  no real GPIO wired in any code path yet), and its reuse here is an
+  explicit, user-approved, DEV-only-scoped decision, not a silent
+  conflict - see `docs/dev-ring-simulator.md` for the full pin-budget
+  rationale and why this must be revisited once the Si3050 and the final
+  board (with its real config/reset button) are integrated together. 11
+  new native tests across `test/test_dev_ring_button` and
+  `test/test_dev_ring_event` (one press → exactly one event; bounce/hold
+  produce no duplicates; release+press yields a new, different
+  `event_id`; a failed-then-retried publish preserves the same
+  `event_id`/payload; an offline press enqueues and a reconnect replays
+  it; JSON stays contract-compatible). Validated for real in this pass
+  (not just claimed): `pio run` actually succeeded (real PlatformIO +
+  espressif32/riscv32-esp toolchain were available in this session) for
+  `esp32-c3`, `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`,
+  `esp32-c3-si3050-clock-probe`, and `esp32dev-si3050-clock-meter` - all
+  five compiled cleanly with `platformio.ini` only gaining one new
+  exclusion line per pre-existing environment, confirming no other build
+  was altered. Native tests were also genuinely compiled **and executed**
+  this pass via a locally available MSVC (VS 2022 Build Tools, `cl.exe`)
+  against the real ArduinoJson v7/Unity sources already fetched into
+  `.pio/libdeps/native` - all 38 native suites (295 assertions) passed,
+  0 failed. **Not yet validated on real hardware** - no board has been
+  flashed, no physical button wired, and the offline/reconnect replay and
+  AWS IoT delivery have only been exercised through native fakes
+  (`FakeDevRingButtonInput`, `FakeDeviceTransport`) - see
+  `docs/dev-ring-simulator.md` > Honest status.
+- **Follow-up fix (same Phase 3B.8 work, before merge): GitHub Actions CI
+  caught two real defects in `test/test_dev_ring_event/test_main.cpp`
+  that this session's local MSVC run had not caught.** (1) A dangling
+  reference: `const std::string& json = outbox.pending()[0].eventJson;`
+  bound a reference into the internal storage of a `std::vector`
+  temporary returned **by value** from `IEventOutbox::pending()`; that
+  temporary is destroyed at the end of its own full expression, and
+  MSVC/glibc happened to disagree on how visibly that use-after-free
+  manifested (MSVC silently tolerated it; libstdc++ on the Ubuntu CI
+  runner did not). Fixed by storing the returned vector in a real local
+  variable (`auto pending = outbox.pending();`) before indexing into it,
+  everywhere the test does so. (2) The `press()`/`release()` test helpers
+  called `DevRingButtonController::update()` directly instead of going
+  through `DevRingEventCoordinator::update()` - the coordinator (which
+  owns the actual enqueue-into-outbox logic) never saw those presses at
+  all, so `outbox.pending().back()` was called against an **empty**
+  outbox, which is undefined behavior for `std::deque` and is what
+  actually produced CI's crash. Fixed by rewriting both helpers to drive
+  `coordinator.update()` (the same path the real firmware loop uses)
+  instead of the underlying button controller. While fixing this, the
+  suite was also reworked per review to (a) use only `ib-`+32-lowercase-
+  hex device-id fixtures, asserted valid against the real
+  `isValidDeviceId()` (`provisioning/device_identity.h`) rather than
+  arbitrary placeholder strings like the previous `ib-test-device`/`ib-x`,
+  and (b) add an explicit `event_id` format assertion
+  (`^evt-[0-9a-f]{32}$`) alongside the existing uniqueness/retry/offline-
+  replay/timestamp-gating coverage. Re-validated locally (MSVC, all 38
+  native suites) and by rebuilding all five embedded environments
+  unchanged; **the authoritative confirmation is the next GitHub Actions
+  run on this branch**, not this local run - see the PR for that run's
+  actual result.
+- **Follow-up finding (same Phase 3B.8 work, before merge): the first
+  real-hardware boot of `esp32-c3-dev-ring-simulator` did not associate
+  to Wi-Fi within 120s** (`[DEV RING] local_status=wifi wifi=down
+  time=pending mqtt=down outbox_size=0 uptime_s=120`, repeated at every
+  heartbeat), on the same board/network `esp32-c3-dev-mqtt` was also being
+  tested against, which was assumed at the time to already connect
+  successfully - **this assumption was wrong, see the next follow-up
+  entry below: a retest found `esp32-c3-dev-mqtt` had not actually been
+  re-confirmed on this exact bring-up path, and SSID/password/network are
+  not actually ruled out.** A line-by-line comparison against
+  `mqtt_smoke_main.cpp` found the connectivity **logic** already
+  equivalent: both drive the identical `DevMqttSmokeState` state machine,
+  call `WiFi.mode(WIFI_STA)` + `WiFi.begin()` only on its `ConnectWifi`
+  action, share the same retry/backoff policy, call
+  `WiFi.disconnect(false, false)` only on `RecoverWifi`, never
+  `ESP.restart()`, and build with identical flags/board - no functional
+  divergence in *when* Wi-Fi actions are authorized was found. What was
+  genuinely missing was **observability**: the simulator had no
+  `WiFi.onEvent()` handler, no boot diagnostics
+  (`previous_reset=`/`resetReasonName()`), and none of
+  `mqtt_smoke_main.cpp`'s per-action log lines (connect-requested,
+  DNS/MQTT retry timing, state transitions, wifi-recovery-requested) - the
+  single 15s heartbeat could show `wifi=down` but nothing about *why*.
+  Fixed by adding that exact logging pattern (copied verbatim from
+  `mqtt_smoke_main.cpp`'s own already-hardware-validated helpers -
+  `onWifiEvent()`, `wifiDisconnectReasonName()`, `resetReasonName()`, and
+  a log line per `DevSmokeAction`) into `dev_ring_simulator_main.cpp`
+  itself, without modifying `mqtt_smoke_main.cpp` at all (it is already
+  validated on real hardware; duplicating a few small, pure diagnostic
+  helpers is lower-risk than editing it). **This closes an observability
+  gap, not a proven functional bug** - no speculative fix (e.g.
+  reassigning GPIO20) was made without hardware evidence tying it to the
+  failure; see `docs/dev-ring-simulator.md` > "Real bench observation:
+  first boot never associated with Wi-Fi" for the full reasoning. A
+  hardware retest with these diagnostics is still required to see the
+  actual disconnect reason (or confirm/rule out a silent reset loop via a
+  changing `previous_reset=` value) - **still not validated on real
+  hardware**; button behavior, MQTT connectivity, and end-to-end delivery
+  from a real press remain unexercised on hardware.
+- **Follow-up fix (same Phase 3B.8 work, before merge): the hardware
+  retest with the diagnostics above revealed a real, shared coordination
+  defect, not just a missing-observability problem.** Both
+  `esp32-c3-dev-ring-simulator` and `esp32-c3-dev-mqtt` showed the
+  identical Wi-Fi association failure on the same session
+  (`wifi event=disconnected reason=2`, `reason=202`, `Wi-Fi connect
+  requested; ... delay_ms=16000`), and `esp32-c3-dev-mqtt`'s own serial
+  log additionally showed `wifi:sta is connecting, return error` /
+  `WiFiSTA.cpp begin(): connect failed!` - meaning **`esp32-c3-dev-mqtt`
+  had never actually been re-confirmed working on this exact bring-up
+  path**; the previous entry's "already connects successfully" framing
+  was wrong, carried over from an earlier, separate bench session. The
+  root cause: `DevMqttSmokeState` (`src/dev/mqtt_smoke_state.*`, shared by
+  both DEV mains) modeled DNS/NTP/MQTT attempts as asynchronous
+  ("in-flight" until an explicit result or timeout) but treated Wi-Fi
+  association as if `!wifiConnected` alone authorized a retry once the
+  ordinary backoff elapsed - with no way to distinguish "still
+  associating" from "gave up." The ESP32 Wi-Fi driver actively rejects
+  (and effectively restarts) a `WiFi.begin()` call issued while a previous
+  attempt is still outstanding, which is exactly what the observed driver
+  log lines show, and which a short-enough backoff could trigger on both
+  DEV environments identically, since they share this one coordinator.
+  Fixed by giving `DevMqttSmokeState` the same in-flight tracking NTP
+  already has for Wi-Fi association: `ConnectWifi` is never reissued while
+  `wifiAttemptInFlight()` is true; the attempt resolves only via an
+  explicit `wifiAssociationResult(nowMs, success)` call (forwarded from a
+  real `ARDUINO_EVENT_WIFI_STA_CONNECTED`/`GOT_IP`/`DISCONNECTED` event) or
+  a new, separate, configurable `wifiAssociationTimeoutMs` (default
+  15000ms, appended as the constructor's last parameter so no existing
+  positional call site broke); a failure or timeout schedules the next
+  backoff-governed retry at resolution time, not at the moment
+  `ConnectWifi` was originally issued. Both `mqtt_smoke_main.cpp` and
+  `dev_ring_simulator_main.cpp` now record the real Wi-Fi event as a
+  minimal `volatile` flag inside `onWifiEvent()` (which the ESP32 Arduino
+  core runs on its own Wi-Fi/event task) and only turn it into an actual
+  `wifiAssociationResult()` call from their own single-threaded `loop()`
+  (`drainWifiEventSignals()`, called once per iteration before
+  `connectivity.update()`) - never mutating the shared state machine
+  directly from the event callback, which would have been a real
+  concurrency hazard. The state-machine fix itself lives in exactly one
+  place (`mqtt_smoke_state.*`); only this small amount of Arduino-main
+  event-forwarding glue is necessarily duplicated per entry point, same as
+  `stateName()`/`safeStatus()`/`NtpClock` already were. 7 new native tests
+  in `test/test_dev_mqtt_state` (23 total in that suite now): `ConnectWifi`
+  issued exactly once and never reissued by rapid updates while pending;
+  an explicit success ends the attempt and the ordinary cascade still
+  advances normally; an explicit failure ends the attempt and schedules
+  the next retry no earlier than its own backoff deadline; a stuck attempt
+  with no event at all is abandoned by its own timeout and allows a later
+  retry; that timeout is wraparound-safe; the existing `RecoverWifi`
+  ladder's own reconnect attempt is equally protected from reissue; and a
+  burst of repeated failure signals for the same attempt never causes more
+  than one `WiFi.begin()`. One pre-existing test
+  (`test_backoff_is_capped_and_deadline_wrap_is_safe`) needed updating to
+  call the new `wifiAssociationResult()` explicitly between attempts,
+  since Wi-Fi retries are no longer resolved implicitly/instantly the way
+  they were before this fix - every other pre-existing test in that suite
+  was unaffected (all of them already transition `wifiConnected` to `true`
+  on the very next call after issuing `ConnectWifi`, which bypasses the
+  new in-flight gate entirely, exactly as intended). Validated in this
+  pass: all 38 native suites (309 assertions) compiled and executed via
+  MSVC, 0 failed; `esp32-c3`, `esp32-c3-dev-mqtt`,
+  `esp32-c3-dev-ring-simulator`, `esp32-c3-si3050-clock-probe`, and
+  `esp32dev-si3050-clock-meter` all compiled with `pio run` (real
+  espressif32/riscv32-esp toolchain). **This fixes the concurrent-retry
+  coordination bug; it does not by itself prove Wi-Fi will now associate**
+  - disconnect reasons 2 (auth expire) and 202 can also indicate a
+  credential/AP-side/signal problem unrelated to this bug, and that must
+  be re-evaluated on a fresh hardware retest, not assumed either way from
+  the evidence gathered so far. GPIO20 remains unreassigned - no evidence
+  ties it to this specific failure. **Still not validated on real
+  hardware**; see `docs/dev-ring-simulator.md`'s "Real bench observation:
+  retest reveals a shared concurrent-retry defect" and Honest status.
+- **Follow-up finding + fix (same Phase 3B.8 work, before merge): a third
+  hardware retest confirmed the concurrent-retry fix worked** - the
+  driver-level `wifi:sta is connecting, return error` error did not
+  recur. **Wi-Fi association still failed, with the same disconnect
+  reasons (2, 202) as before that fix** - meaning the concurrent retry was
+  not the (sole) cause of the original failure. Reason 2/202 has not been
+  root-caused yet; it will be isolated next using a dedicated WPA2 test
+  hotspot with known-good credentials, separate from whatever network the
+  board has been tested against so far. SSID/credential/network causes
+  remain explicitly not ruled out - only the concurrent-retry coordination
+  defect is fixed. The same retest also surfaced an unrelated,
+  diagnostic-only bug: "delay_ms=" log lines showed impossible values
+  (`4294967291`, `4294967294`) from computing `retryAtMs() - now` via
+  plain `uint32_t` subtraction, which underflows whenever the deadline is
+  at or past `now` - guaranteed by construction the instant `ConnectWifi`
+  fires (`deadlineReached()` must already be true then). Fixed with a new
+  `DevMqttSmokeState::millisUntil(deadlineMs, nowMs)` static helper
+  (saturates at 0, wrap-safe via the same signed-subtraction technique as
+  `deadlineReached()`), used at all 8 "delay_ms=" call sites across both
+  DEV mains. **This is display-only - no retry/backoff policy changed**,
+  per explicit instruction not to alter retry policy based on a logging
+  artifact alone. 1 new native test
+  (`test_millis_until_saturates_and_is_wrap_safe` in
+  `test/test_dev_mqtt_state`, 24 tests total in that suite now): ordinary
+  future deadline, deadline already reached (saturates instead of
+  underflowing), and both directions of the `millis()` wraparound.
+  Validated: all 38 native suites (`pio` toolchain's own `pio test -e
+  native` still cannot run natively in this sandbox - same pre-existing
+  no-host-compiler limitation as every prior pass; validated instead via
+  the same locally available MSVC used throughout this work) passed, 0
+  failed; all five required environments (`esp32-c3`,
+  `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`,
+  `esp32-c3-si3050-clock-probe`, `esp32dev-si3050-clock-meter`) compiled
+  via real `pio run`. **Still not validated on real hardware for
+  association success** - see `docs/dev-ring-simulator.md`'s "Real bench
+  observation: concurrent retry gone, auth still fails (reason=2/202)".
+- **Follow-up finding + fix (same Phase 3B.8 work, before merge): a fourth
+  hardware retest against a dedicated WPA2 test hotspot (an iPhone's
+  Personal Hotspot, "Henrique's iPhone") produced a *different* failure
+  than the home network** - `reason=201` (`WIFI_REASON_NO_AP_FOUND`,
+  meaning the ESP32 never saw a beacon for that SSID at all), while the
+  home network kept failing with `reason=2`/`202` (an auth-stage
+  rejection) unchanged. Neither is root-caused. The credential path was
+  reviewed: both DEV mains read `INTERBRIDGE_DEV_WIFI_SSID`/
+  `_PASSWORD` directly from `include/interbridge_dev_secrets.h` straight
+  into `WiFi.begin()` - there is no other credential source - but the
+  only existing diagnostic (`wifi_config=present`) only proved *some*
+  header existed, never that the compiled binary actually held the
+  intended byte values. Added, sanitized, never logging the raw
+  SSID/password value or any other network's name: (1) a credential
+  config summary - `config=valid|invalid ssid_bytes=N password_bytes=N
+  placeholder=true|false` (`valid` requires both fields non-empty and
+  neither still equal to `include/interbridge_dev_secrets.example.h`'s
+  placeholder text) - and (2) a controlled Wi-Fi scan summary -
+  `networks_found=N configured_ssid_found=true|false rssi=N channel=N
+  auth=... scan_age_ms=N`, where RSSI/channel/auth are only ever the
+  configured SSID's own values if present; no other network's SSID is
+  ever retained or logged. Per explicit follow-up instruction, both lines
+  are logged not just once at boot but repeated before every
+  `WiFi.begin()` and from the heartbeat while Wi-Fi is down, since the
+  serial monitor is often attached only after boot and would otherwise
+  miss them. The scan itself is never repeated before every attempt (a
+  multi-second blocking operation via `WiFi.scanNetworks()`'s default
+  synchronous mode) - only the first-ever `ConnectWifi` always scans;
+  later attempts rescan only after a 5-minute interval or 5 consecutive
+  explicit association failures accumulate (`kWifiRescanIntervalMs`/
+  `kWifiRescanFailureThreshold`), and a scan is always fully synchronous
+  with, and strictly precedes, the `WiFi.begin()` call in the same
+  `ConnectWifi` handler - never concurrent with association by
+  construction, and no retry/backoff policy was touched. The pure
+  comparison/formatting logic
+  (`diagnoseCredentialField()`/`summarizeCredentialConfig()`/
+  `summarizeWifiScan()`/both line formatters) lives in a new shared,
+  native-testable module, `src/dev/dev_wifi_diagnostics.*`, used
+  unmodified by both `mqtt_smoke_main.cpp` and
+  `dev_ring_simulator_main.cpp` - only the small Arduino-only glue
+  (reading `WiFi.SSID()`/`RSSI()`/`channel()`/`encryptionType()`, calling
+  `WiFi.scanNetworks()`, the `Serial.print` calls) is duplicated per main,
+  same pattern as `DevMqttSmokeState`'s other callers.
+  `scripts/generate_dev_secrets_header.ps1` now also rejects an SSID/
+  password that still exactly matches the example header's placeholder,
+  reports only the generated SSID/password byte lengths (via
+  `[Text.Encoding]::UTF8.GetByteCount`, matching what the compiled C++
+  macro actually holds - never `.Length`, which counts UTF-16 code units
+  and would misreport a multi-byte SSID) after writing, and validates
+  that all seven expected macros appear exactly once in the generated
+  content before it is ever written to disk. 9 new native tests in
+  `test/test_dev_wifi_diagnostics` (39 suites total now): placeholder
+  detection, correct byte lengths, a config summary that is `valid` only
+  when both fields are non-empty and non-placeholder, scan-summary
+  found/not-found matching (including RSSI/channel/auth extraction), and
+  - run through the entire pipeline with distinctive marker
+  SSID/password/network-name strings - that the formatted diagnostic
+  lines never contain any of those secret/name values. Validated: all 39
+  native suites passed via the same locally available MSVC used
+  throughout this work (`pio test -e native` itself still cannot run in
+  this sandbox - same pre-existing no-host-compiler limitation); all five
+  required environments compiled via real `pio run`; the PS1 script's new
+  logic (placeholder rejection, UTF-8 byte counting including a
+  multi-byte code point, escaping, macro-uniqueness validation) was
+  exercised via a standalone throwaway harness reproducing each snippet,
+  since running the real script would have overwritten the operator's
+  live local DEV secrets file. **This is diagnostics only - no
+  credential/AP root cause is claimed fixed or ruled out by this pass.**
+  See `docs/dev-ring-simulator.md`'s "Real bench observation: WPA2 test
+  hotspot isolates a different failure mode (reason=201)" and "Wi-Fi
+  config and scan diagnostics" for the full record. **Still not validated
+  on real hardware.**
+- **Follow-up fix (same Phase 3B.8 work, before the planned hardware
+  retest, before merge): a pre-retest review of the diagnostics above
+  found and fixed three real defects, none yet observed on hardware.**
+  (1) `DevMqttSmokeState::update()` armed the Wi-Fi association attempt's
+  in-flight deadline at the moment `ConnectWifi` was issued - before the
+  caller's handler ran the (possibly multi-second, blocking) diagnostic
+  scan and only then called the real `WiFi.begin()`, so a slow scan could
+  silently consume part of the association timeout before association
+  even started. Fixed with a new `DevMqttSmokeState::wifiAssociationStarted(nowMs)`,
+  called by both DEV mains with a freshly-read `millis()` immediately
+  alongside the real `WiFi.begin()` (after any scan), re-arming the
+  deadline from that real start time; `update()`'s own deadline at issue
+  time is now explicitly documented as provisional. No change to backoff
+  or to when `ConnectWifi` is authorized. (2) A failed `WiFi.scanNetworks()`
+  call (negative return) was being summarized identically to a scan that
+  legitimately found zero networks - both logged
+  `networks_found=0 configured_ssid_found=false`, indistinguishable.
+  `WifiScanSummary` now carries an explicit `status`
+  (`WifiScanStatus::Success`/`Failed`) and a sanitized `errorCode`;
+  `formatWifiScanLine()` prints `scan_status=failed error=N` and omits
+  `configured_ssid_found`/`rssi`/`channel`/`auth` entirely rather than
+  misleading zeros/false, and this status persists correctly in
+  `lastWifiScanSummary` across every later repeated line (heartbeat,
+  pre-`WiFi.begin()`), not just the line printed at scan time. (3)
+  `diagnoseCredentialField()` took `const std::string&`, so passing the
+  raw `INTERBRIDGE_DEV_WIFI_SSID`/`_PASSWORD` macros allocated a fresh
+  heap copy of the secret on every call - and this runs on every
+  heartbeat tick while Wi-Fi is down, for as long as the device stays
+  offline. Changed to `std::string_view` (standard since C++17, which
+  this project already targets) for both `value` and `placeholder` -
+  passing a `const char*` literal now constructs a zero-allocation view;
+  only the returned formatted line (pure metadata) is still a real
+  `std::string`. 5 new native tests: 2 in `test/test_dev_mqtt_state`
+  (`wifiAssociationStarted()` correctly re-arms the timeout from a
+  simulated post-scan begin time, and is a no-op with nothing in flight -
+  26 tests total in that suite now) and 3 in
+  `test/test_dev_wifi_diagnostics` (a valid zero-network scan
+  distinguishable from a failed one; the failed status/error surviving
+  repeated formatting much later; `diagnoseCredentialField()` called
+  directly against a `std::string_view` built from a raw `const char*` -
+  a test that would fail to *compile*, not just fail an assertion, if the
+  no-copy property ever regressed - 12 tests total in that suite now).
+  Validated: all 39 native suites passed via the same locally available
+  MSVC used throughout this work (`pio test -e native` itself still
+  cannot run in this sandbox); all five required environments compiled
+  via real `pio run`. **Still purely diagnostic and pre-retest - no
+  credential/AP root cause is claimed fixed or ruled out, and this has
+  not been flashed to real hardware.**
+- **Follow-up finding + fix (same Phase 3B.8 work, before merge): a fifth
+  hardware test found a real, reproducible cause of the Wi-Fi failures
+  unrelated to credentials or either access point - the button's GPIO20
+  wiring itself.** With the button physically disconnected from GPIO20,
+  the firmware associated cleanly all the way to `Online` (Wi-Fi → DNS →
+  NTP → MQTT) - the first full success in this entire investigation;
+  reconnecting the button to GPIO20 disconnected Wi-Fi again. The exact
+  physical mechanism is **not** established (a candidate silicon
+  function on GPIO20, this specific button/wiring's mounting, a pinout
+  quirk of this board sample, or electrical/RF interference are all
+  still open), and this does not by itself prove GPIO20 was *also* the
+  cause of the earlier reason=201/2/202 disconnects recorded above - only
+  that removing it let the firmware reach `Online` at least once. The
+  correlation was reproduced (disconnect → succeeds, reconnect → fails)
+  and is treated as sufficient to abandon GPIO20 for this bench rig
+  without waiting for a root cause. Since this board has no other free
+  GPIO (see the exhaustive pin-budget accounting already in
+  `dev_ring_simulator_config.h`), and GPIO21 was never itself tested but
+  is avoided out of the same caution, the only remaining option is a
+  deliberate overlap with one real Si3050 pin - safe here specifically
+  because `esp32-c3-dev-ring-simulator` never compiles or initializes any
+  Si3050 code and no Si3050 is physically attached during this bench
+  test. `kDevRingButtonPin` now equals `kSi3050PinPcmDrx` (GPIO4); the
+  header's `static_assert`s were changed from "not equal to any Si3050
+  pin" to "equal to exactly this one approved overlap," so any future
+  edit to the button pin must deliberately update that assertion too -
+  it cannot silently drift to an unreviewed pin. **The real Si3050 pin
+  map (`src/intercom/si3050/si3050_pins.h`) and production firmware are
+  completely untouched** - this only changes which pin this DEV-only
+  bench button uses. No test files needed updating (none referenced the
+  GPIO number directly - they exercise `IDevRingButtonInput`/
+  `DevRingEventCoordinator` through fakes, never the real pin). Docs
+  (`docs/dev-ring-simulator.md`'s wiring diagram/"Why GPIO4" section and
+  a new "Real bench observation: GPIO20 causes Wi-Fi to disconnect",
+  `docs/roadmap-3b.md`, `README.md`) updated with this honestly: GPIO20
+  disconnected → `Online`; GPIO20 reconnected → Wi-Fi dropped; cause not
+  isolated; GPIO4 requires its own hardware retest before being trusted
+  either. Validated: all 39 native suites passed via MSVC; all five
+  required environments compiled via real `pio run`. **Still not
+  validated on real hardware with the button on GPIO4.**
+- **Technical closing pass (same Phase 3B.8 work, before merge): the
+  GPIO20 framing above was itself corrected, the button's electrical
+  interface was fixed to match the real component, the diagnostic scan
+  was simplified, a presence/health signal was added, and
+  `docs/dev-ring-simulator.md` was consolidated from ~670 to ~380 lines.**
+  (1) **Corrected interpretation of the GPIO20 test**: the physical
+  component wired to the ring-simulator button is a *Linker Button
+  module* (a PCB with `VCC`/`GND`/`SIG`, active-HIGH per its own
+  documentation - `SIG` reads LOW released, HIGH pressed), not a bare
+  dry-contact switch. The firmware and every earlier entry above assumed
+  a dry, active-LOW contact wired with `INPUT_PULLUP`. This means the
+  GPIO20 test was run with an electrically mismatched wiring assumption,
+  so the reproducible correlation it found (disconnected → `Online`;
+  reconnected → Wi-Fi dropped) cannot be attributed to the GPIO20 pin,
+  a UART silicon function, or anything else specific - only that this
+  particular, mismatched assembly correlated with the drop. Every
+  overclaiming statement from earlier entries ("GPIO20 causes Wi-Fi to
+  disconnect", implicitly ruling GPIO21 out too, treating the credential
+  as confirmed either way) is superseded by this correction. (2) **Fixed
+  the electrical interface**: `Esp32DevRingButtonInput::isPressed()` now
+  reads `digitalRead(kDevRingButtonPin) == HIGH` (was `== LOW`), and
+  `setup()` now calls `pinMode(kDevRingButtonPin, INPUT)` (was `INPUT_
+  PULLUP`) - the module drives the pin itself in both states, so no
+  internal pull-up is used. The boot log line changed to `button
+  initialized gpio=4 mode=INPUT active=high module=linker`.
+  `DevRingButtonController` itself needed no change - it is already
+  hardware-independent and only ever sees the adapter's already-resolved
+  boolean, never a raw voltage level. (3) **Simplified the Wi-Fi scan to
+  exactly once per boot**: a real hardware test showed
+  `WiFi.scanNetworks()` itself returning `-2` after several association
+  attempts, meaning the earlier interval/failure-count rescan policy
+  could let the diagnostic scan interfere with the very association it
+  was meant to help diagnose. Removed `kWifiRescanIntervalMs`,
+  `kWifiRescanFailureThreshold`, and `consecutiveWifiAssociationFailures`
+  from both DEV mains entirely (dead code once the policy was gone,
+  including the incorrect earlier claim that GPIO21 was also "ruled out"
+  - it was never tested at all); the `ConnectWifi` handler now gates the
+  scan purely on `!wifiScanEverRun`. A manual reboot is what allows a
+  fresh scan. The already-existing repeated summary lines (boot, every
+  `WiFi.begin()`, heartbeat while down) are unchanged. (4) **Added a
+  presence/health signal**: a real test reached `state mqtt -> online`
+  (local Wi-Fi/DNS/NTP/MQTT connectivity) while the companion app still
+  showed the device offline. `esp32-c3-dev-mqtt`'s existing
+  `publishHealth()` contract (periodic `HealthReport` - device ID,
+  firmware version, `intercom_state=Idle`, uptime, Wi-Fi RSSI, free heap
+  - to `MqttTopics::healthIngest()`, QoS `AtMostOnce`, gated on Wi-Fi/
+  time/MQTT validity and a 60s cadence) was confirmed in code and added
+  identically to `dev_ring_simulator_main.cpp` (new `HealthReporter`
+  instance, `publishHealth()` function, called once per `loop()`
+  iteration, entirely independent of `eventOutbox`). **This is NOT
+  independently confirmed against the actual backend/app presence
+  mechanism** (outside this repo, not inspected) - only that this is the
+  one periodic presence-shaped signal that already exists in this
+  firmware's own contract; if a retest shows the app still doesn't
+  reflect presence, the backend/app's real mechanism needs to be found in
+  its own repo rather than assumed further here. (5) **Documentation
+  consolidation**: `docs/dev-ring-simulator.md` was rewritten from six
+  separate, partially-overlapping "Real bench observation" sections
+  (~670 lines total) into a single chronological "Bench test history"
+  section plus one final "Honest status" (~380 lines), preserving every
+  substantive fact while removing repeated/contradictory restatements of
+  the same conclusions. `README.md` and `docs/roadmap-3b.md`'s Phase
+  3B.8 entries were rewritten the same way. **Consequence for this
+  CONTEXT.md file**: several entries above quote specific
+  `docs/dev-ring-simulator.md` sub-section titles (e.g. "Real bench
+  observation: first boot never associated with Wi-Fi") that no longer
+  exist verbatim after that consolidation - those entries are kept as an
+  unedited historical log per this file's own convention, but readers
+  following those quoted titles should go to
+  `docs/dev-ring-simulator.md` > Bench test history directly instead. (6)
+  Native tests: 1 new test in `test/test_dev_ring_button`
+  (`test_released_low_state_produces_no_event`, plus comment updates
+  reframing the existing press/hold/release-repress tests around the
+  Linker Button's real LOW/HIGH semantics - `DevRingButtonController`'s
+  logic itself did not change, since it was already hardware-independent).
+  Validated: all native suites passed via MSVC; all five required
+  environments compiled via real `pio run`, including the electrical fix,
+  the scan simplification, and the new health publish. **Still not
+  validated on real hardware with the Linker Button correctly wired to
+  GPIO4 at 3.3V** - see `docs/dev-ring-simulator.md` > Honest status for
+  the complete, current, single source of truth.
 
 ## Future Work
 

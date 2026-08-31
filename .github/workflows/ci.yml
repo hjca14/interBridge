@@ -55,6 +55,9 @@ jobs:
       - name: Compile DEV MQTT smoke firmware
         run: pio run -e esp32-c3-dev-mqtt
 
+      - name: Compile DEV physical ring simulator firmware
+        run: pio run -e esp32-c3-dev-ring-simulator
+
       - name: Compile Si3050 clock probe generator (ESP32-C3)
         run: pio run -e esp32-c3-si3050-clock-probe
 
