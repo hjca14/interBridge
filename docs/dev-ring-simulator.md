@@ -15,13 +15,15 @@ without a real Si3050/intercom line attached.
 audio, off-hook, in-call, or any other intercom state - only the initial
 ring detection signal. See Scope and safety below.
 
-**Honest headline (see Honest status at the bottom for the full
-picture):** implemented, compiled, and unit-tested. On real hardware, the
-firmware has reached `Wi-Fi → DNS → NTP → MQTT → Online` exactly once so
-far, with the ring-simulator button *disconnected* from the board. A
-retest with the button correctly wired (Linker Button module, 3.3V,
-GPIO4) has not yet happened. Button-to-app event delivery has not been
-observed on hardware.
+**Validated state (see the consolidated record below):** 3B.8 is
+implemented, compiled, unit-tested, and validated end to end on a real
+ESP32-C3 Super Mini. The successful test used a controlled electrical
+stimulus rather than the Linker Button: GPIO4 was held LOW through an
+approximately 10 kΩ resistor to GND, then connected momentarily to 3V3.
+Wi-Fi, NTP, and AWS IoT MQTT/mTLS completed; the health report made the
+device appear online in the app; and the pulse produced exactly one event
+and one confirmed publish before traversing the backend, FCM, and Android
+notification path.
 
 ## Scope and safety
 
@@ -54,11 +56,11 @@ observed on hardware.
 
 ## Wiring diagram
 
-The bench component wired to this simulator is a **Linker Button module**
-(a small PCB with `VCC`/`GND`/`SIG` pins) - not a bare dry-contact switch.
-Per the module's own documentation, `SIG` reads **LOW when released** and
-**HIGH when pressed**; it actively drives the pin both ways rather than
-relying on an internal pull-up.
+The diagram below records the **intended** Linker Button wiring according
+to the module documentation. It was not the circuit used for the successful
+3B.8 validation, and the module's real electrical behavior and wiring have
+not been validated on this bench. The documentation describes `SIG` as LOW
+when released and HIGH when pressed.
 
 ```
                  ESP32-C3 Super Mini              Linker Button module
@@ -178,18 +180,11 @@ gated on Wi-Fi/time/MQTT all being valid and a cadence
 (`kDevHealthIntervalMs`, 60s) - see `publishHealth()` in
 `src/dev/mqtt_smoke_main.cpp`. This pass adds the **identical** publish
 to `esp32-c3-dev-ring-simulator` (same fields, same topic, same QoS, same
-cadence constant) on the theory that this is the presence signal the
-backend/app depend on, since it is the only periodic, presence-shaped
-publish that exists anywhere in this firmware's contract. **This has NOT
-been independently confirmed against the actual backend/app code**,
-which lives outside this repository and was not inspected as part of
-this change - only the firmware-side contract (what `esp32-c3-dev-mqtt`
-already sends) is verified here. If a hardware retest shows the app
-still does not reflect presence after this, the backend/app's actual
-mechanism needs to be found in its own repo rather than assumed further
-here. The health publish is entirely independent of the `RING_DETECTED`
-event outbox - a skipped or failed health publish never touches
-`eventOutbox`, and vice versa.
+cadence constant). In the successful end-to-end run, the health report was
+published and the device then appeared online in the app, confirming this
+presence path against the deployed DEV backend/app. The health publish is
+entirely independent of the `RING_DETECTED` event outbox - a skipped or
+failed health publish never touches `eventOutbox`, and vice versa.
 
 ## Dependency on Phases 3B.6/3B.7
 
@@ -200,20 +195,20 @@ separately (see `docs/roadmap-3b.md`):
 
 - **Phase 3B.6** (backend FCM sender): `telemetry_ingestion` invokes
   `push_sender`, which delivers the push notification via Firebase Cloud
-  Messaging. **Implemented and deployed in DEV** - the backend has
-  accepted a real event end-to-end and recorded `Sent=1` for it (from a
-  synthetic/backend-originated test event, not yet from a real physical
-  button press - see Honest status).
+  Messaging. **Implemented, deployed, and exercised in DEV** by the hardware run:
+  the GPIO-triggered event traversed `telemetry_ingestion` and `push_sender`
+  to FCM and the Android app.
 - **Phase 3B.7** (notification preference application): the backend
   applies the user's/app's notification preferences before deciding
   whether/how to notify. **Implemented and deployed in DEV.**
 
 ## Manual flash and test procedure
 
-This has been run on real hardware; see Bench test history for what has
-and has not been observed so far. A retest with the button correctly
-wired (Linker Button module, GPIO4, 3.3V) is still required. The intended
-procedure, mirroring `docs/mqtt-dev-smoke-test.md`'s DEV MQTT smoke test:
+The end-to-end test is complete and does not require a Linker Button
+retest. The following remains an **optional, separate module-evaluation
+procedure**; completing it would characterize the module, not reopen or
+re-close 3B.8. The wiring is intended according to module documentation,
+not physically validated here:
 
 1. Wire the Linker Button module as shown above: `VCC`→3V3, `GND`→GND,
    `SIG`→GPIO4. Do not power it from 5V.
@@ -321,62 +316,50 @@ inline rather than left standing separately.
    a real test reached local `Online` while the app still showed the
    device offline.
 
-**Net effect on causes still open**: the Wi-Fi association failures
-(`reason=201`/`2`/`202`) remain unexplained. The one real success
-(`Online`) happened with the button disconnected entirely, which rules
-out nothing about the credential or either AP and does not by itself
-indict GPIO20, since the assembly used there was already known-wrong
-electrically. A clean retest - Linker Button correctly wired to GPIO4 at
-3.3V - is the next real test, not a conclusion.
+8. **Successful controlled GPIO4 validation after PR #20.** On an
+   ESP32-C3 Super Mini, GPIO4 was held LOW through an approximately 10 kΩ
+   resistor to GND and pulsed momentarily to 3V3. Wi-Fi connected, NTP
+   synchronized, AWS IoT MQTT/mTLS connected, and a health report was
+   published; afterward the app showed the device online. One pulse logged
+   `valid press detected; RING_DETECTED enqueued`, followed exactly once by
+   `publish confirmed count=1 remaining=0`. The event traversed AWS IoT,
+   `telemetry_ingestion`, `push_sender`, FCM, and appeared correctly as an
+   Android notification.
 
-## Honest status
+**Net effect:** the earlier GPIO20 attempts and Wi-Fi fixes remain the
+technical history leading to the successful run. The controlled GPIO4 test
+closes the 3B.8 chain without attributing the earlier failures to GPIO20,
+credentials, or either AP, and without claiming validation of the Linker
+Button.
 
-**Implemented, compiled, and unit-tested. Not validated end to end on
-real hardware.** Local Wi-Fi/DNS/NTP/MQTT connectivity (`state ... ->
-online`) has been reached exactly once, with the button physically
-disconnected - see Bench test history. No hardware run has yet combined
-a correctly-wired button with a successful, stable Wi-Fi connection.
-Button press → `RING_DETECTED` → backend → app notification has not been
-observed end to end. App-visible "online" presence depends on the new
-health publish (see "Online status" above), which is itself unconfirmed
-against the real backend/app mechanism. The Wi-Fi association failures
-seen so far (`reason=2`/`202`/`201`) remain unexplained.
+## Validated state
 
-- Native unit tests (`test/test_dev_ring_button`, `test/test_dev_ring_event`)
-  cover: released (LOW) state never fires; one debounced LOW→HIGH press →
-  exactly one `RING_DETECTED`; holding HIGH never repeats; HIGH→LOW→HIGH
-  yields a new, different `event_id`; `event_id` matches
-  `^evt-[0-9a-f]{32}$`; a failed publish attempt followed by a retry
-  preserves the exact same `event_id` and payload; an offline press
-  enqueues and a later reconnect replays it; `timestamp` is only present
-  when the clock is valid; the JSON stays contract-compatible; all
-  device-id fixtures are asserted valid against the real
-  `isValidDeviceId()` contract.
-- Native unit tests (`test/test_dev_mqtt_state`, shared by both DEV
-  mains) cover the Wi-Fi association in-flight tracking: `ConnectWifi`
-  issued exactly once per attempt, never reissued while one is pending;
-  explicit success/failure resolution; a stuck attempt's own timeout
-  (armed from the real `WiFi.begin()` time via `wifiAssociationStarted()`,
-  not before a preceding scan); `millis()`-wraparound safety; the
-  existing `RecoverWifi` ladder still works and is equally protected from
-  reissue; repeated failure signals never cause more than one
-  `WiFi.begin()`.
-- Native unit tests (`test/test_dev_wifi_diagnostics`) cover the
-  credential/scan diagnostics: placeholder detection, correct byte
-  lengths (via `std::string_view`, without copying the secret to an
-  owning `std::string`), a config summary `valid` only when both fields
-  are real and non-empty, scan found/not-found matching, a scan that
-  validly found zero networks staying distinguishable from a failed scan
-  call (with the failed status/error surviving repeated formatting), and
-  that no formatted line ever contains a secret/network-name value.
-- `pio run` succeeds for all five required environments (`esp32-c3`,
-  `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`,
-  `esp32-c3-si3050-clock-probe`, `esp32dev-si3050-clock-meter`); the real
-  Si3050 pin map and production firmware are unaffected by every change
-  in this phase.
-- **Not yet done**: a hardware retest with the Linker Button correctly
-  wired to GPIO4 at 3.3V, confirming a stable Wi-Fi/MQTT connection,
-  confirming the health publish appears and whether it actually changes
-  app-visible presence, and confirming a real button press reaches the
-  app as a notification. The `reason=201`/`2`/`202` Wi-Fi disconnect
-  causes remain open.
+**Phase 3B.8 is validated end to end on real hardware.** The run validated:
+
+- the isolated `esp32-c3-dev-ring-simulator` environment;
+- one controlled GPIO4 LOW→HIGH transition, debounce/coordinator behavior,
+  exactly one `RING_DETECTED`, and exactly one confirmed MQTT/mTLS publish;
+- AWS IoT ingestion, backend persistence/processing through
+  `telemetry_ingestion`, `push_sender`, FCM, and notification receipt and
+  presentation on Android; and
+- the health report path making the device visible as online in the app.
+
+This physical run did **not** validate the Linker Button's electrical
+behavior or wiring, holding the button, repeated presses, offline replay or
+physical preservation of the same `event_id`, a real Si3050/Si3018/Si3019
+or analog intercom line, production ring detection, or GPIO4 as a production
+assignment. It also did not validate audio, `CALL_STARTED`, `CALL_ENDED`,
+off-hook, bidirectional calls, production firmware, real BLE onboarding, or
+the complete full-screen/call UI. Automated tests still cover debounce,
+repeated-edge, offline queue/replay, and stable-`event_id` behavior, but
+those cases were not exercised physically in this run.
+
+GPIO4 is only a provisional DEV overlay with `kSi3050PinPcmDrx` (DRX). The
+overlap was safe for this test solely because the isolated simulator does
+not compile or initialize Si3050 code and the chip was not connected. It
+does not alter production pinout, authorize simultaneous button/DRX use, or
+settle the final-board decision.
+
+A future Linker Button evaluation is optional and separate from 3B.8.
+Production must not depend on that module without its own electrical
+validation.

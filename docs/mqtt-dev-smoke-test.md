@@ -413,6 +413,8 @@ prior diagnostics could not explain. The Wi-Fi scan now runs exactly once
 per boot (simplified from an earlier interval/failure-count rescan policy
 after a real test showed the scan call itself could return an error).
 None of this is duplicated here - see `docs/dev-ring-simulator.md` >
-Bench test history and Honest status for the full investigation, fixes,
-and current status (association has not yet succeeded on either DEV
-environment with the button correctly wired, as of that writing).
+Bench test history and Validated state for the full investigation, fixes,
+and current status. A subsequent controlled GPIO4 test in the ring
+simulator completed Wi-Fi/NTP/MQTT and the end-to-end notification path;
+that does not independently revalidate every `esp32-c3-dev-mqtt` recovery
+scenario documented here.

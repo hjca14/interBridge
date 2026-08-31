@@ -501,12 +501,15 @@ contact the firmware and docs had assumed - `Esp32DevRingButtonInput` now
 reads it as plain `INPUT` (no pull-up), active-high, and the button moved
 from GPIO20 to GPIO4 (see `docs/dev-ring-simulator.md` > Bench test
 history for why GPIO20 was abandoned and what that test does and does
-not prove). The same test showed local connectivity (`state ... ->
-online`) without the companion app reflecting the device as present, so
+not prove). That test showed local connectivity (`state ... -> online`)
+without the companion app reflecting the device as present, so
 `dev_ring_simulator_main.cpp` gained the identical periodic `HealthReport`
 publish `mqtt_smoke_main.cpp` already sends (`MqttTopics::healthIngest()`,
-QoS `AtMostOnce`) - unconfirmed against the actual backend/app presence
-mechanism, which lives outside this repo.
+QoS `AtMostOnce`). A later successful hardware run confirmed that the health
+report made the device appear online and that one controlled GPIO4 LOW→HIGH
+transition traversed MQTT/backend/FCM to an Android notification. GPIO4
+remains a DEV-only provisional overlap with Si3050 DRX; no Si3050 was
+connected or initialized, and no production pinout changed.
 
 ## MQTT/mTLS command lifecycle (Phase 2D)
 

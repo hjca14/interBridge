@@ -1539,10 +1539,33 @@ this pass:)*
   logic itself did not change, since it was already hardware-independent).
   Validated: all native suites passed via MSVC; all five required
   environments compiled via real `pio run`, including the electrical fix,
-  the scan simplification, and the new health publish. **Still not
-  validated on real hardware with the Linker Button correctly wired to
-  GPIO4 at 3.3V** - see `docs/dev-ring-simulator.md` > Honest status for
-  the complete, current, single source of truth.
+  the scan simplification, and the new health publish. At PR #20 merge,
+  this had not been validated on real hardware with the Linker Button correctly wired
+  to GPIO4 at 3.3V. **That status is superseded
+  by the controlled-stimulus validation below; the Linker Button itself
+  remains unvalidated.**
+- **Phase 3B.8 end-to-end hardware validation after PR #20:** the isolated
+  `esp32-c3-dev-ring-simulator` environment was compiled and flashed to an
+  ESP32-C3 Super Mini. The successful test did not use the Linker Button:
+  GPIO4 was held LOW through an approximately 10 kΩ resistor to GND and
+  pulsed momentarily to 3V3. Wi-Fi connected, NTP synchronized, AWS IoT
+  MQTT/mTLS connected, and the health report was published; the device then
+  appeared online in the app. One pulse produced exactly one `valid press
+  detected; RING_DETECTED enqueued` log and exactly one `publish confirmed
+  count=1 remaining=0`; the event traversed AWS IoT, `telemetry_ingestion`,
+  `push_sender`, FCM, and appeared as an Android notification. **3B.8 is
+  therefore complete and validated end to end on real hardware.**
+  This validates the isolated DEV environment, active-high GPIO transition,
+  single-event coordinator/debounce path, MQTT publish, backend/FCM delivery,
+  Android presentation, and health/presence path. It does not validate the
+  Linker Button electrically, held/repeated presses, physical offline replay
+  or stable `event_id`, a real Si3050/line/ring source, audio/call states,
+  production firmware, BLE onboarding, or the complete call UI. GPIO4 is
+  still only a provisional DEV overlap with `kSi3050PinPcmDrx`, safe because
+  the simulator does not compile or initialize Si3050 code and no Si3050 was
+  connected. It neither changes production pinout nor permits simultaneous
+  button/DRX use; the final board must decide the assignment. A future Linker
+  Button evaluation is optional and separate from closing 3B.8.
 
 ## Future Work
 

@@ -165,15 +165,17 @@ smoke environment's connectivity state machine and the existing
 inventing a new one, publishes the same periodic `HealthReport` presence
 signal `esp32-c3-dev-mqtt` does, and never touches the real Si3050 driver
 stack, provisioning, BLE, or production Wi-Fi/AWS composition.
-Implemented, compiled, and unit-tested. **Not yet validated end to end on
-real hardware**: local Wi-Fi/DNS/NTP/MQTT connectivity has been reached
-exactly once so far, with the button disconnected from the board; no run
-has yet combined a correctly-wired button (Linker Button module, GPIO4,
-3.3V) with a stable connection, and button→app notification delivery has
-not been observed. A shared `DevMqttSmokeState` Wi-Fi coordination defect
-(affecting `esp32-c3-dev-mqtt` too) was found and fixed along the way,
-but the underlying Wi-Fi association failures seen on different networks
-remain unexplained. See
+Implemented, compiled, unit-tested, and **validated end to end on real
+hardware**. On an ESP32-C3 Super Mini, GPIO4 was held LOW through an
+approximately 10 kΩ resistor to GND and pulsed momentarily to 3V3. The
+firmware completed Wi-Fi, NTP, and AWS IoT MQTT/mTLS connectivity; its
+health report made the device appear online in the app; and one pulse
+produced exactly one `RING_DETECTED`, one confirmed publish, backend
+processing, FCM delivery, and an Android notification. The Linker Button
+module itself was not used in the successful run and remains electrically
+unvalidated. GPIO4 remains a DEV-only provisional overlap with the
+Si3050 DRX pin, safe only because this isolated environment neither
+compiles nor initializes the Si3050 and no Si3050 was connected. See
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) for the wiring
 diagram, bench test history, and manual test procedure, and
 [docs/roadmap-3b.md](docs/roadmap-3b.md) for how this fits with the rest
