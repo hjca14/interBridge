@@ -16,7 +16,7 @@ those files for the full record of 3B.1-3B.2.
 | 3B.6 | Backend FCM sender: `telemetry_ingestion` invokes `push_sender`, which delivers a push notification via Firebase Cloud Messaging for `RING_DETECTED` (and related) Basic Ingest events | Backend repo | **Implemented, deployed, and exercised in DEV** - initially with a synthetic event and subsequently by the controlled GPIO4 hardware run documented in 3B.8 |
 | 3B.7 | Apply user/app notification preferences before the backend decides whether/how to notify | Backend repo | **Implemented and deployed in DEV** |
 | **3B.8** | **Bench-only DEV physical ring simulator: a controlled active-high GPIO transition on the ESP32-C3 publishes a real `RING_DETECTED` event through the existing firmware/AWS IoT pipeline, for bench-testing 3B.6/3B.7 without a real Si3050/intercom line** | **`interBridge`** | **Done - validated end to end on real hardware from GPIO4 through AWS IoT/backend/FCM to the Android app; see `docs/dev-ring-simulator.md` > Validated state.** |
-| 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal slice (displaying a data-only FCM notification) is underway; the full call UI is not started |
+| 3B.9 | Android call/notification experience for an incoming ring | Mobile (Android) repo | **In progress** - the minimal local data-only notification slice is implemented and merged in the app and was exercised by the end-to-end flow; the complete call experience is not yet on `main` |
 | 3B.10 | iOS/APNs call/notification experience for an incoming ring | Mobile (iOS) repo | Not started (not in this repo) |
 
 ## Notes
