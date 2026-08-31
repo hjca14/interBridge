@@ -48,15 +48,6 @@ constexpr uint32_t kDevHealthIntervalMs = 60u * 1000u;
 // diagnoseCredentialField()'s doc comment.
 constexpr const char* kWifiSsidPlaceholder = "REPLACE_WITH_WIFI_SSID";
 constexpr const char* kWifiPasswordPlaceholder = "REPLACE_WITH_WIFI_PASSWORD";
-// A Wi-Fi scan is never repeated before every ConnectWifi attempt (it
-// would add several blocking seconds to every retry) - only the very
-// first attempt always scans, and later attempts rescan only after this
-// interval elapses or this many consecutive association failures
-// accumulate, so the diagnostic can notice "the AP moved/changed channel"
-// or "we've been failing a while" without turning into a per-attempt
-// scan storm. See the ConnectWifi handler in loop().
-constexpr uint32_t kWifiRescanIntervalMs = 300000; // 5 minutes
-constexpr uint32_t kWifiRescanFailureThreshold = 5;
 
 class NtpClock final : public IClock {
 public:
@@ -168,18 +159,11 @@ const char* sanitizedAuthModeName(wifi_auth_mode_t mode) {
 // Last completed scan's summary, its timestamp, and whether one has run
 // yet at all - kept so the same sanitized line can be repeated later
 // (before every WiFi.begin(), and in the heartbeat while Wi-Fi is down)
-// without rescanning every time; see performWifiScan()'s call sites for
-// the rescan-gating policy. consecutiveWifiAssociationFailures counts
-// only explicit ARDUINO_EVENT_WIFI_STA_DISCONNECTED events (see
-// drainWifiEventSignals()) - a stuck attempt resolved only by
-// DevMqttSmokeState's own internal association timeout, with no event
-// ever arriving, is not counted here (a narrower diagnostic-only signal
-// than DevMqttSmokeState's unrelated consecutiveConnectivityFailures(),
-// which tracks DNS/MQTT failures instead and is never touched by this).
+// without rescanning every time - see performWifiScan()'s doc comment
+// for why exactly one scan per boot, never on a retry/failure cadence.
 WifiScanSummary lastWifiScanSummary;
 uint32_t lastWifiScanAtMs = 0;
 bool wifiScanEverRun = false;
-uint32_t consecutiveWifiAssociationFailures = 0;
 
 std::string credentialConfigLine() {
     auto ssidDiag = diagnoseCredentialField(INTERBRIDGE_DEV_WIFI_SSID, kWifiSsidPlaceholder);
@@ -207,6 +191,12 @@ void logWifiConfigAndScanSummary(uint32_t now) {
 // strictly before that same call's WiFi.begin(), so it can never overlap
 // with an association attempt: the two are sequential statements in the
 // same single-threaded function call, not concurrent by construction.
+// Runs exactly once per boot - the scan is a bench diagnostic, not part
+// of the product, and a real hardware test showed WiFi.scanNetworks()
+// can itself return an error (-2 observed) after several association
+// attempts, which is exactly the kind of diagnostic-vs-association
+// interference a single boot-time scan avoids entirely. A manual reboot
+// is what allows a fresh scan, not an automatic retry/interval policy.
 void performWifiScan(uint32_t now) {
     WiFi.mode(WIFI_STA);
     const int16_t count = WiFi.scanNetworks();
@@ -235,7 +225,6 @@ void performWifiScan(uint32_t now) {
     WiFi.scanDelete();
     lastWifiScanAtMs = now;
     wifiScanEverRun = true;
-    consecutiveWifiAssociationFailures = 0;
 }
 
 // Set only from the Wi-Fi event callback below (which the ESP32 Arduino
@@ -283,12 +272,10 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void drainWifiEventSignals(uint32_t now) {
     if (wifiAssociatedEventPending) {
         wifiAssociatedEventPending = false;
-        consecutiveWifiAssociationFailures = 0;
         connectivity.wifiAssociationResult(now, true);
     }
     if (wifiDisconnectedEventPending) {
         wifiDisconnectedEventPending = false;
-        ++consecutiveWifiAssociationFailures;
         connectivity.wifiAssociationResult(now, false);
     }
 }
@@ -427,18 +414,11 @@ void loop() {
     }
     switch (action) {
         case DevSmokeAction::ConnectWifi: {
-            // Never scan before every attempt (it would add several
-            // blocking seconds to every retry) - only the very first
-            // attempt ever always scans (wifiScanEverRun starts false);
-            // later attempts rescan only after kWifiRescanIntervalMs
-            // elapses or kWifiRescanFailureThreshold consecutive
-            // association failures accumulate. Either way, this call is
-            // strictly sequential with (and completes fully before) the
-            // WiFi.begin() below - never concurrent with association.
-            const bool shouldRescan = !wifiScanEverRun ||
-                DevMqttSmokeState::deadlineReached(now, lastWifiScanAtMs + kWifiRescanIntervalMs) ||
-                consecutiveWifiAssociationFailures >= kWifiRescanFailureThreshold;
-            if (shouldRescan) performWifiScan(now);
+            // Exactly one scan per boot - see performWifiScan()'s doc
+            // comment - strictly sequential with (and completing fully
+            // before) the WiFi.begin() below, never concurrent with
+            // association.
+            if (!wifiScanEverRun) performWifiScan(now);
             logWifiConfigAndScanSummary(now);
 
             // The state machine authorizes exactly one begin call per retry;

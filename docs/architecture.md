@@ -445,8 +445,8 @@ per-`DevSmokeAction` log lines, and boot diagnostics
 (`resetReasonName()`) are a deliberate line-for-line duplication of
 `mqtt_smoke_main.cpp`'s own logging pattern (added after a first real
 bench boot associated on neither DEV environment, with no diagnostic to
-explain why - see `docs/dev-ring-simulator.md` > "Real bench observation:
-first boot never associated with Wi-Fi"), not a new mechanism.
+explain why - see `docs/dev-ring-simulator.md` > Bench test history),
+not a new mechanism.
 
 A subsequent hardware retest with that logging in place showed
 `esp32-c3-dev-ring-simulator` and `esp32-c3-dev-mqtt` failing Wi-Fi
@@ -459,9 +459,8 @@ punishes by rejecting (and restarting) any `WiFi.begin()` issued while a
 previous attempt is still outstanding. `DevMqttSmokeState` now tracks a
 Wi-Fi association attempt in flight, the same way it already did for NTP,
 resolved only by an explicit `wifiAssociationResult()` call or its own
-separate timeout - see `docs/dev-ring-simulator.md` > "Real bench
-observation: retest reveals a shared concurrent-retry defect" for the
-full mechanism. This was the first place `mqtt_smoke_main.cpp` was
+separate timeout - see `docs/dev-ring-simulator.md` > Bench test history
+for the full mechanism. This was the first place `mqtt_smoke_main.cpp` was
 modified for Phase 3B.8 (previously untouched, on the theory that
 duplicating its logging into the new file was lower-risk than editing an
 already-validated one - that theory held only until a real defect was
@@ -488,10 +487,26 @@ placeholder-match facts about the SSID/password and a scan summary
 found) - never the raw SSID/password value or any other network's name.
 Repeated at boot, before every `WiFi.begin()`, and from the heartbeat
 while Wi-Fi is down (so a serial monitor attached late still sees it);
-the scan itself is deliberately rate-limited (first attempt only, then
-gated on a time interval or a consecutive-failure count) and always
-completes strictly before the `WiFi.begin()` call in the same handler, so
-it can never run concurrently with association.
+the scan itself runs exactly once per boot (a rate-limited retry/interval
+policy was tried and then simplified away after a real test showed
+`WiFi.scanNetworks()` itself returning an error after several
+association attempts - the scan is a bench diagnostic, not part of the
+product), and always completes strictly before the `WiFi.begin()` call in
+the same handler, so it can never run concurrently with association.
+
+A later real bench test found a further, unrelated issue: the physical
+component wired to `esp32-c3-dev-ring-simulator`'s button is a Linker
+Button module (active-high, `VCC`/`GND`/`SIG`), not the dry, active-low
+contact the firmware and docs had assumed - `Esp32DevRingButtonInput` now
+reads it as plain `INPUT` (no pull-up), active-high, and the button moved
+from GPIO20 to GPIO4 (see `docs/dev-ring-simulator.md` > Bench test
+history for why GPIO20 was abandoned and what that test does and does
+not prove). The same test showed local connectivity (`state ... ->
+online`) without the companion app reflecting the device as present, so
+`dev_ring_simulator_main.cpp` gained the identical periodic `HealthReport`
+publish `mqtt_smoke_main.cpp` already sends (`MqttTopics::healthIngest()`,
+QoS `AtMostOnce`) - unconfirmed against the actual backend/app presence
+mechanism, which lives outside this repo.
 
 ## MQTT/mTLS command lifecycle (Phase 2D)
 

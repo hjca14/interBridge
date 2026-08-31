@@ -23,9 +23,11 @@
 #include "../hardware/ntp_sync_state.h"
 #include "../core/random_id.h"
 #include "../core/version.h"
+#include "../network/health_reporter.h"
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
 #include "../protocol/event_outbox.h"
+#include "../protocol/messages.h"
 #include "../storage/credential_store.h"
 #include "../storage/memory_store.h"
 
@@ -66,15 +68,14 @@ constexpr uint16_t kMqttKeepAliveSeconds = 300;
 constexpr uint16_t kMqttTimeoutMs = 1000;
 constexpr uint32_t kSerialWaitMs = 1500;
 constexpr uint32_t kHeartbeatMs = 15000;
+// DEV backend considers a device stale after 120s - see
+// mqtt_smoke_main.cpp's identical constant/rationale.
+constexpr uint32_t kDevHealthIntervalMs = 60u * 1000u;
 
 // Must match include/interbridge_dev_secrets.example.h exactly - see
 // diagnoseCredentialField()'s doc comment.
 constexpr const char* kWifiSsidPlaceholder = "REPLACE_WITH_WIFI_SSID";
 constexpr const char* kWifiPasswordPlaceholder = "REPLACE_WITH_WIFI_PASSWORD";
-// See mqtt_smoke_main.cpp's identical constants for the rescan-gating
-// rationale - never rescan before every ConnectWifi attempt.
-constexpr uint32_t kWifiRescanIntervalMs = 300000; // 5 minutes
-constexpr uint32_t kWifiRescanFailureThreshold = 5;
 
 // Mirrors mqtt_smoke_main.cpp's NtpClock exactly: hardware/clock.h's
 // Esp32Clock::hasValidTime() is a deliberate stub that always reports no
@@ -92,11 +93,18 @@ private:
     NtpSyncState syncState_;
 };
 
-// Reads the physical button: INPUT_PULLUP + active-low, so a raw LOW
-// reading means "pressed".
+// Reads the physical button. The bench component actually wired here is
+// a "Linker Button" module (PCB with VCC/GND/SIG, not a bare dry-contact
+// switch): its own documentation states SIG=LOW when released and
+// SIG=HIGH when pressed - the opposite polarity of a dry contact pulled
+// up internally and grounded on press, which an earlier version of this
+// file incorrectly assumed (INPUT_PULLUP + active-low). Plain INPUT (no
+// internal pull-up/pull-down - the module actively drives the pin both
+// ways) + active-high matches the module's real datasheet behavior. See
+// docs/dev-ring-simulator.md > Wiring diagram.
 class Esp32DevRingButtonInput final : public IDevRingButtonInput {
 public:
-    bool isPressed() override { return digitalRead(kDevRingButtonPin) == LOW; }
+    bool isPressed() override { return digitalRead(kDevRingButtonPin) == HIGH; }
 };
 
 AwsIotConnectionConfig connectionConfig() {
@@ -123,6 +131,17 @@ DevRingEventCoordinator ringCoordinator(buttonController, randomSource, eventOut
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 Esp32AwsIotTransport transport(connectionConfig(), credentials);
 DevMqttSmokeState connectivity;
+// Same presence contract mqtt_smoke_main.cpp publishes (HealthReport via
+// Basic Ingest, see publishHealth() below) - added after a real bench
+// test reached `state mqtt -> online` (local Wi-Fi/MQTT connectivity)
+// while the app still showed the device offline, since this simulator
+// had never published the periodic signal the backend/app presence
+// contract is believed to depend on. See docs/dev-ring-simulator.md >
+// "Online status: local connectivity vs. app presence" for exactly what
+// is confirmed here (the firmware-side contract, verified in this repo)
+// versus what is not (the backend/app's actual consumption of it, which
+// lives outside this repo and has not been inspected).
+HealthReporter healthReporter(kDevHealthIntervalMs);
 uint32_t heartbeatAt = 0;
 DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
 // Tracks whether the transport was connected as of the previous loop
@@ -182,7 +201,6 @@ const char* sanitizedAuthModeName(wifi_auth_mode_t mode) {
 WifiScanSummary lastWifiScanSummary;
 uint32_t lastWifiScanAtMs = 0;
 bool wifiScanEverRun = false;
-uint32_t consecutiveWifiAssociationFailures = 0;
 
 std::string credentialConfigLine() {
     auto ssidDiag = diagnoseCredentialField(INTERBRIDGE_DEV_WIFI_SSID, kWifiSsidPlaceholder);
@@ -203,9 +221,15 @@ void logWifiConfigAndScanSummary(uint32_t now) {
     Serial.printf("[DEV RING] wifi scan %s\n", formatWifiScanLine(lastWifiScanSummary, scanAgeMs).c_str());
 }
 
-// See mqtt_smoke_main.cpp's identical function - only ever called from
-// the ConnectWifi handler in loop(), strictly before that same call's
-// WiFi.begin(), so it can never overlap with an association attempt.
+// See mqtt_smoke_main.cpp's identical function. Runs exactly once per
+// boot - the scan is a bench diagnostic, not part of the product, and a
+// real hardware test showed WiFi.scanNetworks() can itself return an
+// error (-2 observed) after several association attempts, which is
+// exactly the kind of diagnostic-vs-association interference a single
+// boot-time scan avoids entirely. Only ever called from the ConnectWifi
+// handler in loop(), strictly before that same call's WiFi.begin(), so
+// it can never overlap with an association attempt; a manual reboot is
+// what allows a fresh scan, not an automatic retry/interval policy.
 void performWifiScan(uint32_t now) {
     WiFi.mode(WIFI_STA);
     const int16_t count = WiFi.scanNetworks();
@@ -229,7 +253,6 @@ void performWifiScan(uint32_t now) {
     WiFi.scanDelete();
     lastWifiScanAtMs = now;
     wifiScanEverRun = true;
-    consecutiveWifiAssociationFailures = 0;
 }
 
 // Set only from the Wi-Fi event callback below (which the ESP32 Arduino
@@ -270,12 +293,10 @@ void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 void drainWifiEventSignals(uint32_t now) {
     if (wifiAssociatedEventPending) {
         wifiAssociatedEventPending = false;
-        consecutiveWifiAssociationFailures = 0;
         connectivity.wifiAssociationResult(now, true);
     }
     if (wifiDisconnectedEventPending) {
         wifiDisconnectedEventPending = false;
-        ++consecutiveWifiAssociationFailures;
         connectivity.wifiAssociationResult(now, false);
     }
 }
@@ -308,6 +329,29 @@ void heartbeat(uint32_t now) {
     // boot and missed the setup()/ConnectWifi prints.
     if (!wifiUp) logWifiConfigAndScanSummary(now);
 }
+
+// Publishes the same periodic presence signal mqtt_smoke_main.cpp does
+// (HealthReport via AWS IoT Basic Ingest, MqttTopics::healthIngest(),
+// QoS AtMostOnce) - see the composition-root comment above for what this
+// does and does not confirm about app-visible online status. This is
+// entirely independent of the RING_DETECTED event outbox: a failed or
+// skipped health publish here never touches eventOutbox, and a failed
+// health publish is never retried through the outbox (matching
+// production/DEV-MQTT's own fire-and-forget QoS 0 health semantics).
+void publishHealth(uint32_t now) {
+    if (WiFi.status() != WL_CONNECTED || !clockSource.hasValidTime() || !transport.isConnected() ||
+        !healthReporter.isDue(now)) {
+        return;
+    }
+    HealthReport health;
+    health.deviceId = INTERBRIDGE_DEV_DEVICE_ID;
+    health.firmwareVersion = FIRMWARE_VERSION;
+    health.intercomState = toString(ProtocolIntercomState::Idle);
+    health.uptimeMs = now;
+    health.wifiRssi = WiFi.RSSI();
+    health.freeHeapBytes = ESP.getFreeHeap();
+    safeStatus("health publish", transport.publish(topics.healthIngest(), health.toJson(), MqttQos::AtMostOnce));
+}
 } // namespace
 
 void setup() {
@@ -324,8 +368,11 @@ void setup() {
     WiFi.onEvent(onWifiEvent);
     logWifiConfigAndScanSummary(millis());
 
-    pinMode(kDevRingButtonPin, INPUT_PULLUP);
-    Serial.printf("[DEV RING] button initialized gpio=%u (INPUT_PULLUP, active-low)\n",
+    // No internal pull-up: the Linker Button module actively drives SIG
+    // both ways (LOW released, HIGH pressed) - see
+    // Esp32DevRingButtonInput's doc comment.
+    pinMode(kDevRingButtonPin, INPUT);
+    Serial.printf("[DEV RING] button initialized gpio=%u mode=INPUT active=high module=linker\n",
                   static_cast<unsigned>(kDevRingButtonPin));
 
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
@@ -358,14 +405,10 @@ void loop() {
     }
     switch (action) {
         case DevSmokeAction::ConnectWifi: {
-            // See mqtt_smoke_main.cpp's identical handler for the
-            // rescan-gating rationale - never before every attempt, and
-            // strictly sequential with (never concurrent with) the
-            // WiFi.begin() below.
-            const bool shouldRescan = !wifiScanEverRun ||
-                DevMqttSmokeState::deadlineReached(now, lastWifiScanAtMs + kWifiRescanIntervalMs) ||
-                consecutiveWifiAssociationFailures >= kWifiRescanFailureThreshold;
-            if (shouldRescan) performWifiScan(now);
+            // Exactly one scan per boot - see performWifiScan()'s doc
+            // comment - strictly sequential with (never concurrent with)
+            // the WiFi.begin() below.
+            if (!wifiScanEverRun) performWifiScan(now);
             logWifiConfigAndScanSummary(now);
 
             // The state machine authorizes exactly one begin call per retry;
@@ -476,6 +519,7 @@ void loop() {
         }
     }
 
+    publishHealth(now);
     heartbeat(now);
     delay(10);
 }

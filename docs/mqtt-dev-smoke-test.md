@@ -409,8 +409,10 @@ found and fixed during the Phase 3B.8 ring-simulator bring-up, plus a
 plus new sanitized SSID/password-length/placeholder and Wi-Fi-scan
 diagnostics added to both DEV mains after a WPA2 test hotspot retest
 surfaced a disconnect reason (`201`, AP not found) this harness's own
-prior diagnostics could not explain. None of this is duplicated here -
-see `docs/dev-ring-simulator.md`'s "Real bench observation" sections (all
-four of them) and "Wi-Fi config and scan diagnostics" for the full
-investigation, fixes, and honest current status (association has not yet
-succeeded on either DEV environment as of that writing).
+prior diagnostics could not explain. The Wi-Fi scan now runs exactly once
+per boot (simplified from an earlier interval/failure-count rescan policy
+after a real test showed the scan call itself could return an error).
+None of this is duplicated here - see `docs/dev-ring-simulator.md` >
+Bench test history and Honest status for the full investigation, fixes,
+and current status (association has not yet succeeded on either DEV
+environment with the button correctly wired, as of that writing).

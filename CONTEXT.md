@@ -1462,6 +1462,87 @@ this pass:)*
   either. Validated: all 39 native suites passed via MSVC; all five
   required environments compiled via real `pio run`. **Still not
   validated on real hardware with the button on GPIO4.**
+- **Technical closing pass (same Phase 3B.8 work, before merge): the
+  GPIO20 framing above was itself corrected, the button's electrical
+  interface was fixed to match the real component, the diagnostic scan
+  was simplified, a presence/health signal was added, and
+  `docs/dev-ring-simulator.md` was consolidated from ~670 to ~380 lines.**
+  (1) **Corrected interpretation of the GPIO20 test**: the physical
+  component wired to the ring-simulator button is a *Linker Button
+  module* (a PCB with `VCC`/`GND`/`SIG`, active-HIGH per its own
+  documentation - `SIG` reads LOW released, HIGH pressed), not a bare
+  dry-contact switch. The firmware and every earlier entry above assumed
+  a dry, active-LOW contact wired with `INPUT_PULLUP`. This means the
+  GPIO20 test was run with an electrically mismatched wiring assumption,
+  so the reproducible correlation it found (disconnected → `Online`;
+  reconnected → Wi-Fi dropped) cannot be attributed to the GPIO20 pin,
+  a UART silicon function, or anything else specific - only that this
+  particular, mismatched assembly correlated with the drop. Every
+  overclaiming statement from earlier entries ("GPIO20 causes Wi-Fi to
+  disconnect", implicitly ruling GPIO21 out too, treating the credential
+  as confirmed either way) is superseded by this correction. (2) **Fixed
+  the electrical interface**: `Esp32DevRingButtonInput::isPressed()` now
+  reads `digitalRead(kDevRingButtonPin) == HIGH` (was `== LOW`), and
+  `setup()` now calls `pinMode(kDevRingButtonPin, INPUT)` (was `INPUT_
+  PULLUP`) - the module drives the pin itself in both states, so no
+  internal pull-up is used. The boot log line changed to `button
+  initialized gpio=4 mode=INPUT active=high module=linker`.
+  `DevRingButtonController` itself needed no change - it is already
+  hardware-independent and only ever sees the adapter's already-resolved
+  boolean, never a raw voltage level. (3) **Simplified the Wi-Fi scan to
+  exactly once per boot**: a real hardware test showed
+  `WiFi.scanNetworks()` itself returning `-2` after several association
+  attempts, meaning the earlier interval/failure-count rescan policy
+  could let the diagnostic scan interfere with the very association it
+  was meant to help diagnose. Removed `kWifiRescanIntervalMs`,
+  `kWifiRescanFailureThreshold`, and `consecutiveWifiAssociationFailures`
+  from both DEV mains entirely (dead code once the policy was gone,
+  including the incorrect earlier claim that GPIO21 was also "ruled out"
+  - it was never tested at all); the `ConnectWifi` handler now gates the
+  scan purely on `!wifiScanEverRun`. A manual reboot is what allows a
+  fresh scan. The already-existing repeated summary lines (boot, every
+  `WiFi.begin()`, heartbeat while down) are unchanged. (4) **Added a
+  presence/health signal**: a real test reached `state mqtt -> online`
+  (local Wi-Fi/DNS/NTP/MQTT connectivity) while the companion app still
+  showed the device offline. `esp32-c3-dev-mqtt`'s existing
+  `publishHealth()` contract (periodic `HealthReport` - device ID,
+  firmware version, `intercom_state=Idle`, uptime, Wi-Fi RSSI, free heap
+  - to `MqttTopics::healthIngest()`, QoS `AtMostOnce`, gated on Wi-Fi/
+  time/MQTT validity and a 60s cadence) was confirmed in code and added
+  identically to `dev_ring_simulator_main.cpp` (new `HealthReporter`
+  instance, `publishHealth()` function, called once per `loop()`
+  iteration, entirely independent of `eventOutbox`). **This is NOT
+  independently confirmed against the actual backend/app presence
+  mechanism** (outside this repo, not inspected) - only that this is the
+  one periodic presence-shaped signal that already exists in this
+  firmware's own contract; if a retest shows the app still doesn't
+  reflect presence, the backend/app's real mechanism needs to be found in
+  its own repo rather than assumed further here. (5) **Documentation
+  consolidation**: `docs/dev-ring-simulator.md` was rewritten from six
+  separate, partially-overlapping "Real bench observation" sections
+  (~670 lines total) into a single chronological "Bench test history"
+  section plus one final "Honest status" (~380 lines), preserving every
+  substantive fact while removing repeated/contradictory restatements of
+  the same conclusions. `README.md` and `docs/roadmap-3b.md`'s Phase
+  3B.8 entries were rewritten the same way. **Consequence for this
+  CONTEXT.md file**: several entries above quote specific
+  `docs/dev-ring-simulator.md` sub-section titles (e.g. "Real bench
+  observation: first boot never associated with Wi-Fi") that no longer
+  exist verbatim after that consolidation - those entries are kept as an
+  unedited historical log per this file's own convention, but readers
+  following those quoted titles should go to
+  `docs/dev-ring-simulator.md` > Bench test history directly instead. (6)
+  Native tests: 1 new test in `test/test_dev_ring_button`
+  (`test_released_low_state_produces_no_event`, plus comment updates
+  reframing the existing press/hold/release-repress tests around the
+  Linker Button's real LOW/HIGH semantics - `DevRingButtonController`'s
+  logic itself did not change, since it was already hardware-independent).
+  Validated: all native suites passed via MSVC; all five required
+  environments compiled via real `pio run`, including the electrical fix,
+  the scan simplification, and the new health publish. **Still not
+  validated on real hardware with the Linker Button correctly wired to
+  GPIO4 at 3.3V** - see `docs/dev-ring-simulator.md` > Honest status for
+  the complete, current, single source of truth.
 
 ## Future Work
 

@@ -7,9 +7,8 @@
 namespace interbridge {
 
 // Phase 3B.8 bench-only DEV physical ring simulator GPIO. See
-// docs/dev-ring-simulator.md for the full wiring diagram and rationale,
-// including the real-hardware evidence that ruled out GPIO20 (see "Real
-// bench observation: GPIO20 causes Wi-Fi to disconnect").
+// docs/dev-ring-simulator.md > "Why GPIO4" and > "Bench test history" for
+// the full wiring diagram and rationale.
 //
 // The validated bench board ("generic 4 MB ESP32-C3 Super Mini", see
 // platformio.ini/CONTEXT.md) exposes only 15 GPIOs total: 0-10 and 18-21.
@@ -21,16 +20,18 @@ namespace interbridge {
 //     *documentation-reserved*, for a future physical config/reset
 //     button and status LED - kSi3050ReservedPinButton/
 //     kSi3050ReservedPinStatusLed - neither implemented in any current
-//     code path). A real bench test wiring the button to GPIO20 reliably
-//     disconnected Wi-Fi association (WaitingForWifi -> ... -> Online
-//     with the button unplugged; Wi-Fi dropped again as soon as it was
-//     reconnected to GPIO20) - see docs/dev-ring-simulator.md. The exact
-//     physical cause (an alternate silicon pin function, this specific
-//     button/wiring's mounting, this board's particular pinout, or
-//     electrical/RF interference) has NOT been isolated - only the
-//     correlation itself was reproduced, which is enough to abandon
-//     GPIO20 (and, out of caution, GPIO21) for this bench rig without
-//     waiting for a root cause.
+//     code path). A real bench test wiring the button assembly then in
+//     use to GPIO20 reliably correlated with Wi-Fi disconnecting
+//     (WaitingForWifi -> ... -> Online with it unplugged; Wi-Fi dropped
+//     again as soon as it was reconnected). That assembly was later found
+//     to be electrically mismatched with the firmware's assumptions (a
+//     Linker Button module, active-high, needs VCC/GND/SIG - not the
+//     dry, active-low contact assumed at the time), so this correlation
+//     does NOT establish GPIO20 itself, a silicon pin function, this
+//     board's pinout, or RF/electrical interference as the cause - see
+//     docs/dev-ring-simulator.md > Bench test history for the full,
+//     corrected account. GPIO20/21 are avoided here out of caution from
+//     that inconclusive result, not because a root cause was confirmed.
 //   - GPIO0-8/10 are already committed to the real Si3050 wiring
 //     (si3050_pins.h).
 //
@@ -57,8 +58,8 @@ constexpr uint8_t kDevRingButtonPin = kSi3050PinPcmDrx;
 // future edit can silently pick an unreviewed pin.
 static_assert(kDevRingButtonPin == kSi3050PinPcmDrx,
               "DEV ring simulator button GPIO must be the one explicitly-approved Si3050 overlap "
-              "(GPIO4/kSi3050PinPcmDrx) - see docs/dev-ring-simulator.md for why GPIO20/21 were ruled out on real "
-              "hardware and why only this specific overlap is considered safe");
+              "(GPIO4/kSi3050PinPcmDrx) - see docs/dev-ring-simulator.md > Bench test history for why GPIO20/21 "
+              "are avoided and why only this specific overlap is considered safe");
 static_assert(kDevRingButtonPin != kSi3050ReservedPinBoot && kDevRingButtonPin != kSi3050ReservedPinUsbDMinus &&
                   kDevRingButtonPin != kSi3050ReservedPinUsbDPlus,
               "DEV ring simulator button GPIO must never collide with BOOT/USB pins");
