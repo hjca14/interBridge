@@ -216,11 +216,28 @@ already-real-hardware-validated command-processing composition (see
 This pass adds it, reusing the exact same classes `esp32-c3-dev-mqtt`
 already uses - `RemoteCommandProcessor`, `CommandHandler`,
 `InMemoryDedupCache`, and the non-actuating `DisabledHardware`/
-`DisabledSystemControl` pair (now shared from
-`src/dev/dev_disabled_hardware.h` so the two DEV entry points cannot
-silently diverge on this guarantee) - not a second implementation. The
-per-stage diagnostic log wording is likewise shared, from
-`src/dev/dev_command_diagnostics.h/.cpp`. `esp32-c3-dev-ring-simulator`
+`DisabledSystemControl` pair. A first version of this fix shared only the
+`DisabledHardware`/`DisabledSystemControl` stand-ins and the diagnostic log
+wording via two small headers, while the composition and command-processing
+cycle around them (`InMemoryDedupCache`, `Intercom`, `CommandHandler`,
+`RemoteCommandProcessor`, the commands-topic subscription, and draining
+pending responses) were still hand-copied into each `*_main.cpp` - the same
+kind of manual duplication that caused this gap in the first place, just
+narrower. That is now fixed too: `src/dev/dev_command_environment.h/.cpp`
+defines `DevCommandEnvironment`, one class that owns the entire composition
+behind a small `subscribe()`/`processPending()`/`setDiagnosticCallback()`
+surface, and both `esp32-c3-dev-mqtt` and `esp32-c3-dev-ring-simulator`
+construct exactly one instance of it and call only that surface - neither
+entry point declares `RemoteCommandProcessor`, `CommandHandler`, or
+`InMemoryDedupCache` itself anymore. The per-stage diagnostic log wording is
+still shared separately, from `src/dev/dev_command_diagnostics.h/.cpp`
+(Arduino/Serial-only, so it stays outside the natively-testable
+`DevCommandEnvironment` class itself; each entry point wires its own log
+prefix through `setDiagnosticCallback()`).
+`scripts/check_repo_safety.py` greps both entry points for the
+`DevCommandEnvironment commandEnv`/`commandEnv.subscribe()`/
+`commandEnv.processPending()` fragments, so a future omission of either call
+in either environment fails CI, not just review. `esp32-c3-dev-ring-simulator`
 now:
 
 - subscribes to `interbridge/{device_id}/commands` (QoS 1) on every
@@ -229,24 +246,47 @@ now:
   `subscribed` bookkeeping `esp32-c3-dev-mqtt` already uses, so a dropped
   subscription is never silently left unresolved after a reconnect;
 - drains and processes commands every loop iteration via
-  `processor.processPending()`, on the same one-response-publish-per-call
+  `commandEnv.processPending()`, on the same one-response-publish-per-call
   discipline documented in `docs/mqtt-dev-smoke-test.md`;
 - still only reaches `DoorOpenCapability::Disabled` (`CommandHandler`'s own
   compile-time constant, shared, not overridden here) - a valid `OPEN_DOOR`
   still only ever produces `ACCEPTED` then `REJECTED/CAPABILITY_DISABLED`.
   No door, relay, DTMF, GPIO, or system action is genuinely performed.
 
-**What this closes, and what it does not**: `RING_DETECTED`
-publishing/health/connectivity are byte-for-byte unchanged from the
-already-validated 3B.8 run - this pass only adds the command path
-alongside them, never modifies them. What is proven automatically: all 39
-native Unity suites (unchanged logic - `CommandHandler`,
+**What this closes, and what it does not**: `RING_DETECTED` *generation and
+outbox* (`DevRingEventCoordinator`, `MemoryEventOutbox`,
+`publishPendingEvents`) are unchanged by this pass - the button-press path,
+debounce, offline queueing, and `event_id` stability are exactly what the
+3B.8 hardware run validated. It is **not** true that the surrounding
+session/connectivity behavior is byte-for-byte unchanged, though: `Online`
+is now only reached after a successful command-topic subscription (not just
+Wi-Fi/DNS/NTP/MQTT connect), a failed subscription now tears the connection
+down and retries, and every loop iteration now also drains pending command
+responses (`commandEnv.processPending()`) alongside the outbox drain. So
+`RING_DETECTED` publishing itself did not change, but *when* the session is
+considered ready, and what else happens on it after connecting, did.
+
+What is proven automatically: all 40 native Unity suites pass - the 39 that
+existed before this pass (unchanged logic - `CommandHandler`,
 `RemoteCommandProcessor`, dedup, `DevRingEventCoordinator`,
 `DevRingButtonController`, `HealthReporter`, `DevMqttSmokeState`, and every
-other existing suite) still pass, and all three affected PlatformIO
-environments (`esp32-c3`, `esp32-c3-dev-mqtt`, `esp32-c3-dev-ring-simulator`)
-compile cleanly with this composition. What is **not** proven
-automatically, and still needs a real ESP32 retest: that
+other existing suite), plus a new `test_dev_command_environment` suite that
+exercises the shared `DevCommandEnvironment` composition directly: it
+subscribes to the exact commands topic at QoS 1, drives a full valid
+`OPEN_DOOR` through to `ACCEPTED` then `REJECTED/CAPABILITY_DISABLED`
+(never `COMPLETED`), and proves re-subscription after a simulated
+disconnect/reconnect still processes a command correctly. Unlike the
+pre-existing per-class suites (which only ever exercised `CommandHandler`/
+`RemoteCommandProcessor` in isolation and could not see that
+`esp32-c3-dev-ring-simulator` never constructed them at all), this suite
+targets the one class both DEV entry points actually build against, so an
+entry point silently omitting the composition is no longer just an
+uncaught textual gap - `scripts/check_repo_safety.py` also now greps both
+`*_main.cpp` files for the `DevCommandEnvironment`/`subscribe()`/
+`processPending()` calls (see "Command processing" above). All three
+affected PlatformIO environments (`esp32-c3`, `esp32-c3-dev-mqtt`,
+`esp32-c3-dev-ring-simulator`) compile cleanly with this composition. What
+is **not** proven automatically, and still needs a real ESP32 retest: that
 `esp32-c3-dev-ring-simulator` actually subscribes successfully on real
 AWS IoT Core, actually receives a real `OPEN_DOOR` command, and actually
 publishes `ACCEPTED` then `REJECTED/CAPABILITY_DISABLED` back - this exact

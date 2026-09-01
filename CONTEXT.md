@@ -1580,13 +1580,45 @@ this pass:)*
   exact composition unchanged - not a second implementation - shared via
   two new tiny headers (`src/dev/dev_disabled_hardware.h`,
   `src/dev/dev_command_diagnostics.h/.cpp`) so `esp32-c3-dev-mqtt` and
-  `esp32-c3-dev-ring-simulator` can no longer silently diverge on this
-  guarantee again. A valid `OPEN_DOOR` still only ever reaches `ACCEPTED`
-  then `REJECTED/CAPABILITY_DISABLED`; no door/system action is genuinely
+  `esp32-c3-dev-ring-simulator` can no longer silently diverge on the
+  `DisabledHardware`/`DisabledSystemControl` guarantee again. A valid
+  `OPEN_DOOR` still only ever reaches `ACCEPTED` then
+  `REJECTED/CAPABILITY_DISABLED`; no door/system action is genuinely
   performed. See `docs/dev-ring-simulator.md` > "Command processing (Phase
   3B.8 cumulative pass)" for the full diagnosis, what changed, and exactly
   what still needs a real-hardware retest (this specific combination -
   ring simulator + commands - has never run on real hardware).
+- **Follow-up architectural fix: the composition/cycle itself was still
+  duplicated, not just the two classes above.** The fix directly above
+  shared `DisabledHardware`/`DisabledSystemControl`/the diagnostic log
+  wording, but `InMemoryDedupCache`, `Intercom`, `CommandHandler`,
+  `RemoteCommandProcessor`, the commands-topic subscription, and the
+  pending-response drain were still constructed and wired by hand,
+  separately, in both `mqtt_smoke_main.cpp` and
+  `dev_ring_simulator_main.cpp` - the 39 native suites existing at the time
+  could not detect this because they test those classes in isolation, never
+  whether a given DEV `*_main.cpp` actually builds and drives them. Fixed by
+  extracting `DevCommandEnvironment`
+  (`src/dev/dev_command_environment.h/.cpp`): one class that owns the whole
+  composition behind a small `subscribe()`/`processPending()`/
+  `setDiagnosticCallback()` surface. Both DEV entry points now construct
+  exactly one `DevCommandEnvironment` and call only that surface; neither
+  declares `RemoteCommandProcessor`/`CommandHandler`/`InMemoryDedupCache`
+  itself anymore. Two things now make this specific gap mechanically hard to
+  reintroduce, not just documented against: `scripts/check_repo_safety.py`
+  greps both `*_main.cpp` files for the `DevCommandEnvironment`
+  construction and the `subscribe()`/`processPending()` calls, and a new
+  `test/test_dev_command_environment` suite (40th native suite) exercises
+  the shared class directly - commands-topic subscription at QoS 1, a full
+  `OPEN_DOOR` → `ACCEPTED` → `REJECTED/CAPABILITY_DISABLED` cycle (never
+  `COMPLETED`), and re-subscription after a simulated disconnect/reconnect
+  still processing a command correctly. `RING_DETECTED` event
+  generation/outbox (`DevRingEventCoordinator`/`publishPendingEvents`)
+  remain unchanged by this pass; what changed is that `Online` now also
+  requires a successful command-topic subscription and every loop iteration
+  drains pending command responses alongside the event outbox - see
+  `docs/dev-ring-simulator.md` > "Command processing" for the corrected,
+  precise before/after.
 
   **DEV environment evolution rule** (new, general going forward): the
   canonical DEV integration environment (`esp32-c3-dev-ring-simulator`, as

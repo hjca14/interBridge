@@ -19,21 +19,17 @@
 #include "dev_ring_event.h"
 #include "mqtt_smoke_state.h"
 #include "dev_wifi_diagnostics.h"
-#include "dev_disabled_hardware.h"
 #include "dev_command_diagnostics.h"
+#include "dev_command_environment.h"
 #include "../hardware/clock.h"
 #include "../hardware/ntp_sync_state.h"
 #include "../core/random_id.h"
 #include "../core/version.h"
-#include "../intercom/intercom.h"
 #include "../network/health_reporter.h"
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
-#include "../protocol/command_cache.h"
-#include "../protocol/command_handler.h"
 #include "../protocol/event_outbox.h"
 #include "../protocol/messages.h"
-#include "../protocol/remote_command_processor.h"
 #include "../storage/credential_store.h"
 #include "../storage/memory_store.h"
 
@@ -50,15 +46,16 @@
 // publishPendingEvents (src/dev/dev_ring_event.*).
 //
 // Cumulative DEV integration pass: this environment now also subscribes to
-// the commands topic and processes them through the exact same
-// RemoteCommandProcessor/CommandHandler/dedup/DisabledHardware/
-// DisabledSystemControl composition esp32-c3-dev-mqtt already uses (see
-// dev_disabled_hardware.h/dev_command_diagnostics.h) - not a second
-// implementation. A valid OPEN_DOOR still only ever reaches ACCEPTED then
-// REJECTED/CAPABILITY_DISABLED; nothing here actuates a door or performs a
-// system action. See docs/dev-ring-simulator.md > "Command processing
-// (Phase 3B.8 cumulative pass)" and CONTEXT.md's DEV environment evolution
-// rule.
+// the commands topic and processes them through DevCommandEnvironment (see
+// dev_command_environment.h) - the exact same
+// RemoteCommandProcessor/CommandHandler/InMemoryDedupCache/DisabledHardware/
+// DisabledSystemControl composition esp32-c3-dev-mqtt uses, now owned by one
+// shared class instead of hand-copied per entry point, so the two DEV
+// environments cannot silently diverge on it again. A valid OPEN_DOOR still
+// only ever reaches ACCEPTED then REJECTED/CAPABILITY_DISABLED; nothing here
+// actuates a door or performs a system action. See
+// docs/dev-ring-simulator.md > "Command processing (Phase 3B.8 cumulative
+// pass)" and CONTEXT.md's DEV environment evolution rule.
 //
 // The Wi-Fi event handler, per-action diagnostic log lines, and boot
 // diagnostics below deliberately mirror mqtt_smoke_main.cpp's own
@@ -147,19 +144,14 @@ DevRingButtonController buttonController(buttonInput);
 DevRingEventCoordinator ringCoordinator(buttonController, randomSource, eventOutbox, INTERBRIDGE_DEV_DEVICE_ID);
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 Esp32AwsIotTransport transport(connectionConfig(), credentials);
-// Command-processing composition, identical to mqtt_smoke_main.cpp's own
-// (same InMemoryDedupCache/DisabledHardware/Intercom/DisabledSystemControl/
-// CommandHandler/RemoteCommandProcessor classes, not a second
-// implementation) - see docs/dev-ring-simulator.md > "Command processing
-// (Phase 3B.8 cumulative pass)". A valid OPEN_DOOR still only ever reaches
-// ACCEPTED then REJECTED/CAPABILITY_DISABLED; no door/system action is
-// ever genuinely actuated by this bench firmware.
-InMemoryDedupCache dedupCache;
-DisabledHardware hardware;
-Intercom intercom(hardware);
-DisabledSystemControl systemControl;
-CommandHandler commandHandler(INTERBRIDGE_DEV_DEVICE_ID, clockSource, dedupCache, intercom, systemControl);
-RemoteCommandProcessor processor(INTERBRIDGE_DEV_DEVICE_ID, transport, commandHandler, topics);
+// Shared DEV command-processing composition (InMemoryDedupCache/
+// DisabledHardware/Intercom/DisabledSystemControl/CommandHandler/
+// RemoteCommandProcessor), the same class esp32-c3-dev-mqtt uses - see
+// src/dev/dev_command_environment.h and docs/dev-ring-simulator.md >
+// "Command processing (Phase 3B.8 cumulative pass)". A valid OPEN_DOOR
+// still only ever reaches ACCEPTED then REJECTED/CAPABILITY_DISABLED; no
+// door/system action is ever genuinely actuated by this bench firmware.
+DevCommandEnvironment commandEnv(INTERBRIDGE_DEV_DEVICE_ID, clockSource, transport, topics);
 DevMqttSmokeState connectivity;
 // Same presence contract mqtt_smoke_main.cpp publishes (HealthReport via
 // Basic Ingest, see publishHealth() below) - added after a real bench
@@ -407,7 +399,7 @@ void setup() {
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb([](struct timeval*) { clockSource.syncCompleted(millis()); });
-    processor.setDiagnosticCallback([](const CommandDiagnostic &event) {
+    commandEnv.setDiagnosticCallback([](const CommandDiagnostic &event) {
         logCommandDiagnostic("[DEV RING]", event);
     });
 }
@@ -500,14 +492,14 @@ void loop() {
             const bool connected =
                 clockSource.hasValidTime() && transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
             if (connected) {
-                subscribed = processor.subscribe();
+                subscribed = commandEnv.subscribe();
                 safeStatus("command QoS1 subscription", subscribed);
                 if (!subscribed) {
                     transport.disconnect();
                 } else {
                     healthReporter.forceNextPublish();
                     Serial.printf("[DEV RING] reconnected; pending_responses=%u\n",
-                                  static_cast<unsigned>(processor.pendingResponseCount()));
+                                  static_cast<unsigned>(commandEnv.pendingResponseCount()));
                 }
             }
             connectivity.mqttResult(now, connected && subscribed);
@@ -549,7 +541,7 @@ void loop() {
 
     if (transport.isConnected()) {
         transport.poll();
-        processor.processPending();
+        commandEnv.processPending();
         if (eventOutbox.size() > 0) {
             size_t publishedCount = publishPendingEvents(eventOutbox, transport, topics.eventsIngest());
             if (publishedCount > 0) {

@@ -17,19 +17,15 @@
 #include "interbridge_dev_secrets.h"
 #include "mqtt_smoke_state.h"
 #include "dev_wifi_diagnostics.h"
-#include "dev_disabled_hardware.h"
 #include "dev_command_diagnostics.h"
+#include "dev_command_environment.h"
 #include "../hardware/clock.h"
 #include "../hardware/ntp_sync_state.h"
-#include "../intercom/intercom.h"
 #include "../network/mqtt_topics.h"
 #include "../network/mqtt_transport.h"
 #include "../network/health_reporter.h"
 #include "../protocol/messages.h"
 #include "../core/version.h"
-#include "../protocol/command_cache.h"
-#include "../protocol/command_handler.h"
-#include "../protocol/remote_command_processor.h"
 #include "../storage/credential_store.h"
 #include "../storage/memory_store.h"
 
@@ -83,16 +79,14 @@ NtpClock clockSource;
 // reboot. Production NVS and provisioning remain separate and pending.
 MemoryStore devStore;
 DeviceCredentialStore credentials(devStore);
-InMemoryDedupCache dedupCache;
-DisabledHardware hardware;
-Intercom intercom(hardware);
-DisabledSystemControl systemControl;
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 Esp32AwsIotTransport transport(connectionConfig(), credentials);
-CommandHandler commandHandler(INTERBRIDGE_DEV_DEVICE_ID, clockSource, dedupCache,
-                              intercom, systemControl);
-RemoteCommandProcessor processor(INTERBRIDGE_DEV_DEVICE_ID, transport,
-                                 commandHandler, topics);
+// Shared DEV command-processing composition (InMemoryDedupCache/
+// DisabledHardware/Intercom/DisabledSystemControl/CommandHandler/
+// RemoteCommandProcessor) - see src/dev/dev_command_environment.h. The same
+// class is used by esp32-c3-dev-ring-simulator so the two DEV entry points
+// cannot silently diverge on this composition again.
+DevCommandEnvironment commandEnv(INTERBRIDGE_DEV_DEVICE_ID, clockSource, transport, topics);
 DevMqttSmokeState connectivity;
 uint32_t heartbeatAt = 0;
 bool subscribed = false;
@@ -328,7 +322,7 @@ void setup() {
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
     sntp_set_time_sync_notification_cb(onTimeSynchronized);
-    processor.setDiagnosticCallback([](const CommandDiagnostic &event) {
+    commandEnv.setDiagnosticCallback([](const CommandDiagnostic &event) {
         logCommandDiagnostic("[DEV MQTT]", event);
     });
 }
@@ -431,14 +425,14 @@ void loop() {
             const bool connected = clockSource.hasValidTime() &&
                 transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
             if (connected) {
-                subscribed = processor.subscribe();
+                subscribed = commandEnv.subscribe();
                 safeStatus("command QoS1 subscription", subscribed);
                 if (!subscribed) {
                     transport.disconnect();
                 } else {
                     healthReporter.forceNextPublish();
                     Serial.printf("[DEV MQTT] reconnected; pending_responses=%u\n",
-                                  static_cast<unsigned>(processor.pendingResponseCount()));
+                                  static_cast<unsigned>(commandEnv.pendingResponseCount()));
                 }
             }
             connectivity.mqttResult(now, connected && subscribed);
@@ -472,7 +466,7 @@ void loop() {
     }
     if (transport.isConnected()) {
         transport.poll();
-        processor.processPending();
+        commandEnv.processPending();
     }
     publishHealth(now);
     heartbeat(now);

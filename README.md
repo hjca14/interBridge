@@ -186,10 +186,16 @@ environment had never adopted `esp32-c3-dev-mqtt`'s own command-processing
 composition, so a real `OPEN_DOOR` sent from the app was never received or
 processed while this firmware was loaded. It now reuses that exact,
 already-hardware-validated composition (`RemoteCommandProcessor`/
-`CommandHandler`/dedup/`DisabledHardware`/`DisabledSystemControl`, shared
-via `src/dev/dev_disabled_hardware.h`/`dev_command_diagnostics.h`, not a
-second implementation) alongside the unchanged `RING_DETECTED`/health
-path. A valid `OPEN_DOOR` still only ever reaches `ACCEPTED` then
+`CommandHandler`/dedup/`DisabledHardware`/`DisabledSystemControl`) via one
+shared class, `DevCommandEnvironment`
+(`src/dev/dev_command_environment.h/.cpp`), which both DEV entry points now
+construct and call instead of each hand-copying the composition - not a
+second implementation, and no longer a hand-copied one either. `RING_DETECTED`
+event generation/outbox are unchanged, but session readiness (`Online`) now
+also requires a successful command-topic subscription, and pending command
+responses are drained every loop iteration alongside it - additional
+behavior after connecting that did not exist before this pass. A valid
+`OPEN_DOOR` still only ever reaches `ACCEPTED` then
 `REJECTED/CAPABILITY_DISABLED` - no door/system action is genuinely
 performed. This specific combination has not yet been retested on real
 hardware - see

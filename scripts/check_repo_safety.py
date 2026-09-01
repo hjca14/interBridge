@@ -78,14 +78,33 @@ def main() -> int:
     if 'R\"' in generator or "@'" in generator or '@"' in generator:
         failures.append("DEV header generator must not emit multiline raw/here strings")
 
-    dev_entrypoint = Path("src/dev/mqtt_smoke_main.cpp").read_text()
+    # The two DEV bench entry points must share exactly one command-processing
+    # composition (see src/dev/dev_command_environment.h) rather than each
+    # hand-copying RemoteCommandProcessor/CommandHandler themselves - that
+    # hand-copying is exactly how esp32-c3-dev-ring-simulator once ended up
+    # silently missing command processing entirely (see
+    # docs/dev-ring-simulator.md > "Command processing"). Check both entry
+    # points, not just one, so that specific class of gap cannot recur
+    # unnoticed in either of them.
+    shared_command_environment = Path("src/dev/dev_command_environment.h").read_text()
+    required_shared_composition = (
+        "InMemoryDedupCache dedupCache_",
+        "DisabledHardware hardware_",
+        "Intercom intercom_",
+        "DisabledSystemControl systemControl_",
+        "CommandHandler handler_",
+        "RemoteCommandProcessor processor_",
+    )
+    if any(fragment not in shared_command_environment for fragment in required_shared_composition):
+        failures.append("Shared DEV command composition is missing a required class")
+
     required_dev_composition = (
         "Esp32AwsIotTransport transport",
-        "RemoteCommandProcessor processor",
-        "CommandHandler commandHandler",
         "DeviceCredentialStore credentials",
+        "DevCommandEnvironment commandEnv",
         "transport.poll()",
-        "processor.subscribe()",
+        "commandEnv.subscribe()",
+        "commandEnv.processPending()",
     )
     forbidden_dev_composition = (
         "MQTTClient",
@@ -93,10 +112,12 @@ def main() -> int:
         "DevMqttSmokeHandler",
         "mqtt_smoke_handler",
     )
-    if any(fragment not in dev_entrypoint for fragment in required_dev_composition):
-        failures.append("DEV entrypoint is missing the production MQTT command composition")
-    if any(fragment in dev_entrypoint for fragment in forbidden_dev_composition):
-        failures.append("DEV entrypoint contains a forbidden parallel MQTT implementation")
+    for dev_entrypoint_path in ("src/dev/mqtt_smoke_main.cpp", "src/dev/dev_ring_simulator_main.cpp"):
+        dev_entrypoint = Path(dev_entrypoint_path).read_text()
+        if any(fragment not in dev_entrypoint for fragment in required_dev_composition):
+            failures.append(f"{dev_entrypoint_path} is missing the shared DEV command composition")
+        if any(fragment in dev_entrypoint for fragment in forbidden_dev_composition):
+            failures.append(f"{dev_entrypoint_path} contains a forbidden parallel MQTT implementation")
 
     if failures:
         print("Repository credential safety check failed:", file=sys.stderr)
