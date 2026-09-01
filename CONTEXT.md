@@ -1672,15 +1672,15 @@ this pass:)*
   `event_id`/`call_id` distinctness and reuse, debounce on both GPIOs, the
   GPIO3-vs-timeout race producing only one `RING_ENDED`, the publish-order
   fix, and restart always starting `Idle`) - all pre-existing native
-  suites are unaffected. **Not yet exercised on real hardware**: no real
-  GPIO3 pulse, `RING_ENDED` publish, or backend/app handling of
-  `RING_ENDED`/`call_id` has been performed - see
+  suites are unaffected. At the time of this specific bullet, not yet
+  exercised on real hardware; a later pass closed that gap - see
   `docs/dev-ring-simulator.md` > "Call session addition
-  (GPIO3/`RING_ENDED`/`call_id`): not yet hardware-validated" for exactly
-  what remains open, and its "Call session manual test procedure" for the
-  pending runbook. This does not claim the Si3050 was tested, that a real
-  intercom line's ring end was detected, that the Linker Button was
-  validated, or that GPIO3/GPIO4 are final production pins.
+  (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated with
+  backend and app" for the real-hardware record, and its "Call session
+  manual test procedure" for exactly which steps that run exercised. This
+  does not claim the Si3050 was tested, that a real intercom line's ring
+  end was physically detected, that the Linker Button was validated, or
+  that GPIO3/GPIO4 are final production pins.
 - **Real-hardware finding + fix: `esp32-c3-dev-ring-simulator` connected
   successfully, then lost connectivity and never recovered without a
   manual reboot.** Two independent, compounding defects in this
@@ -1758,10 +1758,41 @@ this pass:)*
   `RING_ENDED`, the backend processes and forwards the call's end, and
   the app ends only the session whose `call_id` matches; GPIO4/GPIO3
   remain temporary DEV-only simulators, never a production pin
-  assignment; GPIO3/`RING_ENDED`, the connectivity-recovery hardening,
-  and the complete updated call cycle are all still **not validated on
-  real hardware**; and the Si3050 and Linker Button module remain
-  electrically unvalidated.
+  assignment; and the Si3050 and Linker Button module remain
+  electrically unvalidated. At the time of this specific bullet,
+  GPIO3/`RING_ENDED` and the complete call cycle were still not validated
+  on real hardware - see the following bullet for the subsequent
+  hardware run that closed that gap (the connectivity-recovery hardening
+  itself remains not physically validated).
+- **Real-hardware finding: the coordinated call-session contract
+  (GPIO3/`RING_ENDED`/`call_id`) was validated end to end on a real
+  ESP32-C3 Super Mini, integrated with the deployed coordinated backend
+  (`hjca14/interBackend#27`) and the installed coordinated app
+  (`hjca14/interapp#24`).** Confirmed, with valid local DEV credentials:
+  Wi-Fi/NTP/AWS IoT MQTT/mTLS/health completed and the device appeared
+  online in the app; GPIO4 started a session and published exactly one
+  `RING_DETECTED`; GPIO3 ended that same session and published
+  `RING_ENDED` with a distinct `event_id` and the same `call_id`; the
+  event traversed firmware → AWS IoT → `telemetry_ingestion` →
+  `push_sender` → FCM → app, and the app ended its call presentation on
+  the correlated `RING_ENDED`; a subsequent session received a new
+  `call_id`. This validates the DEV bench pipeline and the cross-repo
+  contract - it does **not** validate the Si3050, Si3018/Si3019, a real
+  analog intercom line, physical ringing or its end, audio, off-hook,
+  physical door opening, the Linker Button module (this run used the
+  same external-resistor + momentary-3V3-jumper rig as GPIO4's original
+  validation for both pins), GPIO3/GPIO4 as a production pin assignment,
+  production firmware/provisioning/BLE/infrastructure beyond the deployed
+  DEV environment, or the connectivity-recovery hardening's actual
+  loss-and-recovery behavior (this run confirmed normal connectivity, not
+  a connectivity interruption - see the connectivity-recovery bullet
+  above, still pending its own physical retest). The firmware still boots
+  into `Idle` and the outbox remains RAM-only, unchanged by this run. See
+  `docs/dev-ring-simulator.md` > "Call session addition
+  (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated with
+  backend and app" for the full record, and
+  `docs/communication-protocol.md` section 16.1's "Cross-repo
+  coordination and validation status" for the contract-level summary.
 
 ## Future Work
 

@@ -469,8 +469,14 @@ order so a `RING_ENDED` can never be published ahead of its own session's
 `RING_DETECTED`. The same `event_id`/`call_id` survive any retry or
 offline period. See `docs/dev-ring-simulator.md` > "Call session state
 machine" for the full state diagram, GPIO rationale, and manual test
-procedure - the GPIO3/`RING_ENDED` addition is native-tested only and not
-yet validated on real hardware, unlike the original GPIO4-only 3B.8 pass.
+procedure - the GPIO3/`RING_ENDED` addition, like the original GPIO4-only
+3B.8 pass, is now validated end to end on real hardware, integrated with
+the deployed coordinated backend (`hjca14/interBackend#27`) and installed
+coordinated app (`hjca14/interapp#24`); see `docs/dev-ring-simulator.md`
+> "Call session addition (GPIO3/`RING_ENDED`/`call_id`): hardware-
+validated, integrated with backend and app" for what that run confirmed
+and what remains open (Si3050, Linker Button, production pinning, and
+physical connectivity-loss recovery all remain unvalidated).
 
 `dev_ring_simulator_main.cpp`'s Wi-Fi event handler (`onWifiEvent()`),
 per-`DevSmokeAction` log lines, and boot diagnostics

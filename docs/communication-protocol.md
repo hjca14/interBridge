@@ -822,11 +822,13 @@ Do not emit events whose real semantic source is not implemented yet.
 `RING_DETECTED` and `RING_ENDED` together describe one call session, from
 the ring signal's start to its end. This contract is coordinated across
 all three repositories - firmware (this repo), backend
-(`hjca14/interBackend#27`), and app (`hjca14/interapp#24`) - though each
-side's own PR still depends on the shared, integrated validation round
-across all three before any of them merges; see "Cross-repo coordination
-and validation status" below for exactly what that does and does not
-confirm today. `RING_ENDED` currently only has a producer in the
+(`hjca14/interBackend#27`), and app (`hjca14/interapp#24`) - and has been
+validated end to end on real hardware in the DEV environment, integrated
+with the deployed backend and installed app; see "Cross-repo coordination
+and validation status" below for exactly what that run confirmed and what
+still remains open (each side's own pull request still needs its own
+merge, and production infrastructure remains separate and unvalidated).
+`RING_ENDED` currently only has a producer in the
 bench-only DEV ring simulator (`esp32-c3-dev-ring-simulator`, see
 `docs/dev-ring-simulator.md` > "Call session state machine"), never in
 production firmware - GPIO4/GPIO3 remain temporary DEV-only simulators
@@ -891,9 +893,10 @@ Rules:
 
 The `RING_DETECTED`/`RING_ENDED`/`call_id` contract itself is coordinated
 across firmware, backend, and app - it is not this firmware repository's
-unilateral proposal. It is tracked by three still-open pull requests, one
-per repository, all still gated on the same shared, integrated validation
-round before any of them merges:
+unilateral proposal, and the shared integrated validation round across all
+three has been completed on real hardware in the DEV environment (see
+below for exactly what that confirmed). It is tracked by three pull
+requests, one per repository, each still open pending its own merge:
 
 ```text
 firmware   hjca14/interBridge#23
@@ -901,24 +904,38 @@ backend    hjca14/interBackend#27
 app        hjca14/interapp#24
 ```
 
-What "coordinated" means here, precisely - and does not mean:
+What "coordinated" means here, precisely:
 
 - The wire shape (fields, semantics, `call_id`/`event_id` roles) is
   agreed across all three sides, not just documented from the firmware's
   side alone.
-- It does **not** mean any of the three have merged, deployed, or been
-  exercised together on real hardware/infrastructure yet.
-- **Still not validated on real hardware**: GPIO3/`RING_ENDED` itself
-  (native-tested only), the connectivity-recovery hardening in this same
-  firmware PR (native-tested and real-toolchain-compiled only), and the
-  complete updated call cycle end to end (firmware → MQTT → backend →
-  push → app) with a real `RING_ENDED` reaching the app. See
-  `docs/dev-ring-simulator.md` for exactly what each pass has and has not
-  exercised physically.
+- **The complete cycle has been exercised end to end on real hardware, in
+  the DEV environment, integrated with the deployed backend
+  (`hjca14/interBackend#27`) and the installed app (`hjca14/interapp#24`)**:
+  GPIO4 starting a session and publishing one `RING_DETECTED`, GPIO3
+  ending that session and publishing `RING_ENDED` with the same `call_id`
+  and a distinct `event_id`, the event traversing firmware → AWS IoT →
+  `telemetry_ingestion` → `push_sender` → FCM → app, the app ending its
+  call presentation on the correlated `RING_ENDED`, and a subsequent
+  session receiving a new `call_id`. See `docs/dev-ring-simulator.md` >
+  "Call session addition (GPIO3/`RING_ENDED`/`call_id`): hardware-
+  validated, integrated with backend and app" for the full record.
+- This is DEV-environment validation, not production: none of the three
+  pull requests above have merged yet, and this does not by itself
+  validate production infrastructure, final provisioning, or final BLE.
+- **Still not validated on real hardware**: the connectivity-recovery
+  hardening's actual loss-and-recovery behavior in this same firmware PR
+  (that run confirmed normal connectivity, not a connectivity
+  interruption), the timeout race, offline/reconnect replay, and
+  `OPEN_DOOR` during an active call. See `docs/dev-ring-simulator.md` for
+  exactly what remains open.
 - GPIO4 and GPIO3 remain temporary DEV-only bench simulators of the ring
-  signal's start and end, never a production pin assignment.
-- The Si3050 and the Linker Button module remain electrically
-  unvalidated - none of this coordination work tests either one.
+  signal's start and end, never a production pin assignment. This run
+  used the same external-resistor + momentary-3V3-jumper rig as GPIO4's
+  original validation for both pins, never the Linker Button module.
+- The Si3050, Si3018/Si3019, a real analog intercom line, physical
+  ringing/its end, audio, off-hook, and physical door opening all remain
+  unvalidated - none of this work tests any of them.
 
 ---
 

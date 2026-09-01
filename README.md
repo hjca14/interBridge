@@ -218,9 +218,20 @@ through the exact same outbox/retry/`Esp32AwsIotTransport` path as
 deliberate, explicit DEV-only overlap with the Si3050's DTX pin, safe for
 the same reason GPIO4's DRX overlap is: this isolated environment never
 compiles or initializes Si3050 code and no Si3050 is attached while it
-runs. Not yet validated on real hardware - see
+runs. **Validated end to end on real hardware**, integrated with the
+deployed coordinated backend (`hjca14/interBackend#27`) and installed
+coordinated app (`hjca14/interapp#24`): GPIO4 started a session and
+published one `RING_DETECTED`; GPIO3 ended it and published `RING_ENDED`
+with a distinct `event_id` and the same `call_id`; the event reached the
+app via AWS IoT/`telemetry_ingestion`/`push_sender`/FCM, and the app
+ended its call presentation on the correlated `RING_ENDED`; a subsequent
+session got a new `call_id`. This validates the DEV pipeline and the
+cross-repo contract, not production hardware - see
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Call session
-state machine".
+addition (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated
+with backend and app" for exactly what is and is not covered (Si3050,
+Linker Button, production pinning, and physical connectivity-loss
+recovery all remain unvalidated).
 
 A subsequent pass hardens connectivity recovery after a real bench run
 connected successfully, then never recovered from a later connectivity

@@ -19,19 +19,21 @@ signal's start and end. See Scope and safety below.
 environment to simulate a complete call session, not just its start**: a
 second momentary input (GPIO3) simulates the same call's end and
 publishes `RING_ENDED`, correlated with the `RING_DETECTED` from GPIO4 by
-a shared `call_id`. **This extension is native-tested only - it has not
-yet been exercised on real hardware.** The GPIO4-only 3B.8 hardware
-validation recorded below still stands as-is and is not affected by it.
+a shared `call_id`.
 
-**Validated state (see the consolidated record below):** 3B.8's original
-GPIO4-only scope is implemented, compiled, unit-tested, and validated end
-to end on a real ESP32-C3 Super Mini. The successful test used a
-controlled electrical stimulus rather than the Linker Button: GPIO4 was
+**Validated state (see "Validated state" below for the full record):**
+both the original GPIO4-only start signal and this call-session extension
+(GPIO3/`RING_ENDED`) are implemented, compiled, unit-tested, and
+validated end to end on a real ESP32-C3 Super Mini, integrated with the
+deployed coordinated backend (`hjca14/interBackend#27`) and the installed
+coordinated app (`hjca14/interapp#24`). All runs used a controlled
+electrical stimulus rather than the Linker Button: each of GPIO4/GPIO3
 held LOW through an approximately 10 kΩ resistor to GND, then connected
-momentarily to 3V3. Wi-Fi, NTP, and AWS IoT MQTT/mTLS completed; the
-health report made the device appear online in the app; and the pulse
-produced exactly one event and one confirmed publish before traversing
-the backend, FCM, and Android notification path.
+momentarily to 3V3. **This validates the DEV bench pipeline and the
+`RING_DETECTED`/`RING_ENDED`/`call_id` contract, not production hardware**
+- see "Validated state" for exactly what is and is not covered (Si3050,
+Linker Button, production pinning, real ringing/audio, and physical
+connectivity-loss recovery all remain unvalidated).
 
 ## Scope and safety
 
@@ -480,10 +482,13 @@ entire addition lives behind `INTERBRIDGE_DEV_RING_SIMULATOR`, in files
 **What is proven automatically:** all pre-existing native suites remain
 unchanged and passing, plus `test/test_dev_ring_event` (rewritten for the
 two-button/call-session coordinator, 16 tests - see "Call session state
-machine" above for what each behavior guarantees). **What is not proven
-automatically, and needs a real ESP32 retest:** everything under "Call
-session addition (GPIO3/`RING_ENDED`/`call_id`): not yet hardware-validated"
-below.
+machine" above for what each behavior guarantees). **What is additionally
+now confirmed by a real ESP32 hardware run** (a later pass than this
+commit - see "Validated state" below for the full record): GPIO3/
+`RING_ENDED`, the `event_id`/`call_id` contract, and the complete
+firmware → backend → app pipeline. Still not exercised by that run:
+production hardware, the Linker Button, and a physical connectivity-loss/
+recovery scenario - see "Validated state" for exactly what remains open.
 
 ## Manual flash and test procedure
 
@@ -557,14 +562,24 @@ not physically validated here:
     the two paths (event outbox vs. command processor) must not interfere
     with each other.
 
-## Call session manual test procedure (GPIO3 + GPIO4, pending real-hardware run)
+## Call session manual test procedure (GPIO3 + GPIO4)
 
 This procedure exercises the call-session addition (GPIO3/`RING_ENDED`/
-`call_id`/timeout) described above. **Unlike the GPIO4-only procedure
-above, this has not yet been run on real hardware** - only native-tested
-(`test/test_dev_ring_event`, 16 assertions). Use the same electrical rig
-for both pins - see "Validated electrical rig: resistor + pulse" above,
-never the Linker Button module for GPIO3.
+`call_id`/timeout) described above, using the same electrical rig for
+both pins as "Validated electrical rig: resistor + pulse" above - never
+the Linker Button module for GPIO3.
+
+**Executed on real hardware** (see "Validated state" below for the
+consolidated result, integrated with the deployed backend and installed
+app): steps 1, 2, 4, 6, and 7 - GPIO4 starting a session and publishing
+one `RING_DETECTED`, GPIO3 ending that same session with `RING_ENDED`
+carrying the same `call_id` and a different `event_id`, and a subsequent
+GPIO4 pulse starting a new session with a new `call_id`. **Not
+specifically exercised by that run, and still open**: step 3/8 (GPIO3
+with no active call), 5 (a second GPIO4 pulse mid-call), the timeout race
+(9-10), the offline/reconnect replay (11), and `OPEN_DOOR` during an
+active call (12) - these remain covered only by
+`test/test_dev_ring_event`'s native tests, not by a physical run.
 
 1. Wire two independent momentary-pulse inputs, one per pin: GPIO4 (start)
    and GPIO3 (end), each held LOW at rest by its own external ~10 kΩ
@@ -735,38 +750,64 @@ A future Linker Button evaluation is optional and separate from 3B.8.
 Production must not depend on that module without its own electrical
 validation.
 
-### Call session addition (GPIO3/`RING_ENDED`/`call_id`): not yet hardware-validated
+### Call session addition (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated with backend and app
 
 Everything above this subsection describes the GPIO4-only 3B.8 state that
 **is** validated on real hardware. The call-session addition (GPIO3,
 `RING_ENDED`, `call_id`, the safety timeout - see "Call session state
-machine" above) is a separate, later, software-only pass:
+machine" above) was implemented, compiled, and native-tested
+(`test/test_dev_ring_event`, 16 tests covering the state machine, both
+buttons' debounce, the `call_id`/`event_id` contract, the safety timeout,
+the GPIO3/timeout race, publish ordering, and restart behavior) in an
+earlier commit on this same PR, and has since been **validated end to end
+on a real ESP32-C3 Super Mini**, integrated with the deployed coordinated
+backend (`hjca14/interBackend#27`) and the installed coordinated app
+(`hjca14/interapp#24`) - see "Call session manual test procedure (GPIO3 +
+GPIO4)" above for which specific steps this run exercised. Confirmed on
+that run, with valid local DEV credentials:
 
-- Implemented, compiled, and **native-tested only**
-  (`test/test_dev_ring_event`, 16 tests covering the state machine, both
-  buttons' debounce, the `call_id`/`event_id` contract, the safety
-  timeout, the GPIO3/timeout race, publish ordering, and restart
-  behavior).
-- **Not yet run on any real ESP32-C3.** No real GPIO3 pulse, no real
-  `RING_ENDED` publish, and no real backend/app handling of `RING_ENDED`
-  or `call_id` has been exercised - see "Call session manual test
-  procedure (GPIO3 + GPIO4, pending real-hardware run)" above for the
-  pending runbook.
-- `RING_ENDED` and `call_id` are a coordinated contract across firmware,
-  backend (`hjca14/interBackend#27`), and app (`hjca14/interapp#24`) -
-  see `docs/communication-protocol.md` section 16.1's "Cross-repo
-  coordination and validation status." Coordinated does not mean
-  hardware-validated: none of the three PRs have merged yet, all three
-  are still gated on the same shared, integrated validation round, and no
-  real `RING_ENDED` has yet reached a real backend or app.
-- GPIO3 is a second, equally provisional DEV-only overlay, this time with
-  `kSi3050PinPcmDtx` (DTX), justified for exactly the same reason and
-  under exactly the same constraints as GPIO4's DRX overlay above - see
-  "Why GPIO4 and GPIO3, and why both are provisional".
-- This pass does **not** claim that the Si3050 was tested, that a real
-  intercom line's ringing was detected or its end observed, that the
-  Linker Button module was validated, that GPIO3/GPIO4 are final
-  production pin assignments, or that any physical door was opened.
+- Wi-Fi, NTP, AWS IoT MQTT/mTLS, and the health report completed; the
+  device appeared online in the app.
+- GPIO4 started a session and published exactly one `RING_DETECTED`.
+- GPIO3 ended that same session and published `RING_ENDED`.
+- `RING_DETECTED` and `RING_ENDED` carried **distinct `event_id`s and the
+  same `call_id`**.
+- The event traversed the full pipeline: firmware → AWS IoT →
+  `telemetry_ingestion` → `push_sender` → FCM → app, and the app ended
+  its call presentation on receiving the correlated `RING_ENDED`.
+- A new session, started after the previous one ended, received a new
+  `call_id`.
+
+This validates the DEV bench firmware → MQTT → backend → push → app
+pipeline and the `RING_DETECTED`/`RING_ENDED`/`call_id` contract across
+all three repositories. It does **not** validate:
+
+- the Si3050, Si3018/Si3019, a real analog intercom line, physical
+  ringing detection, its physical end, audio, off-hook, or physical door
+  opening;
+- the Linker Button module - this run used the same external-resistor +
+  momentary-3V3-jumper rig as GPIO4's original validation for both
+  GPIO3 and GPIO4, never the Linker Button;
+- GPIO3/GPIO4 as a production pin assignment - both remain temporary
+  DEV-only bench simulators (see "Why GPIO4 and GPIO3, and why both are
+  provisional" above);
+- production firmware, final provisioning, final BLE, or any
+  infrastructure beyond the already-deployed DEV environment;
+- the timeout race, offline/reconnect replay, and `OPEN_DOOR` during an
+  active call - not specifically exercised in this run (native-tested
+  only; see the manual procedure above for exactly which steps were and
+  were not run);
+- the connectivity-recovery hardening's actual loss-and-recovery
+  behavior - this run confirms the hardened connectivity code connects
+  normally end to end, but did **not** exercise a connectivity
+  interruption; see "Connectivity recovery hardening" below, which
+  remains pending a physical retest.
+
+Unchanged architectural facts, not new claims from this run: the
+firmware still boots into `Idle` and never restores a previous session as
+still active (see "Call session state machine" above), and the event
+outbox remains RAM-only (`MemoryEventOutbox`) - a reboot with a queued
+event still loses it.
 
 ## Connectivity recovery hardening (this pass)
 
@@ -928,11 +969,15 @@ behind a backoff that kept restarting near-instantly instead of growing.
   compile against the real ESP32-C3 toolchain (confirms the newly
   referenced `WIFI_REASON_*` constants and `WiFi.setAutoReconnect()` are
   valid for the pinned `espressif32`/Arduino core version).
-- **Not yet re-validated on real hardware.** The next physical test must
-  reproduce a comparable connectivity loss (e.g. briefly power off the
-  AP/router, or move the device out of range and back) without rebooting
-  the ESP32, and confirm autonomous recovery - see the updated manual
-  procedure below.
+- A later hardware run (see "Call session addition" above) confirmed this
+  hardened connectivity code connects normally end to end (Wi-Fi, NTP,
+  MQTT, health) on real hardware. **The specific loss-and-recovery
+  behavior this pass exists for is still not re-validated on real
+  hardware** - that run did not include a connectivity interruption. The
+  next physical test must reproduce a comparable connectivity loss (e.g.
+  briefly power off the AP/router, or move the device out of range and
+  back) without rebooting the ESP32, and confirm autonomous recovery -
+  see the updated manual procedure below.
 
 ### Manual test addition: connectivity recovery (pending real-hardware run)
 
