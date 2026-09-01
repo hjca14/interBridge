@@ -511,6 +511,39 @@ transition traversed MQTT/backend/FCM to an Android notification. GPIO4
 remains a DEV-only provisional overlap with Si3050 DRX; no Si3050 was
 connected or initialized, and no production pinout changed.
 
+**Cumulative integration follow-up:** that validated run exposed a real
+gap - `esp32-c3-dev-ring-simulator` had adopted `DevMqttSmokeState` but
+never `esp32-c3-dev-mqtt`'s command-processing composition, so a real
+`OPEN_DOOR` was never received on this environment. An initial fix reused
+the same `RemoteCommandProcessor`/`CommandHandler`/`InMemoryDedupCache`/
+`DisabledHardware`/`DisabledSystemControl` classes unchanged, but still left
+the composition itself (which classes get constructed with which
+references, the subscribe-on-connect call, and the pending-response drain)
+hand-copied into each `*_main.cpp` - only the non-actuating
+`DisabledHardware`/`DisabledSystemControl` stand-ins and the diagnostic log
+wording were factored out, into `src/dev/dev_disabled_hardware.h` and
+`src/dev/dev_command_diagnostics.h/.cpp` respectively. That left the same
+class of risk one level down: the composition/cycle itself could still
+silently diverge between the two entry points even though the individual
+classes could not. `src/dev/dev_command_environment.h/.cpp` now closes that
+gap too: `DevCommandEnvironment` owns the entire composition (dedup cache,
+disabled hardware/system-control stand-ins, `Intercom`, `CommandHandler`,
+`RemoteCommandProcessor`) behind a small `subscribe()`/`processPending()`/
+`setDiagnosticCallback()` surface, and both DEV entry points construct
+exactly one instance of it and call only that surface - neither declares
+`RemoteCommandProcessor`/`CommandHandler`/`InMemoryDedupCache` directly
+anymore. `scripts/check_repo_safety.py` greps both `*_main.cpp` files for
+the `DevCommandEnvironment`/`subscribe()`/`processPending()` calls, and
+`test/test_dev_command_environment` exercises the shared class directly
+(subscription, a full `OPEN_DOOR` → `ACCEPTED` → `REJECTED/
+CAPABILITY_DISABLED` cycle, and re-subscription after a simulated
+reconnect) - so this specific omission can no longer hide behind the
+per-class unit suites the way it originally did. `Online` is now reached
+only after a successful command-topic subscription, mirroring
+`esp32-c3-dev-mqtt` exactly (see `docs/dev-ring-simulator.md` > "Command
+processing"). See CONTEXT.md's DEV environment evolution rule (Technical
+Debt) for the general principle this follows.
+
 ## MQTT/mTLS command lifecycle (Phase 2D)
 
 The composition root retains the existing layering: Wi-Fi readiness gates MQTT;
