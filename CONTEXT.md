@@ -1679,6 +1679,66 @@ this pass:)*
   pending runbook. This does not claim the Si3050 was tested, that a real
   intercom line's ring end was detected, that the Linker Button was
   validated, or that GPIO3/GPIO4 are final production pins.
+- **Real-hardware finding + fix: `esp32-c3-dev-ring-simulator` connected
+  successfully, then lost connectivity and never recovered without a
+  manual reboot.** Two independent, compounding defects in this
+  repository's own code (not the AP/router): (1)
+  `ARDUINO_EVENT_WIFI_STA_CONNECTED` (L2 association only, before DHCP)
+  was forwarded to `DevMqttSmokeState` as a full success signal
+  identically to `..._GOT_IP` - combined with a latent bug in
+  `DevMqttSmokeState` itself (a success signal cleared the in-flight
+  attempt immediately with no further safeguard), this could permanently
+  strand the state machine in `WaitingForWifi` with `actionIssued_` stuck
+  `true` and no pending transition to ever reset it, if `wifiConnected`
+  then never actually became true - exactly what a real bench log showed.
+  `reason=8` (`WIFI_REASON_ASSOC_LEAVE`) disconnects were also ambiguous:
+  the driver reports that same code for both an AP-initiated drop and this
+  firmware's own `RecoverWifi`-triggered `WiFi.disconnect()`. (2) The
+  ESP32 Arduino core's own Wi-Fi auto-reconnect (on by default) was never
+  disabled, letting it retry association internally, racing against
+  `DevMqttSmokeState`'s own explicit `ConnectWifi`/backoff cadence as a
+  second, uncoordinated source of connect/disconnect events. **Fixed**:
+  `DevMqttSmokeState` (`src/dev/mqtt_smoke_state.h/.cpp`) gained a bounded
+  "awaiting confirmed connect" window
+  (`wifiConnectConfirmationPending()`) so an unconfirmed/premature success
+  signal can never wedge it again (defense in depth, not only a
+  caller-side fix), plus a dedicated Wi-Fi reconnection backoff - separate
+  from the unchanged per-stage DNS/Time/MQTT ladder - that grows only on
+  an explicit failed/timed-out reconnect attempt and resets only on a
+  full, genuinely stable success (`mqttResult(true)`), never merely by
+  re-entering `WaitingForWifi` (a real, related bug: the original design
+  reset backoff to the floor on every re-entry, including a momentary
+  reassociation that dropped again before ever stabilizing). A genuinely
+  fresh loss-of-connectivity transition still reseeds just the retry
+  *deadline* from `nowMs` (both the semantically correct reaction to a new
+  loss, and a fix for a 32-bit `millis()`-wraparound hazard on a
+  long-untouched deadline, found and fixed during this same work before it
+  was ever committed) - never the backoff *growth* itself. Both DEV
+  entry points now handle `STA_CONNECTED`/`STA_GOT_IP` distinctly (only
+  `GOT_IP` is a success signal), call `WiFi.setAutoReconnect(false)` once
+  in `setup()`, and log each disconnect's origin
+  (`origin=local_recovery`/`remote_or_unknown`) via a flag set immediately
+  before `RecoverWifi`'s own `WiFi.disconnect()` call.
+  `wifiDisconnectReasonName()` also now names `WIFI_REASON_ASSOC_LEAVE`/
+  `HANDSHAKE_TIMEOUT`/`AUTH_EXPIRE`/`BEACON_TIMEOUT` explicitly. Heartbeat
+  log spam reduced (the full credential/scan summary no longer repeats
+  every 15s heartbeat while offline; RSSI added to the terse line
+  instead), and `previous_reset=` now names an unrecognized reset reason
+  `unknown` rather than `other`. Proven by 4 new tests in
+  `test/test_dev_mqtt_state` (26 → 30) exercising exactly these two fixed
+  defects plus the two related backoff/wraparound bugs found while fixing
+  them; all pre-existing suites (including the other 26 in this file)
+  remain unchanged and passing. The outbox is still RAM-only - this pass
+  fixes *ordinary* connectivity-loss recovery so a reboot is no longer
+  *required* for that case, but does not add persistence (see Future Work
+  below); `event_id`/`call_id`/timestamp are still never regenerated on
+  retry, and `publishPendingEvents()`'s strict-FIFO ordering (see the
+  call-session entry above) is untouched. GPIO3/GPIO4, the call-session
+  state machine, and `DevCommandEnvironment` are completely untouched by
+  this pass. See `docs/dev-ring-simulator.md` > "Connectivity recovery
+  hardening" for the full sanitized log, root-cause writeup, and the
+  pending manual real-hardware retest procedure - **not yet re-validated
+  on real hardware**.
 
 ## Future Work
 

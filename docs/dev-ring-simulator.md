@@ -759,3 +759,205 @@ machine" above) is a separate, later, software-only pass:
   intercom line's ringing was detected or its end observed, that the
   Linker Button module was validated, that GPIO3/GPIO4 are final
   production pin assignments, or that any physical door was opened.
+
+## Connectivity recovery hardening (this pass)
+
+A real bench run of the firmware described above (GPIO4/GPIO3 call
+session, on top of the already-hardware-validated 3B.8 connectivity/
+command stack) connected successfully, then lost connectivity and never
+recovered on its own - only a manual reboot restored it. Sanitized log
+excerpt (no credentials/endpoint/identity):
+
+```text
+[DEV RING] valid press detected; RING_DETECTED enqueued
+[WARN] AWS IoT publish failed; session marked invalid (mqtt_err=-9)
+[DEV RING] state online -> mqtt
+hostByName(): DNS Failed
+[DEV RING] network preflight dns=failed
+[DEV RING] state mqtt -> dns
+[DEV RING] state dns -> wifi
+[DEV RING] wifi recovery requested
+[DEV RING] wifi event=disconnected reason=8
+[DEV RING] wifi recovery cooldown until_ms=710086
+[DEV RING] Wi-Fi connect requested; next_attempt_ms=117111 delay_ms=0
+[DEV RING] wifi event=disconnected reason=204
+[DEV RING] wifi event=connected
+[DEV RING] wifi event=disconnected reason=8
+[DEV RING] Wi-Fi connect requested
+[DEV RING] wifi event=disconnected reason=39 (timeout)
+```
+
+### Root cause
+
+Two independent, compounding defects, both in code paths this repository
+owns (not the AP/router):
+
+1. **`ARDUINO_EVENT_WIFI_STA_CONNECTED` (L2 association only, before
+   DHCP) was forwarded to `DevMqttSmokeState` identically to
+   `ARDUINO_EVENT_WIFI_STA_GOT_IP`** (both logged as `wifi event=connected`
+   and both set the same "success" flag). `DevMqttSmokeState` itself had a
+   latent bug that made this genuinely dangerous rather than merely
+   imprecise: a success signal (`wifiAssociationResult(nowMs, true)`)
+   cleared the in-flight attempt immediately with no further safeguard -
+   if `wifiConnected` (`WiFi.status()==WL_CONNECTED`, which the real
+   ESP32 Arduino core only reports after `GOT_IP`) then never actually
+   became true (association was only L2, or a later drop happened before
+   DHCP completed), `actionIssued_` was left permanently `true` with no
+   state transition ever pending to reset it - **no further `ConnectWifi`
+   was ever issued again**, for that boot, without a manual reboot. Every
+   `reason=8` (`WIFI_REASON_ASSOC_LEAVE`) in the log above is also, on its
+   own, ambiguous: the ESP32 Wi-Fi driver reports that exact code both for
+   an AP-initiated drop and for a disconnect the firmware requested
+   itself (the `RecoverWifi` case's own `WiFi.disconnect()` call) - the
+   log alone could not previously tell the two apart.
+2. **The ESP32 Arduino core's own Wi-Fi auto-reconnect (enabled by
+   default) was never disabled**, so it could retry association
+   internally, independent of and racing against
+   `DevMqttSmokeState`'s own explicit `ConnectWifi`/backoff cadence - a
+   second, uncoordinated source of `connected`/`disconnected` events this
+   firmware never accounted for.
+
+A third, narrower defect was found and fixed while implementing the first
+fix above: `DevMqttSmokeState`'s original design reset its Wi-Fi-retry
+backoff to the floor on every re-entry into `WaitingForWifi` (via
+`enter()`), including a merely momentary reassociation that dropped again
+before ever reaching a stable connection - masking real instability
+behind a backoff that kept restarting near-instantly instead of growing.
+
+### Fixes
+
+- **`DevMqttSmokeState`** (`src/dev/mqtt_smoke_state.h/.cpp`) gained a
+  bounded "awaiting confirmed connect" window
+  (`wifiConnectConfirmationPending()`): a success signal no longer goes
+  fully idle immediately - if `wifiConnected` does not become genuinely
+  true within this window, the attempt is now treated as failed and a
+  fresh retry is scheduled automatically. This makes the state machine
+  itself robust against a premature/unconfirmed success signal, not just
+  the caller that produces one - defense in depth, not only a caller-side
+  fix.
+- **A dedicated Wi-Fi reconnection backoff**, separate from the
+  per-stage (DNS/Time/MQTT) backoff those stages continue to use exactly
+  as before: it grows only on an explicit failed/timed-out reconnect
+  *attempt*, and is reset to its floor only by a full, genuinely stable
+  success (`mqttResult(true)`, reaching `Online`) - never merely by
+  re-entering `WaitingForWifi`. A fresh loss-of-connectivity transition
+  still gets a prompt first retry (the deadline is reseeded from `nowMs`,
+  both because that is the correct reaction to a just-detected real loss
+  and to avoid a 32-bit `millis()` wraparound hazard on a long-untouched
+  deadline - a real defect found and fixed during this same work, before
+  it ever reached a committed state); the *growth* itself never resets on
+  that transition alone. `retryDelayMs()`/`retryAtMs()` are now
+  context-sensitive: they report this dedicated ladder while
+  `state()==WaitingForWifi`, and the unchanged shared ladder otherwise.
+- **`ARDUINO_EVENT_WIFI_STA_CONNECTED` and `..._GOT_IP` are now handled
+  distinctly** in both `dev_ring_simulator_main.cpp` and
+  `mqtt_smoke_main.cpp`: only `GOT_IP` is forwarded as a success signal;
+  `STA_CONNECTED` is logged (`wifi event=associated awaiting_ip=true`)
+  but never treated as "ready."
+- **`WiFi.setAutoReconnect(false)`** is now called once in `setup()` in
+  both DEV entry points, so this firmware's own `DevMqttSmokeState`-driven
+  `WiFi.begin()` calls are the *only* source of reconnection attempts -
+  no second, uncoordinated retry loop running inside the driver.
+- **Disconnect origin is now logged**: a `wifiLocalDisconnectExpected`
+  flag, set immediately before the `RecoverWifi` case's own
+  `WiFi.disconnect()` call and consumed by the very next disconnect event,
+  labels that event `origin=local_recovery` in the log; every other
+  disconnect logs `origin=remote_or_unknown` - `reason=8` is no longer
+  ambiguous between "the AP dropped us" and "we asked to disconnect."
+  `wifiDisconnectReasonName()` also now names `WIFI_REASON_ASSOC_LEAVE`,
+  `WIFI_REASON_HANDSHAKE_TIMEOUT`, `WIFI_REASON_AUTH_EXPIRE`, and
+  `WIFI_REASON_BEACON_TIMEOUT` explicitly (previously only
+  `NO_AP_FOUND`/`TIMEOUT` were named; everything else fell back to a bare
+  numeric code).
+- **Heartbeat log spam reduced**: the full sanitized credential/Wi-Fi-scan
+  summary no longer repeats every 15s heartbeat while offline (nothing in
+  it changes between repeats - the scan itself runs once per boot); it
+  now repeats at most every 2 minutes. The terse heartbeat line gained
+  `rssi=<dBm>` so signal strength stays visible at the normal cadence.
+- **Boot reset-reason diagnostic** (`previous_reset=...`, already present
+  since the original 3B.8 pass) now names an unrecognized
+  `esp_reset_reason_t` value as `unknown` rather than `other`, matching
+  this pass's intent precisely: distinguishing power-on/software/panic/
+  watchdog/brownout resets from "we don't know" - never expands into a
+  full stack/memory dump, and never logs anything sensitive.
+
+### What is unchanged
+
+- **The outbox remains RAM-only** (`MemoryEventOutbox`) - a reboot while
+  an event is still queued still loses it. This pass fixes *ordinary*
+  connectivity-loss recovery so a reboot is no longer *necessary* for
+  that case; it does not add persistence. Durable (NVS/flash-backed)
+  outbox persistence remains explicitly out of scope here and is tracked
+  as future work in `CONTEXT.md` - wear, atomicity, corruption, capacity,
+  and credential-adjacent storage concerns all need their own review
+  before that is attempted.
+- **Event identity/ordering are untouched**: `RING_DETECTED`/`RING_ENDED`
+  JSON is still built and enqueued once, at the moment of the original
+  GPIO edge/timeout (see "Call session state machine" above) - a retry
+  during recovery only ever republishes the exact bytes already sitting
+  in the outbox, never reconstructs the payload with a new timestamp.
+  `event_id`/`call_id` are never regenerated on retry, and
+  `publishPendingEvents()`'s existing strict-FIFO ordering (see "Call
+  session state machine" > Publish ordering) is untouched by this pass -
+  an old, offline-queued event still reaches the backend for history even
+  after it is no longer fresh enough for a push notification; deciding
+  that is explicitly the backend's policy to apply, not something this
+  firmware invents.
+- **GPIO4/GPIO3, the call-session state machine, and
+  `DevCommandEnvironment`/command processing are completely untouched**
+  by this pass - only the Wi-Fi/MQTT connectivity recovery layer changed.
+
+### Validation
+
+- All pre-existing native suites continue to pass unchanged (26 → 30
+  tests in `test/test_dev_mqtt_state`, covering: a success signal that
+  never resolves to a real connection eventually retries instead of
+  wedging; a momentary reconnect-then-drop never resets the Wi-Fi backoff
+  growth; only a full stable success resets it; and the ordinary Wi-Fi
+  retry is never suppressed by an active recovery cooldown, which exists
+  only to gate *escalating* to a second forced full recovery).
+- `esp32-c3`, `esp32-c3-dev-mqtt`, and `esp32-c3-dev-ring-simulator` all
+  compile against the real ESP32-C3 toolchain (confirms the newly
+  referenced `WIFI_REASON_*` constants and `WiFi.setAutoReconnect()` are
+  valid for the pinned `espressif32`/Arduino core version).
+- **Not yet re-validated on real hardware.** The next physical test must
+  reproduce a comparable connectivity loss (e.g. briefly power off the
+  AP/router, or move the device out of range and back) without rebooting
+  the ESP32, and confirm autonomous recovery - see the updated manual
+  procedure below.
+
+### Manual test addition: connectivity recovery (pending real-hardware run)
+
+Extends the existing manual procedures above; run after a normal boot has
+already reached `Online`.
+
+1. Note the current `local_status=online` heartbeat line, then interrupt
+   connectivity without touching the ESP32 itself - power off the Wi-Fi
+   AP/router, or block the configured AWS IoT endpoint at the network
+   level, for at least a few minutes.
+2. Confirm the device logs a state regression (`state online -> ...`),
+   Wi-Fi disconnect/reassociation attempts with `origin=` on each one, and
+   - if the interruption lasts long enough to accumulate three
+     connectivity failures - a `wifi recovery requested` /
+     `wifi disconnect requested origin=local_recovery` cycle.
+3. While still interrupted, trigger a GPIO4 pulse (and optionally a GPIO3
+   pulse). Confirm the resulting event(s) are enqueued
+   (`outbox_size` increases in the heartbeat line) even though nothing
+   can be published yet.
+4. Restore connectivity (power the AP back on, unblock the endpoint) -
+   **do not power-cycle or reset the ESP32**.
+5. Confirm the device recovers on its own: Wi-Fi reassociates, `got_ip`
+   is logged (distinctly from the earlier `associated awaiting_ip=true`),
+   DNS/MQTT re-establish, `network stable; wifi retry backoff reset` is
+   logged, and the queued event(s) from step 3 are published
+   (`outbox_size` returns to 0) with their **original** `event_id`s and
+   `call_id`(s) - confirm on the backend/AWS IoT side that the
+   `RING_DETECTED`/`RING_ENDED` payloads that eventually arrive still
+   carry the timestamp from when the GPIO pulse actually happened, not
+   from the moment connectivity was restored.
+6. Only as a separate, explicit sub-case: power-cycle or reset the ESP32
+   while an event is still genuinely queued (before step 4). Confirm the
+   boot log's `previous_reset=` line, and confirm that queued event is
+   lost (`outbox_size=0` after boot with no corresponding publish) -
+   this is the documented, unchanged RAM-only outbox limitation, not a
+   new regression.

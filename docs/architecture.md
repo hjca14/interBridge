@@ -420,6 +420,30 @@ hardware and system-control dependencies are explicitly non-actuating. Ignored D
 credentials live only in a transient `MemoryStore`; this is not reboot persistence.
 Production NVS, BLE/Fleet Provisioning, and onboarding remain pending.
 
+**Connectivity recovery hardening** (both `esp32-c3-dev-mqtt` and
+`esp32-c3-dev-ring-simulator`): a real bench run showed the device connect
+successfully, then never recover from a later connectivity loss without a
+manual reboot - see `docs/dev-ring-simulator.md` > "Connectivity recovery
+hardening" for the full sanitized log and root-cause writeup. Two
+compounding causes, both fixed: `ARDUINO_EVENT_WIFI_STA_CONNECTED` (L2
+association only) was forwarded to `DevMqttSmokeState` as a full success
+signal identically to `..._GOT_IP`, which - combined with a latent
+`DevMqttSmokeState` bug where a success signal cleared the in-flight
+attempt with no further safeguard - could permanently strand the state
+machine in `WaitingForWifi` if `wifiConnected` never actually became true
+afterward; and the ESP32 Arduino core's own Wi-Fi auto-reconnect (on by
+default) was racing, uncoordinated, against `DevMqttSmokeState`'s own
+retry cadence. `DevMqttSmokeState` now has a bounded "awaiting confirmed
+connect" window that can never wedge again regardless of what a caller
+forwards, and a dedicated Wi-Fi reconnection backoff (separate from the
+unchanged per-stage DNS/Time/MQTT ladder) that grows only on a failed
+reconnect attempt and resets only on a full stable success - never merely
+by re-entering `WaitingForWifi`. Both entry points now only treat
+`GOT_IP` as success, call `WiFi.setAutoReconnect(false)`, and label each
+disconnect's origin (self-requested vs. not) in its log line. The outbox
+remains RAM-only - this hardening removes the need for a reboot on
+*ordinary* connectivity loss, it does not add persistence.
+
 ## DEV physical ring simulator isolation (Phase 3B.8)
 
 `src/dev/dev_ring_simulator_main.cpp` is compiled only by

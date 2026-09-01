@@ -222,6 +222,28 @@ runs. Not yet validated on real hardware - see
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Call session
 state machine".
 
+A subsequent pass hardens connectivity recovery after a real bench run
+connected successfully, then never recovered from a later connectivity
+loss without a manual reboot. Root cause: `ARDUINO_EVENT_WIFI_STA_CONNECTED`
+(L2 association only, before DHCP) was forwarded as a full success signal
+identically to `..._GOT_IP`, which - combined with a latent
+`DevMqttSmokeState` bug where a success signal cleared the in-flight
+attempt with no further safeguard - could permanently strand the
+connectivity state machine if a real IP was never actually obtained
+afterward; separately, the ESP32 Arduino core's own Wi-Fi auto-reconnect
+(on by default) was racing, uncoordinated, against this firmware's own
+retry cadence. Fixed: `DevMqttSmokeState` gained a bounded confirmation
+window that can never wedge again regardless of what a caller forwards,
+plus a dedicated Wi-Fi reconnection backoff (separate from the unchanged
+DNS/Time/MQTT ladder) that only resets on a full stable success; both DEV
+entry points now only treat `GOT_IP` as success, disable the driver's
+auto-reconnect, and label each disconnect's origin (self-requested vs.
+not). The outbox stays RAM-only - this removes the need for a reboot on
+*ordinary* connectivity loss, it does not add persistence. Not yet
+re-validated on real hardware - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Connectivity
+recovery hardening".
+
 ## Si3050/Si3011-19 firmware foundation (Phase 3A + 3B.2 PCM clock)
 
 `src/intercom/si3050/` is a hardware-independent, natively-tested
