@@ -43,3 +43,11 @@ those files for the full record of 3B.1-3B.2.
   selected provisionally. That history does not establish the Linker Button's
   electrical behavior or GPIO4 as a production choice.
 - Historical firmware phase numbers are never renumbered by this document.
+- A later, still bench-only pass extended the 3B.8 DEV ring simulator to
+  simulate a complete call session rather than only its start: a second
+  input (GPIO3) now simulates the call's end and publishes `RING_ENDED`,
+  correlated with GPIO4's `RING_DETECTED` by a shared `call_id` - see
+  `docs/dev-ring-simulator.md` > "Call session state machine". This is
+  native-tested only and has not been exercised on real hardware; it does
+  not reopen or change 3B.8's own GPIO4-only hardware validation recorded
+  above, and does not get its own phase number.

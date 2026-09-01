@@ -708,6 +708,7 @@ Where applicable:
 ```text
 device_id
 event_id
+call_id
 command_id
 timestamp
 uptime_ms
@@ -722,6 +723,16 @@ the example in section 18. This is a deliberate asymmetry, not an
 inconsistency: prefixes exist so a human/log reader can tell at a glance
 what generated an ID, and only the device generates `device_id`/
 `event_id`. Custom JSON payloads must not exceed 8 KiB.
+
+`call_id` (firmware-generated, prefix `call-`, same 32-lowercase-hex
+encoding) correlates two events that describe the same call session,
+currently `RING_DETECTED` and `RING_ENDED` (section 16.1) - it is omitted
+entirely from every event that isn't part of a call session, exactly like
+`event_id`/`timestamp` are omitted when not meaningful. `event_id`
+identifies one specific message; `call_id` identifies the session that
+message belongs to. The two are never interchangeable and a `RING_ENDED`
+must never reuse its own session's `RING_DETECTED` `event_id` as if it
+were the same message.
 
 `device_id` inside JSON is diagnostic information only. Authorization comes from AWS IoT certificate/policy/Thing context.
 
@@ -787,6 +798,7 @@ Initial vocabulary:
 
 ```text
 RING_DETECTED
+RING_ENDED
 OFF_HOOK
 ON_HOOK
 CALL_STARTED
@@ -805,6 +817,64 @@ ERROR
 
 Do not emit events whose real semantic source is not implemented yet.
 
+### 16.1 `RING_DETECTED` / `RING_ENDED` and `call_id`
+
+`RING_DETECTED` and `RING_ENDED` together describe one call session, from
+the ring signal's start to its end. **`RING_ENDED` is a proposed
+extension of this vocabulary, not yet coordinated with the backend** -
+it currently only has a producer in the bench-only DEV ring simulator
+(`esp32-c3-dev-ring-simulator`, see `docs/dev-ring-simulator.md` >
+"Call session state machine"), never in production firmware. It is
+recorded here, rather than left undocumented, so the backend has one
+authoritative shape to implement against instead of reverse-engineering
+it from firmware source.
+
+```json
+{
+  "protocol_version": 1,
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
+  "event_id": "evt-12345678900000000000000000000001",
+  "call_id": "call-99999999999999999999999999999999",
+  "event": "RING_DETECTED",
+  "timestamp": "2026-08-11T17:30:25Z",
+  "uptime_ms": 123456
+}
+```
+
+```json
+{
+  "protocol_version": 1,
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
+  "event_id": "evt-12345678900000000000000000000002",
+  "call_id": "call-99999999999999999999999999999999",
+  "event": "RING_ENDED",
+  "timestamp": "2026-08-11T17:31:10Z",
+  "uptime_ms": 168456
+}
+```
+
+Rules:
+
+- `RING_DETECTED` always creates a brand-new `call_id` and always has its
+  own `event_id`.
+- `RING_ENDED` always reuses the exact `call_id` of the `RING_DETECTED`
+  that started the same session, and always has a **different**
+  `event_id` from it - the two are always two distinct messages, never
+  one message republished under a second name.
+- Backend correlation of a call session must use `call_id`, never
+  `event_id` and never timestamp proximity alone (clock skew, replay, or
+  network reordering can all break a timestamp-only correlation).
+- A `RING_ENDED` must never be treated as valid, or considered for
+  notification purposes, ahead of its own session's `RING_DETECTED` -
+  the firmware-side outbox guarantees enqueue/publish order per session
+  (see `docs/dev-ring-simulator.md`), but backend ingestion should not
+  assume delivery order is otherwise guaranteed by the transport itself.
+- There is currently no coordinated wire field for *why* a `RING_ENDED`
+  happened (a physical hang-up vs. a DEV-only safety timeout, see
+  `docs/dev-ring-simulator.md`); the DEV simulator keeps that reason in
+  its own local log only, and does not invent an uncoordinated field for
+  it.
+
 ---
 
 ## 17. Event Reliability / Outbox
@@ -817,6 +887,7 @@ Candidate replayable events:
 
 ```text
 RING_DETECTED
+RING_ENDED
 CALL_STARTED
 CALL_ENDED
 DOOR_OPENED

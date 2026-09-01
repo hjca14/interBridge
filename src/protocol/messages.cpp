@@ -8,6 +8,7 @@ namespace interbridge {
 const char* toString(ProtocolEventName event) {
     switch (event) {
         case ProtocolEventName::RingDetected: return "RING_DETECTED";
+        case ProtocolEventName::RingEnded: return "RING_ENDED";
         case ProtocolEventName::OffHook: return "OFF_HOOK";
         case ProtocolEventName::OnHook: return "ON_HOOK";
         case ProtocolEventName::CallStarted: return "CALL_STARTED";
@@ -128,6 +129,9 @@ std::string DeviceEvent::toJson() const {
     doc["event"] = toString(event);
     if (!eventId.empty()) {
         doc["event_id"] = eventId;
+    }
+    if (!callId.empty()) {
+        doc["call_id"] = callId;
     }
     if (!timestamp.empty()) {
         doc["timestamp"] = timestamp;

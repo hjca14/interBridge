@@ -1632,6 +1632,53 @@ this pass:)*
   accumulate capabilities from the other DEV environments. GPIO4/
   `RING_DETECTED` remains only a temporary DEV substitute for the real
   Si3050-based ring detector, not a production mechanism.
+- **Call-session extension of the 3B.8 DEV ring simulator: GPIO3 now
+  simulates the end of the same simulated call (`RING_ENDED`), correlated
+  with GPIO4's `RING_DETECTED` by a new, shared `call_id`.** Following the
+  DEV environment evolution rule directly above, this keeps every
+  previously-validated capability (Wi-Fi/NTP/MQTT, health, command
+  processing via `DevCommandEnvironment`) intact and adds a minimal
+  `Idle`/`Ringing` state machine on top, owned by (the now two-button)
+  `DevRingEventCoordinator` (`src/dev/dev_ring_event.h/.cpp`): a GPIO4
+  pulse in `Idle` generates a new `call_id` and enqueues `RING_DETECTED`;
+  a GPIO3 pulse in `Ringing`, or a DEV-only safety timeout
+  (`kDevCallTimeoutMs`, 60s default, aligned with the app's own
+  ring-timeout fallback) if GPIO3 never pulses, enqueues `RING_ENDED`
+  reusing that exact `call_id` and returns to `Idle`. A GPIO3 pulse with
+  no active call, and a second GPIO4 pulse while already `Ringing`, are
+  both explicitly ignored (no new event, no state change) rather than
+  silently mis-tracked. `protocol/messages.h/.cpp` gained
+  `ProtocolEventName::RingEnded` and an optional `DeviceEvent::callId`
+  (omitted from the JSON, and therefore fully retrocompatible, for every
+  event that isn't part of a call session);
+  `docs/communication-protocol.md` section 16.1 records `RING_ENDED`/
+  `call_id` as a **proposed**, not yet backend-coordinated, extension.
+  GPIO3 is a second, equally provisional DEV-only overlap - this time
+  with `kSi3050PinPcmDtx` (DTX) - justified for exactly the same reason
+  as GPIO4/DRX (`esp32-c3-dev-ring-simulator` never compiles or
+  initializes Si3050 code, and no Si3050 is attached while it runs), with
+  the same compile-time-asserted single-approved-pin guard in
+  `dev_ring_simulator_config.h`. A genuine, previously-latent ordering bug
+  was found and fixed while implementing this: `publishPendingEvents()`
+  (`src/dev/dev_ring_event.cpp`) used to keep iterating past a failed
+  publish, which could have let a later-enqueued `RING_ENDED` publish
+  successfully ahead of an earlier-enqueued `RING_DETECTED` still stuck at
+  the front of the outbox after a failed retry attempt for it specifically
+  - it now stops at the first failed publish, preserving strict FIFO
+  publish order. Proven by 16 native tests in a rewritten
+  `test/test_dev_ring_event` (state machine transitions/ignored edges,
+  `event_id`/`call_id` distinctness and reuse, debounce on both GPIOs, the
+  GPIO3-vs-timeout race producing only one `RING_ENDED`, the publish-order
+  fix, and restart always starting `Idle`) - all pre-existing native
+  suites are unaffected. **Not yet exercised on real hardware**: no real
+  GPIO3 pulse, `RING_ENDED` publish, or backend/app handling of
+  `RING_ENDED`/`call_id` has been performed - see
+  `docs/dev-ring-simulator.md` > "Call session addition
+  (GPIO3/`RING_ENDED`/`call_id`): not yet hardware-validated" for exactly
+  what remains open, and its "Call session manual test procedure" for the
+  pending runbook. This does not claim the Si3050 was tested, that a real
+  intercom line's ring end was detected, that the Linker Button was
+  validated, or that GPIO3/GPIO4 are final production pins.
 
 ## Future Work
 

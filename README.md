@@ -202,6 +202,26 @@ hardware - see
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Command
 processing (Phase 3B.8 cumulative pass)".
 
+A further pass evolves this environment to simulate a complete call
+session rather than only its start. **GPIO4 still only ever starts** a
+simulated call (`RING_DETECTED`); **GPIO3 now simulates that same call's
+end** (`RING_ENDED`), wired the same way (external ~10 kΩ resistor to
+GND, momentary pulse to 3V3) as the already-validated GPIO4 test. Both
+events share one `call_id`, generated fresh per session; each still gets
+its own `event_id`. A minimal `Idle`/`Ringing` state machine
+(`DevRingEventCoordinator`, `src/dev/dev_ring_event.*`) rejects a GPIO3
+pulse with no active call and a second GPIO4 pulse while already
+Ringing, and a configurable DEV-only safety timeout (60s default) ends a
+session automatically if GPIO3 never pulses. Both events still go
+through the exact same outbox/retry/`Esp32AwsIotTransport` path as
+`RING_DETECTED` always has - no parallel MQTT path. GPIO3 is a new,
+deliberate, explicit DEV-only overlap with the Si3050's DTX pin, safe for
+the same reason GPIO4's DRX overlap is: this isolated environment never
+compiles or initializes Si3050 code and no Si3050 is attached while it
+runs. Not yet validated on real hardware - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Call session
+state machine".
+
 ## Si3050/Si3011-19 firmware foundation (Phase 3A + 3B.2 PCM clock)
 
 `src/intercom/si3050/` is a hardware-independent, natively-tested

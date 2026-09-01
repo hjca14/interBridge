@@ -64,4 +64,45 @@ static_assert(kDevRingButtonPin != kSi3050ReservedPinBoot && kDevRingButtonPin !
                   kDevRingButtonPin != kSi3050ReservedPinUsbDPlus,
               "DEV ring simulator button GPIO must never collide with BOOT/USB pins");
 
+// This pass (call-session simulator): a second bench-only momentary input
+// simulates the *end* of the same simulated call (RING_ENDED), correlated
+// with the RING_DETECTED produced by kDevRingButtonPin above via a shared
+// call_id - see docs/dev-ring-simulator.md > "Call session state machine".
+//
+// The same pin-survey constraints from kDevRingButtonPin's own comment
+// apply unchanged: this board exposes only GPIO 0-10 and 18-21; 2/8/9 are
+// BOOT/strapping, 18/19 are the native USB D-/D+ serial console pair, and
+// 20/21 remain avoided per the GPIO20 Wi-Fi-drop investigation recorded in
+// "Bench test history" (inconclusive root cause, avoided out of caution,
+// not because GPIO20/21 themselves were confirmed at fault). That leaves
+// the same class of choice as GPIO4 did: a deliberate, explicit overlap
+// with one more real Si3050 pin.
+//
+// The chosen pin is GPIO3 (kSi3050PinPcmDtx, the Si3050's DTX line,
+// Si3050 -> ESP). This is safe for exactly the same reason GPIO4/DRX is
+// safe, and for no other reason: esp32-c3-dev-ring-simulator never
+// compiles or initializes any Si3050/RingDetector/PCM-clock code (see
+// "Scope and safety" in docs/dev-ring-simulator.md), and no Si3050 is
+// physically attached to the board while this bench environment runs. It
+// is NOT a production pin assignment, does not authorize simultaneous
+// button/DTX use, and must be revisited once the Si3050 and the final
+// board (with the real config/reset button) are integrated together -
+// same caveat as kDevRingButtonPin above.
+//
+// This is a bench-only DEV-simulator addition, not a real end-of-call
+// detector: nothing here reads the intercom line, DTMF, or any Si3050
+// signal. See CONTEXT.md > Open Questions for the pending final-board
+// pin decision.
+constexpr uint8_t kDevRingEndButtonPin = kSi3050PinPcmDtx;
+
+static_assert(kDevRingEndButtonPin == kSi3050PinPcmDtx,
+              "DEV ring simulator end-of-call button GPIO must be the one explicitly-approved Si3050 overlap "
+              "(GPIO3/kSi3050PinPcmDtx) - see this header's own comment above for why only this specific "
+              "overlap is considered safe");
+static_assert(kDevRingEndButtonPin != kSi3050ReservedPinBoot && kDevRingEndButtonPin != kSi3050ReservedPinUsbDMinus &&
+                  kDevRingEndButtonPin != kSi3050ReservedPinUsbDPlus,
+              "DEV ring simulator end-of-call button GPIO must never collide with BOOT/USB pins");
+static_assert(kDevRingEndButtonPin != kDevRingButtonPin,
+              "DEV ring simulator start (GPIO4) and end (GPIO3) buttons must never share the same pin");
+
 } // namespace interbridge

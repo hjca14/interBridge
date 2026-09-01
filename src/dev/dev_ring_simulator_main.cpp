@@ -45,6 +45,19 @@
 // existing IEventOutbox contract - see DevRingEventCoordinator/
 // publishPendingEvents (src/dev/dev_ring_event.*).
 //
+// This pass (call-session simulator): GPIO4 still only ever starts a
+// simulated call (RING_DETECTED), and GPIO3 now simulates that same
+// call's end (RING_ENDED), correlated by a shared call_id - a minimal
+// two-state (Idle/Ringing) machine owned by DevRingEventCoordinator, plus
+// a DEV-only kDevCallTimeoutMs safety timeout so a simulated call can
+// never remain Ringing forever if GPIO3 never pulses. This is still
+// exclusively a bench/DEV convenience for exercising
+// firmware -> MQTT -> backend -> push -> app: neither GPIO simulates real
+// intercom-line ringing/off-hook/audio, and neither the Si3050 nor the
+// Linker Button module is validated by this environment - see
+// docs/dev-ring-simulator.md > "Call session state machine" and
+// dev_ring_simulator_config.h for the full pin rationale.
+//
 // Cumulative DEV integration pass: this environment now also subscribes to
 // the commands topic and processes them through DevCommandEnvironment (see
 // dev_command_environment.h) - the exact same
@@ -107,18 +120,24 @@ private:
     NtpSyncState syncState_;
 };
 
-// Reads the physical button. The bench component actually wired here is
-// a "Linker Button" module (PCB with VCC/GND/SIG, not a bare dry-contact
-// switch): its own documentation states SIG=LOW when released and
-// SIG=HIGH when pressed - the opposite polarity of a dry contact pulled
-// up internally and grounded on press, which an earlier version of this
-// file incorrectly assumed (INPUT_PULLUP + active-low). Plain INPUT (no
-// internal pull-up/pull-down - the module actively drives the pin both
-// ways) + active-high matches the module's real datasheet behavior. See
-// docs/dev-ring-simulator.md > Wiring diagram.
+// Reads one of the two DEV bench inputs (GPIO4 "start"/GPIO3 "end" - see
+// dev_ring_simulator_config.h). Both are wired the same way: normally LOW
+// through an external ~10 kOhm resistor to GND, pulsed momentarily to
+// 3V3 - the exact scheme the successful GPIO4 hardware validation used
+// (see docs/dev-ring-simulator.md > Bench test history). Plain INPUT (no
+// internal pull-up/pull-down - the external resistor already defines the
+// resting level) + active-high. This class is intentionally pin-agnostic
+// so the same code path is exercised for both buttons; an earlier version
+// of this file also documented an alternative "Linker Button" module
+// wiring for GPIO4 (VCC/GND/SIG, self-driven both ways) - that module is
+// still not validated and is not what this class assumes today.
 class Esp32DevRingButtonInput final : public IDevRingButtonInput {
 public:
-    bool isPressed() override { return digitalRead(kDevRingButtonPin) == HIGH; }
+    explicit Esp32DevRingButtonInput(uint8_t pin) : pin_(pin) {}
+    bool isPressed() override { return digitalRead(pin_) == HIGH; }
+
+private:
+    uint8_t pin_;
 };
 
 AwsIotConnectionConfig connectionConfig() {
@@ -139,9 +158,16 @@ MemoryStore devStore;
 DeviceCredentialStore credentials(devStore);
 Esp32RandomSource randomSource;
 MemoryEventOutbox eventOutbox;
-Esp32DevRingButtonInput buttonInput;
-DevRingButtonController buttonController(buttonInput);
-DevRingEventCoordinator ringCoordinator(buttonController, randomSource, eventOutbox, INTERBRIDGE_DEV_DEVICE_ID);
+// GPIO4 (start of a simulated call, RING_DETECTED) and GPIO3 (end of the
+// same simulated call, RING_ENDED) - see dev_ring_simulator_config.h for
+// the full pin rationale and docs/dev-ring-simulator.md > "Call session
+// state machine" for the two-state coordinator both feed into.
+Esp32DevRingButtonInput startButtonInput(kDevRingButtonPin);
+Esp32DevRingButtonInput endButtonInput(kDevRingEndButtonPin);
+DevRingButtonController startButtonController(startButtonInput);
+DevRingButtonController endButtonController(endButtonInput);
+DevRingEventCoordinator ringCoordinator(startButtonController, endButtonController, randomSource, eventOutbox,
+                                        INTERBRIDGE_DEV_DEVICE_ID);
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 Esp32AwsIotTransport transport(connectionConfig(), credentials);
 // Shared DEV command-processing composition (InMemoryDedupCache/
@@ -389,12 +415,18 @@ void setup() {
     WiFi.onEvent(onWifiEvent);
     logWifiConfigAndScanSummary(millis());
 
-    // No internal pull-up: the Linker Button module actively drives SIG
-    // both ways (LOW released, HIGH pressed) - see
-    // Esp32DevRingButtonInput's doc comment.
+    // No internal pull-up/pull-down: each external ~10 kOhm resistor to
+    // GND already defines the resting LOW level - see
+    // Esp32DevRingButtonInput's doc comment. Enabling an internal pull
+    // here would fight that external resistor rather than complement it.
     pinMode(kDevRingButtonPin, INPUT);
-    Serial.printf("[DEV RING] button initialized gpio=%u mode=INPUT active=high module=linker\n",
+    Serial.printf("[DEV RING] start button initialized gpio=%u mode=INPUT active=high rig=external_pulldown_10k "
+                  "role=call_start\n",
                   static_cast<unsigned>(kDevRingButtonPin));
+    pinMode(kDevRingEndButtonPin, INPUT);
+    Serial.printf("[DEV RING] end button initialized gpio=%u mode=INPUT active=high rig=external_pulldown_10k "
+                  "role=call_end\n",
+                  static_cast<unsigned>(kDevRingEndButtonPin));
 
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
@@ -534,9 +566,43 @@ void loop() {
     // independent of connectivity state - a press while offline still
     // enqueues (see DevRingEventCoordinator::update()) and is replayed
     // once the outbox drain below can reach the broker again.
-    std::string eventId = ringCoordinator.update(now, clockSource.hasValidTime(), clockSource.unixTimeSeconds());
-    if (!eventId.empty()) {
-        Serial.println("[DEV RING] valid press detected; RING_DETECTED enqueued");
+    const DevCallSessionOutcome outcome =
+        ringCoordinator.update(now, clockSource.hasValidTime(), clockSource.unixTimeSeconds());
+    bool eventEnqueuedThisLoop = false;
+    switch (outcome.kind) {
+        case DevCallSessionEventKind::RingDetected:
+            eventEnqueuedThisLoop = true;
+            Serial.printf("[DEV RING] valid start detected on GPIO%u; RING_DETECTED enqueued call_id=%s\n",
+                          static_cast<unsigned>(kDevRingButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::RingEndedByButton:
+            eventEnqueuedThisLoop = true;
+            Serial.printf("[DEV RING] valid end detected on GPIO%u; RING_ENDED enqueued call_id=%s\n",
+                          static_cast<unsigned>(kDevRingEndButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::RingEndedByTimeout:
+            eventEnqueuedThisLoop = true;
+            // The timeout reason is deliberately local-log-only, not a
+            // wire payload field: docs/communication-protocol.md does not
+            // yet define one, and this DEV simulator must not invent a
+            // field the backend was never coordinated on - see
+            // docs/dev-ring-simulator.md > "Call session state machine" >
+            // Safety timeout.
+            Serial.printf("[DEV RING] call timed out after %lums with no GPIO%u pulse; RING_ENDED enqueued "
+                          "call_id=%s reason=timeout(local-only)\n",
+                          static_cast<unsigned long>(kDevCallTimeoutMs), static_cast<unsigned>(kDevRingEndButtonPin),
+                          outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::StartIgnoredAlreadyRinging:
+            Serial.printf("[DEV RING] GPIO%u press ignored; call_id=%s already active\n",
+                          static_cast<unsigned>(kDevRingButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::EndIgnoredNoActiveCall:
+            Serial.printf("[DEV RING] GPIO%u press ignored; no active call\n",
+                          static_cast<unsigned>(kDevRingEndButtonPin));
+            break;
+        case DevCallSessionEventKind::None:
+            break;
     }
 
     if (transport.isConnected()) {
@@ -553,7 +619,7 @@ void loop() {
         // Logged at heartbeat cadence too, but an explicit line right
         // after a fresh enqueue makes the "waiting for reconnection"
         // state obvious without waiting up to 15s for the heartbeat.
-        if (!eventId.empty()) {
+        if (eventEnqueuedThisLoop) {
             Serial.println("[DEV RING] offline; event queued, awaiting reconnection");
         }
     }

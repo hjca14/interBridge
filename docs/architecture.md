@@ -430,15 +430,23 @@ those are linked into it. It reuses `DevMqttSmokeState` for connectivity
 bring-up (same Wi-Fi → DNS → NTP → MQTT cascade as the DEV MQTT smoke
 harness above) instead of duplicating it. Two hardware-independent,
 natively-tested classes carry the actual bench logic:
-`DevRingButtonController` (`src/dev/dev_ring_button.*`) debounces the
-physical button and emits a one-shot pulse only on the released-to-pressed
-edge; `DevRingEventCoordinator` + `publishPendingEvents()`
-(`src/dev/dev_ring_event.*`) turn that pulse into a `RING_DETECTED`
-`DeviceEvent`, enqueue it into a `MemoryEventOutbox`, and drain that
-outbox against `Esp32AwsIotTransport`/`MqttTopics::eventsIngest()` exactly
-like `main.cpp`'s production outbox loop - the same `event_id` survives
-any retry or offline period. See `docs/dev-ring-simulator.md` for the
-wiring, GPIO rationale, and manual test procedure.
+`DevRingButtonController` (`src/dev/dev_ring_button.*`, reused for both
+GPIOs) debounces one physical input and emits a one-shot pulse only on
+the released-to-pressed edge; `DevRingEventCoordinator` +
+`publishPendingEvents()` (`src/dev/dev_ring_event.*`) own a minimal
+`Idle`/`Ringing` call-session state machine over two such buttons - a
+GPIO4 pulse in `Idle` generates a new `call_id` and enqueues
+`RING_DETECTED`; a GPIO3 pulse in `Ringing`, or a DEV-only safety
+timeout, enqueues `RING_ENDED` reusing that same `call_id` and returns
+to `Idle` - and drain the resulting `MemoryEventOutbox` against
+`Esp32AwsIotTransport`/`MqttTopics::eventsIngest()` exactly like
+`main.cpp`'s production outbox loop, publishing strictly in enqueue
+order so a `RING_ENDED` can never be published ahead of its own session's
+`RING_DETECTED`. The same `event_id`/`call_id` survive any retry or
+offline period. See `docs/dev-ring-simulator.md` > "Call session state
+machine" for the full state diagram, GPIO rationale, and manual test
+procedure - the GPIO3/`RING_ENDED` addition is native-tested only and not
+yet validated on real hardware, unlike the original GPIO4-only 3B.8 pass.
 
 `dev_ring_simulator_main.cpp`'s Wi-Fi event handler (`onWifiEvent()`),
 per-`DevSmokeAction` log lines, and boot diagnostics
