@@ -460,9 +460,14 @@ session state machine" above for the state machine itself and
   `loop()`. Every previously-existing capability in this file - Wi-Fi/NTP/
   MQTT bring-up, health reporting, `DevCommandEnvironment` command
   processing - is untouched.
-- `docs/communication-protocol.md`: documents `RING_ENDED`/`call_id` as a
-  proposed, retrocompatible extension (section 16.1), explicitly not yet
-  backend-coordinated.
+- `docs/communication-protocol.md`: documents the `RING_ENDED`/`call_id`
+  wire contract (section 16.1) as a retrocompatible extension. At the
+  time of this specific commit that contract was still only a firmware-
+  side proposal; it was subsequently coordinated with the backend
+  (`hjca14/interBackend#27`) and app (`hjca14/interapp#24`) - see section
+  16.1's "Cross-repo coordination and validation status" for the current
+  state, including which parts are still pending real-hardware
+  validation.
 
 **What did not change:** GPIO4's own electrical behavior, debounce
 constants, and `RING_DETECTED` payload shape (aside from the new optional
@@ -747,10 +752,13 @@ machine" above) is a separate, later, software-only pass:
   or `call_id` has been exercised - see "Call session manual test
   procedure (GPIO3 + GPIO4, pending real-hardware run)" above for the
   pending runbook.
-- `RING_ENDED` and `call_id` are, as of this pass, only defined in this
-  firmware repository and in `docs/communication-protocol.md` as a
-  **proposed** extension (section 16.1) - neither has been confirmed
-  against a real backend implementation.
+- `RING_ENDED` and `call_id` are a coordinated contract across firmware,
+  backend (`hjca14/interBackend#27`), and app (`hjca14/interapp#24`) -
+  see `docs/communication-protocol.md` section 16.1's "Cross-repo
+  coordination and validation status." Coordinated does not mean
+  hardware-validated: none of the three PRs have merged yet, all three
+  are still gated on the same shared, integrated validation round, and no
+  real `RING_ENDED` has yet reached a real backend or app.
 - GPIO3 is a second, equally provisional DEV-only overlay, this time with
   `kSi3050PinPcmDtx` (DTX), justified for exactly the same reason and
   under exactly the same constraints as GPIO4's DRX overlay above - see

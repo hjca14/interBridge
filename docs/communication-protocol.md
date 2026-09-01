@@ -820,14 +820,26 @@ Do not emit events whose real semantic source is not implemented yet.
 ### 16.1 `RING_DETECTED` / `RING_ENDED` and `call_id`
 
 `RING_DETECTED` and `RING_ENDED` together describe one call session, from
-the ring signal's start to its end. **`RING_ENDED` is a proposed
-extension of this vocabulary, not yet coordinated with the backend** -
-it currently only has a producer in the bench-only DEV ring simulator
-(`esp32-c3-dev-ring-simulator`, see `docs/dev-ring-simulator.md` >
-"Call session state machine"), never in production firmware. It is
-recorded here, rather than left undocumented, so the backend has one
-authoritative shape to implement against instead of reverse-engineering
-it from firmware source.
+the ring signal's start to its end. This contract is coordinated across
+all three repositories - firmware (this repo), backend
+(`hjca14/interBackend#27`), and app (`hjca14/interapp#24`) - though each
+side's own PR still depends on the shared, integrated validation round
+across all three before any of them merges; see "Cross-repo coordination
+and validation status" below for exactly what that does and does not
+confirm today. `RING_ENDED` currently only has a producer in the
+bench-only DEV ring simulator (`esp32-c3-dev-ring-simulator`, see
+`docs/dev-ring-simulator.md` > "Call session state machine"), never in
+production firmware - GPIO4/GPIO3 remain temporary DEV-only simulators
+of the ring start/end signal, not a production ring detector.
+
+`event_id` identifies one specific message; `call_id` identifies the
+call session and is shared between the `RING_DETECTED` and `RING_ENDED`
+that describe the same session (see section 14's `call_id` paragraph for
+the full identifier contract). The firmware publishes `RING_ENDED`; the
+backend processes it and forwards the call's end to the app; the app
+ends only the specific call session whose `call_id` matches - never by
+`event_id`, and never a different session that merely arrived around the
+same time.
 
 ```json
 {
@@ -874,6 +886,39 @@ Rules:
   `docs/dev-ring-simulator.md`); the DEV simulator keeps that reason in
   its own local log only, and does not invent an uncoordinated field for
   it.
+
+#### Cross-repo coordination and validation status
+
+The `RING_DETECTED`/`RING_ENDED`/`call_id` contract itself is coordinated
+across firmware, backend, and app - it is not this firmware repository's
+unilateral proposal. It is tracked by three still-open pull requests, one
+per repository, all still gated on the same shared, integrated validation
+round before any of them merges:
+
+```text
+firmware   hjca14/interBridge#23
+backend    hjca14/interBackend#27
+app        hjca14/interapp#24
+```
+
+What "coordinated" means here, precisely - and does not mean:
+
+- The wire shape (fields, semantics, `call_id`/`event_id` roles) is
+  agreed across all three sides, not just documented from the firmware's
+  side alone.
+- It does **not** mean any of the three have merged, deployed, or been
+  exercised together on real hardware/infrastructure yet.
+- **Still not validated on real hardware**: GPIO3/`RING_ENDED` itself
+  (native-tested only), the connectivity-recovery hardening in this same
+  firmware PR (native-tested and real-toolchain-compiled only), and the
+  complete updated call cycle end to end (firmware → MQTT → backend →
+  push → app) with a real `RING_ENDED` reaching the app. See
+  `docs/dev-ring-simulator.md` for exactly what each pass has and has not
+  exercised physically.
+- GPIO4 and GPIO3 remain temporary DEV-only bench simulators of the ring
+  signal's start and end, never a production pin assignment.
+- The Si3050 and the Linker Button module remain electrically
+  unvalidated - none of this coordination work tests either one.
 
 ---
 

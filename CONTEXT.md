@@ -1651,8 +1651,10 @@ this pass:)*
   `ProtocolEventName::RingEnded` and an optional `DeviceEvent::callId`
   (omitted from the JSON, and therefore fully retrocompatible, for every
   event that isn't part of a call session);
-  `docs/communication-protocol.md` section 16.1 records `RING_ENDED`/
-  `call_id` as a **proposed**, not yet backend-coordinated, extension.
+  `docs/communication-protocol.md` section 16.1 records the `RING_ENDED`/
+  `call_id` wire contract (at the time of this specific bullet, only a
+  firmware-side proposal - later coordinated with the backend and app,
+  see the follow-up bullet below).
   GPIO3 is a second, equally provisional DEV-only overlap - this time
   with `kSi3050PinPcmDtx` (DTX) - justified for exactly the same reason
   as GPIO4/DRX (`esp32-c3-dev-ring-simulator` never compiles or
@@ -1739,6 +1741,27 @@ this pass:)*
   hardening" for the full sanitized log, root-cause writeup, and the
   pending manual real-hardware retest procedure - **not yet re-validated
   on real hardware**.
+- **Documentation-only follow-up: the `RING_DETECTED`/`RING_ENDED`/
+  `call_id` contract is now coordinated across firmware, backend, and
+  app - no longer only a firmware-side proposal.** Three still-open pull
+  requests, one per repository, track it: `hjca14/interBridge#23` (this
+  one), `hjca14/interBackend#27`, and `hjca14/interapp#24` - all three
+  still gated on the same shared, integrated validation round before any
+  of them merges. `docs/communication-protocol.md` section 16.1 and
+  `docs/dev-ring-simulator.md` were updated to state this correctly
+  (previously they read as "proposed, not yet backend-coordinated," which
+  had gone stale). This is a documentation-only correction: no firmware
+  code, test, configuration, or behavior changed. Still true and
+  unchanged by this correction: `event_id` identifies one message,
+  `call_id` identifies the call session and is shared between a
+  `RING_DETECTED` and its `RING_ENDED`; the firmware publishes
+  `RING_ENDED`, the backend processes and forwards the call's end, and
+  the app ends only the session whose `call_id` matches; GPIO4/GPIO3
+  remain temporary DEV-only simulators, never a production pin
+  assignment; GPIO3/`RING_ENDED`, the connectivity-recovery hardening,
+  and the complete updated call cycle are all still **not validated on
+  real hardware**; and the Si3050 and Linker Button module remain
+  electrically unvalidated.
 
 ## Future Work
 
