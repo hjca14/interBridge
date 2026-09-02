@@ -4,7 +4,7 @@
 
 All PlatformIO environments are pinned to `platform-espressif32` **6.12.0**. Its resolved Arduino framework is **Arduino-ESP32 2.0.17**, built on **ESP-IDF 4.4.7**. Arduino-ESP32 2.0.17 ships the official `WiFiProv` wrapper; that wrapper calls ESP-IDF Wi-Fi Provisioning Manager, the BLE scheme and Protocomm. Therefore a mixed-framework migration and a proprietary GATT protocol are unnecessary for this slice.
 
-The upstream contracts consulted are PlatformIO's Espressif 32 6.12.0 release/package metadata, Arduino-ESP32 2.0.17 `WiFiProv` API/example, and ESP-IDF 4.4.7 Wi-Fi Provisioning Manager, Unified Provisioning and Protocomm Security 1 documentation. The isolated implementation selects `NETWORK_PROV_SCHEME_BLE`, `NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM` and `NETWORK_PROV_SECURITY_1`. The PoP is passed directly to the official wrapper and is never advertised or logged.
+The upstream contracts consulted are PlatformIO's Espressif 32 6.12.0 release/package metadata, Arduino-ESP32 2.0.17 `WiFiProv` API/example, and ESP-IDF 4.4.7 Wi-Fi Provisioning Manager, Unified Provisioning and Protocomm Security 1 documentation. The isolated implementation selects `WIFI_PROV_SCHEME_BLE`, `WIFI_PROV_SCHEME_HANDLER_FREE_BTDM` and `WIFI_PROV_SECURITY_1`, which are the identifiers exposed by the pinned headers. The PoP is passed directly to the official wrapper and is never advertised or logged.
 
 ## Frozen Android contract for the parallel PR
 
@@ -38,7 +38,7 @@ cp include/interbridge_ble_dev_secrets.example.h include/interbridge_ble_dev_sec
 pio run -e esp32-c3-dev-ble-provisioning
 ```
 
-This composition contains only the BLE adapter and DEV entry point. It excludes the production root, AWS/MQTT composition, Si3050 code, and GPIO3/GPIO4 call simulators, preserving all accumulated behavior. Logs contain only window/name/security mode, authenticated request observation, success/failure, disconnect and timeout—never PoP, SSID, Wi-Fi password, protobuf payload, or cryptographic material.
+This composition contains only the BLE adapter and DEV entry point. It excludes the production root, AWS/MQTT composition, Si3050 code, and GPIO3/GPIO4 call simulators, preserving all accumulated behavior. At timeout the adapter calls ESP-IDF 4.4.7's public `wifi_prov_mgr_deinit()` API from `wifi_provisioning/manager.h`; that API stops an active provisioning service and releases manager/scheme resources, while the selected `WIFI_PROV_SCHEME_HANDLER_FREE_BTDM` handler releases Bluetooth controller memory. The timeout therefore ends the real provisioning service rather than merely changing local state. Logs contain only window/name/security mode, authenticated request observation, success/failure, disconnect and timeout—never PoP, SSID, Wi-Fi password, protobuf payload, or cryptographic material.
 
 ## Physical validation still pending
 

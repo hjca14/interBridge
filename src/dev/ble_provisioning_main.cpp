@@ -43,6 +43,7 @@ void onWifiEvent(arduino_event_t* event) {
             break;
         case ARDUINO_EVENT_PROV_END:
             provisioning.notifyDisconnected();
+            windowOpen = false;
             Serial.println("[BLE] disconnected");
             break;
         default:

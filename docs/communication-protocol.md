@@ -485,6 +485,10 @@ Provisioning window:  5 minutes (from entering PROVISIONING_AVAILABLE)
 If the window elapses before reaching `PROVISIONED`, BLE advertising
 stops and the device returns to normal operation (`IDLE` if it was
 already provisioned before this attempt, `NOT_PROVISIONED` otherwise). A
+Phase 3C.1's pinned Arduino wrapper has no end method, so its adapter performs
+this shutdown through ESP-IDF's public `wifi_prov_mgr_deinit()` API; this stops
+the active provisioning service and releases its BLE scheme resources rather
+than only updating an application boolean. A
 failure at any single step does **not** require a reboot or a fresh
 button press to retry - the device recovers to `PROVISIONING_AVAILABLE`
 and keeps advertising as long as the overall window hasn't elapsed. This

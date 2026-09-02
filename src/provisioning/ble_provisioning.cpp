@@ -5,6 +5,7 @@
 
 #if defined(ARDUINO) && defined(INTERBRIDGE_DEV_BLE_PROVISIONING)
 #include <WiFiProv.h>
+#include <wifi_provisioning/manager.h>
 #endif
 
 namespace interbridge {
@@ -30,8 +31,8 @@ bool Esp32BleProvisioning::startAdvertising(const BleAdvertisementInfo& info, co
     if (securityMode_ != BleSecurityMode::Security1 || info.deviceName.empty() || proofOfPossession.empty()) {
         return false;
     }
-    WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
-                            NETWORK_PROV_SECURITY_1, proofOfPossession.c_str(),
+    WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
+                            WIFI_PROV_SECURITY_1, proofOfPossession.c_str(),
                             info.deviceName.c_str());
     advertising_ = true;
     return true;
@@ -44,7 +45,11 @@ bool Esp32BleProvisioning::startAdvertising(const BleAdvertisementInfo& info, co
 
 void Esp32BleProvisioning::stopAdvertising() {
 #if defined(ARDUINO) && defined(INTERBRIDGE_DEV_BLE_PROVISIONING)
-    WiFiProv.endProvision();
+    // Arduino-ESP32 2.0.17 has no WiFiProv end method. This public ESP-IDF
+    // manager API stops an active provisioning service before releasing the
+    // manager and scheme resources. With WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
+    // deinitialization also releases the Bluetooth controller memory.
+    wifi_prov_mgr_deinit();
 #endif
     advertising_ = false;
     sessionActive_ = false;
