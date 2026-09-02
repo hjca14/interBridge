@@ -1,3 +1,5 @@
+#if defined(INTERBRIDGE_DEV_BLE_PROVISIONING)
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_system.h>
@@ -74,3 +76,5 @@ void loop() {
     }
     delay(20);
 }
+
+#endif // INTERBRIDGE_DEV_BLE_PROVISIONING
