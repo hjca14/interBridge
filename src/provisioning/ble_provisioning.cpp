@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <cctype>
 
+#if defined(ARDUINO) && defined(INTERBRIDGE_DEV_BLE_PROVISIONING)
+#include <WiFiProv.h>
+#endif
+
 namespace interbridge {
 
 BleAdvertisementInfo buildBleAdvertisementInfo(const std::string& deviceId) {
@@ -19,17 +23,31 @@ BleAdvertisementInfo buildBleAdvertisementInfo(const std::string& deviceId) {
 }
 
 Esp32BleProvisioning::Esp32BleProvisioning(BleSecurityMode requestedMode)
-    : securityMode_(requestedMode), advertising_(false) {}
+    : securityMode_(requestedMode), advertising_(false), sessionActive_(false) {}
 
 bool Esp32BleProvisioning::startAdvertising(const BleAdvertisementInfo& info, const std::string& proofOfPossession) {
+#if defined(ARDUINO) && defined(INTERBRIDGE_DEV_BLE_PROVISIONING)
+    if (securityMode_ != BleSecurityMode::Security1 || info.deviceName.empty() || proofOfPossession.empty()) {
+        return false;
+    }
+    WiFiProv.beginProvision(NETWORK_PROV_SCHEME_BLE, NETWORK_PROV_SCHEME_HANDLER_FREE_BTDM,
+                            NETWORK_PROV_SECURITY_1, proofOfPossession.c_str(),
+                            info.deviceName.c_str());
+    advertising_ = true;
+    return true;
+#else
     (void)info;
     (void)proofOfPossession;
-    // TODO: not implemented. See CONTEXT.md > Open Questions.
     return false;
+#endif
 }
 
 void Esp32BleProvisioning::stopAdvertising() {
+#if defined(ARDUINO) && defined(INTERBRIDGE_DEV_BLE_PROVISIONING)
+    WiFiProv.endProvision();
+#endif
     advertising_ = false;
+    sessionActive_ = false;
 }
 
 bool Esp32BleProvisioning::isAdvertising() const {
@@ -37,8 +55,7 @@ bool Esp32BleProvisioning::isAdvertising() const {
 }
 
 bool Esp32BleProvisioning::isSessionActive() const {
-    // TODO: not implemented. See CONTEXT.md > Open Questions.
-    return false;
+    return sessionActive_;
 }
 
 BleSecurityMode Esp32BleProvisioning::securityMode() const {
@@ -46,18 +63,27 @@ BleSecurityMode Esp32BleProvisioning::securityMode() const {
 }
 
 std::optional<WifiCredentialsPayload> Esp32BleProvisioning::pollReceivedCredentials() {
-    // TODO: not implemented. See CONTEXT.md > Open Questions.
-    return std::nullopt;
+    auto result = receivedCredentials_;
+    receivedCredentials_.reset();
+    return result;
 }
 
+void Esp32BleProvisioning::notifySecureSessionEstablished() { sessionActive_ = true; }
+void Esp32BleProvisioning::notifyDisconnected() { sessionActive_ = false; }
+void Esp32BleProvisioning::notifyCredentials(const std::string& ssid, const std::string& password) {
+    sessionActive_ = true;
+    receivedCredentials_ = WifiCredentialsPayload{ssid, password};
+}
+void Esp32BleProvisioning::notifyFailure() { sessionActive_ = false; }
+
 FakeBleProvisioning::FakeBleProvisioning(BleSecurityMode mode)
-    : securityMode_(mode), advertising_(false), sessionActive_(false) {}
+    : securityMode_(mode), advertising_(false), sessionActive_(false), startResult_(true) {}
 
 bool FakeBleProvisioning::startAdvertising(const BleAdvertisementInfo& info, const std::string& proofOfPossession) {
-    advertising_ = true;
+    advertising_ = startResult_;
     lastPop_ = proofOfPossession;
     lastInfo_ = info;
-    return true;
+    return startResult_;
 }
 
 void FakeBleProvisioning::stopAdvertising() {
@@ -89,6 +115,8 @@ void FakeBleProvisioning::injectCredentials(const WifiCredentialsPayload& creden
 void FakeBleProvisioning::setSessionActive(bool active) {
     sessionActive_ = active;
 }
+
+void FakeBleProvisioning::setStartResult(bool result) { startResult_ = result; }
 
 const std::string& FakeBleProvisioning::lastProofOfPossession() const {
     return lastPop_;

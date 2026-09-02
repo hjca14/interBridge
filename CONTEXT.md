@@ -54,7 +54,9 @@ unavailable hardware/AWS/crypto, and clearly-labeled stubs where it does.
 **The isolated, manually provisioned DEV smoke entry point can complete an AWS
 IoT MQTT/mTLS connection and has been validated on a bench device. The
 production composition root still cannot complete a real AWS IoT connection,
-BLE provisioning session, or signed OTA update.** See
+BLE provisioning session, or signed OTA update. An isolated Phase 3C.1 target
+now starts Arduino's official `WiFiProv`/ESP-IDF Unified Provisioning BLE
+service with Security 1; physical interoperability remains unvalidated.** See
 Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
@@ -64,6 +66,17 @@ Backend/infrastructure-only topics (Cognito, API Gateway, environment
 separation, the temporary application claim session's actual
 implementation) remain out of scope for this repository - see Open
 Questions.
+
+## Phase 3C.1 BLE foundation
+
+The toolchain is now reproducibly pinned to platform-espressif32 6.12.0,
+Arduino-ESP32 2.0.17, and ESP-IDF 4.4.7. The isolated
+`esp32-c3-dev-ble-provisioning` target uses the official `WiFiProv` wrapper,
+Security 1 and a local gitignored PoP; it does not compile production or DEV
+call-simulator composition roots. The Android contract and pending physical
+checklist are consolidated in `docs/ble-onboarding.md`. This is a foundation,
+not completion of 3C.1: advertising, connection, correct/incorrect PoP,
+reconnection and timeout still require bench validation.
 
 ## Architecture
 
@@ -547,14 +560,12 @@ gcc. New from this pass:)*
   (`CLOCK_NOT_TRUSTWORTHY`). This is intentional fail-safe behavior, not
   an oversight, but it does mean the whole command pipeline is
   unreachable end-to-end until NTP exists.
-- `Esp32BleProvisioning` is a stub for a structural reason, not a missed
-  task: ESP-IDF Unified Provisioning (the intended design) isn't exposed
-  by `framework = arduino`. See Decisions and
-  `docs/communication-protocol.md` section 7.2. This means the entire
-  BLE-first onboarding flow, however well-tested against fakes, cannot
-  run end-to-end on real hardware yet - nearby discovery, the security
-  session, and credential transfer are all unimplemented at the
-  ESP32/BLE-stack level.
+- `Esp32BleProvisioning` is real in the isolated
+  `esp32-c3-dev-ble-provisioning` composition: Arduino-ESP32 2.0.17 exposes
+  the official `WiFiProv` wrapper over ESP-IDF 4.4.7 Wi-Fi Provisioning Manager
+  and Protocomm. The old claim that Arduino structurally prevented Unified
+  Provisioning was false. Production wiring, manufacturing PoP storage and
+  physical Android interoperability remain intentionally pending.
 - `DefaultFirmwareVerifier::verifySignature()` always returns `false` -
   no signing scheme/public key chosen. Real OTA cannot complete
   end-to-end even once download/transport exist, until this changes.

@@ -58,7 +58,12 @@ void ProvisioningManager::enterProvisioning(uint32_t nowMs) {
     wasAlreadyProvisionedWhenEntered_ = store_.has(kWifiSsidKey);
     provisioningStartedAtMs_ = nowMs;
     state_ = ProvisioningState::ProvisioningAvailable;
-    ble_.startAdvertising(advertisementInfo_, proofOfPossession_);
+    if (!ble_.startAdvertising(advertisementInfo_, proofOfPossession_)) {
+        state_ = ProvisioningState::ProvisioningFailed;
+        statusIndicator_.show(ProvisioningIndication::ProvisioningFailure);
+        pendingEvent_ = ProtocolEventName::ProvisioningFailed;
+        return;
+    }
     statusIndicator_.show(ProvisioningIndication::ProvisioningAvailable);
     pendingEvent_ = ProtocolEventName::ProvisioningStarted;
 }

@@ -68,19 +68,10 @@ public:
     virtual std::optional<WifiCredentialsPayload> pollReceivedCredentials() = 0;
 };
 
-// Real ESP32 implementation. STUB, and deliberately so: this firmware
-// currently targets `framework = arduino` (see platformio.ini). The
-// ESP-IDF Unified Provisioning component that
-// docs/communication-protocol.md calls for (wifi_provisioning +
-// protocomm) is ESP-IDF-native; arduino-esp32 does not expose it through
-// the Arduino API surface. A real implementation needs either (a)
-// switching the esp32-c3 environment to `framework = espidf` (or a mixed
-// `arduino, espidf` framework), or (b) a hand-rolled BLE GATT
-// provisioning service on top of arduino-esp32's BLE library - which
-// would NOT be ESP-IDF Unified Provisioning and would need its own
-// security review before being called equivalent, and would need its own
-// plan for reaching Security2 parity. Neither has been done; every
-// method here is a placeholder. See CONTEXT.md > Open Questions.
+// ESP32 adapter. In the isolated Phase 3C.1 build it uses Arduino-ESP32's
+// official WiFiProv wrapper, which delegates to ESP-IDF Wi-Fi Provisioning
+// Manager and Protocomm. Other compositions retain the fail-closed adapter
+// until production PoP storage and lifecycle wiring are designed.
 class Esp32BleProvisioning : public IBleProvisioning {
 public:
     explicit Esp32BleProvisioning(BleSecurityMode requestedMode = BleSecurityMode::Security2);
@@ -92,9 +83,18 @@ public:
     BleSecurityMode securityMode() const override;
     std::optional<WifiCredentialsPayload> pollReceivedCredentials() override;
 
+    // Forwarded by the Arduino system-event callback in the isolated DEV
+    // composition. Arguments are intentionally metadata-only.
+    void notifySecureSessionEstablished();
+    void notifyDisconnected();
+    void notifyCredentials(const std::string& ssid, const std::string& password);
+    void notifyFailure();
+
 private:
     BleSecurityMode securityMode_;
     bool advertising_;
+    bool sessionActive_;
+    std::optional<WifiCredentialsPayload> receivedCredentials_;
 };
 
 // Test double: lets a test simulate a session starting and credentials
@@ -112,6 +112,7 @@ public:
 
     void injectCredentials(const WifiCredentialsPayload& credentials);
     void setSessionActive(bool active);
+    void setStartResult(bool result);
     const std::string& lastProofOfPossession() const;
     const BleAdvertisementInfo& lastAdvertisementInfo() const;
 
@@ -119,6 +120,7 @@ private:
     BleSecurityMode securityMode_;
     bool advertising_;
     bool sessionActive_;
+    bool startResult_;
     std::string lastPop_;
     BleAdvertisementInfo lastInfo_;
     std::optional<WifiCredentialsPayload> queuedCredentials_;

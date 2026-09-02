@@ -52,6 +52,30 @@ void test_session_active_defaults_false_and_is_settable() {
     TEST_ASSERT_TRUE(ble.isSessionActive());
 }
 
+void test_real_transport_lifecycle_metadata_never_exposes_credentials() {
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    ble.notifySecureSessionEstablished();
+    TEST_ASSERT_TRUE(ble.isSessionActive());
+    ble.notifyCredentials("private-ssid", "private-password");
+    auto credentials = ble.pollReceivedCredentials();
+    TEST_ASSERT_TRUE(credentials.has_value());
+    TEST_ASSERT_EQUAL_STRING("private-ssid", credentials->ssid.c_str());
+    TEST_ASSERT_FALSE(ble.pollReceivedCredentials().has_value());
+    ble.notifyDisconnected();
+    TEST_ASSERT_FALSE(ble.isSessionActive());
+}
+
+void test_fake_can_model_sanitized_start_failure_and_retry() {
+    FakeBleProvisioning ble(BleSecurityMode::Security1);
+    BleAdvertisementInfo info{"InterBridge-A91C", "A91C", true};
+    ble.setStartResult(false);
+    TEST_ASSERT_FALSE(ble.startAdvertising(info, "secret-pop"));
+    TEST_ASSERT_FALSE(ble.isAdvertising());
+    ble.setStartResult(true);
+    TEST_ASSERT_TRUE(ble.startAdvertising(info, "secret-pop"));
+    TEST_ASSERT_TRUE(ble.isAdvertising());
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -62,5 +86,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_security_mode_is_configurable);
     RUN_TEST(test_start_advertising_records_info_and_pop);
     RUN_TEST(test_session_active_defaults_false_and_is_settable);
+    RUN_TEST(test_real_transport_lifecycle_metadata_never_exposes_credentials);
+    RUN_TEST(test_fake_can_model_sanitized_start_failure_and_retry);
     return UNITY_END();
 }

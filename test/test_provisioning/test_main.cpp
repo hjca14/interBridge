@@ -214,6 +214,23 @@ void test_configured_device_reopens_provisioning_on_button_request() {
     TEST_ASSERT_TRUE(f.ble.isAdvertising());
 }
 
+void test_ble_start_failure_is_observable_and_can_be_retried() {
+    Fixture f;
+    f.ble.setStartResult(false);
+    f.manager.checkAtBoot(0);
+    TEST_ASSERT_EQUAL(static_cast<int>(ProvisioningState::ProvisioningFailed),
+                      static_cast<int>(f.manager.state()));
+    auto event = f.manager.pollEvent();
+    TEST_ASSERT_TRUE(event.has_value());
+    TEST_ASSERT_EQUAL(static_cast<int>(ProtocolEventName::ProvisioningFailed), static_cast<int>(*event));
+
+    f.ble.setStartResult(true);
+    f.manager.requestProvisioning(100);
+    TEST_ASSERT_EQUAL(static_cast<int>(ProvisioningState::ProvisioningAvailable),
+                      static_cast<int>(f.manager.state()));
+    TEST_ASSERT_TRUE(f.ble.isAdvertising());
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -230,5 +247,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_provisioning_window_expiry_on_already_provisioned_device_returns_to_idle);
     RUN_TEST(test_request_provisioning_is_ignored_while_already_in_progress);
     RUN_TEST(test_configured_device_reopens_provisioning_on_button_request);
+    RUN_TEST(test_ble_start_failure_is_observable_and_can_be_retried);
     return UNITY_END();
 }
