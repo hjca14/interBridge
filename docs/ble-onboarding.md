@@ -40,6 +40,12 @@ pio run -e esp32-c3-dev-ble-provisioning
 
 This composition contains only the BLE adapter and DEV entry point. It excludes the production root, AWS/MQTT composition, Si3050 code, and GPIO3/GPIO4 call simulators, preserving all accumulated behavior. At timeout the adapter calls ESP-IDF 4.4.7's public `wifi_prov_mgr_deinit()` API from `wifi_provisioning/manager.h`; that API stops an active provisioning service and releases manager/scheme resources, while the selected `WIFI_PROV_SCHEME_HANDLER_FREE_BTDM` handler releases Bluetooth controller memory. The timeout therefore ends the real provisioning service rather than merely changing local state. Logs contain only window/name/security mode, authenticated request observation, success/failure, disconnect and timeout—never PoP, SSID, Wi-Fi password, protobuf payload, or cryptographic material.
 
+The target alone selects Arduino-ESP32's official `huge_app.csv` partition
+table for a 4 MB flash device. It retains NVS and provides a single enlarged
+application slot without OTA, which is appropriate for this bench-only image.
+It is not a production partitioning or OTA decision; every production and
+pre-existing DEV environment retains its default table.
+
 ## Physical validation still pending
 
 No flash or radio test was performed. Phase 3C.1 remains open until:
