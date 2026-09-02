@@ -733,6 +733,131 @@ void test_connectivity_counter_is_untouched_by_a_normal_successful_cycle() {
     TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::Online), static_cast<int>(state.state()));
 }
 
+// Regression test for a real-hardware hang: a success signal (forwarded
+// from e.g. a plain L2-associate event, or a GOT_IP itself followed by an
+// unreported drop) that is never followed by wifiConnected genuinely
+// becoming true used to permanently strand the machine in WaitingForWifi -
+// wifiAttemptInFlight() went false with no corresponding state transition,
+// and nothing ever reset actionIssued_/the retry deadline again, so no
+// further ConnectWifi was ever issued without a manual reboot. The bounded
+// "awaiting confirmed connect" window (wifiConnectConfirmationPending())
+// guarantees this can no longer wedge forever.
+void test_wifi_success_signal_without_confirmed_connection_eventually_retries() {
+    DevMqttSmokeState state(10, 40, 15000, 3, 600000, /*wifiAssociationTimeoutMs=*/50);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    TEST_ASSERT_TRUE(state.wifiAttemptInFlight());
+
+    state.wifiAssociationResult(1, true);
+    TEST_ASSERT_FALSE(state.wifiAttemptInFlight());
+    TEST_ASSERT_TRUE(state.wifiConnectConfirmationPending());
+
+    // Many rapid updates while still (falsely) not connected, well within
+    // the confirmation window - must never reissue ConnectWifi and must
+    // never simply give up (both would be wrong).
+    for (uint32_t t = 2; t < 50; t += 5) {
+        TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None), static_cast<int>(state.update(t, false, false, false)));
+    }
+    TEST_ASSERT_TRUE(state.wifiConnectConfirmationPending());
+
+    // Once the confirmation window elapses without wifiConnected ever
+    // becoming true, the attempt is treated as failed and a fresh retry
+    // is scheduled - the machine is never permanently stuck.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None), static_cast<int>(state.update(51, false, false, false)));
+    TEST_ASSERT_FALSE(state.wifiConnectConfirmationPending());
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(61, false, false, false))); // 51 + initialRetryMs(10)
+}
+
+// A momentary Wi-Fi reassociation that drops again before ever reaching a
+// full, stable success (Online) must not reset the dedicated Wi-Fi retry
+// backoff back to its floor - only a genuine mqttResult(true) does (see
+// mqttResult()'s doc comment). Before this fix, every re-entry into
+// WaitingForWifi reset the (then-shared) backoff via enter(), so a
+// persistently flappy link could retry near the 1-attempt-per-tick floor
+// indefinitely instead of backing off.
+void test_momentary_wifi_reconnect_does_not_reset_backoff_growth() {
+    DevMqttSmokeState state(1000, 60000);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    state.wifiAssociationResult(1, false); // failed attempt -> grows to 2000
+    TEST_ASSERT_EQUAL_UINT32(2000, state.retryDelayMs());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(1001, false, false, false)));
+    // Wi-Fi genuinely reassociates this time (ordinary wifiConnected-driven
+    // cascade, no explicit wifiAssociationResult() call needed).
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ResolveDns),
+                      static_cast<int>(state.update(1002, true, false, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForDns), static_cast<int>(state.state()));
+
+    // ...but drops again before ever reaching Online (DNS not even
+    // resolved yet) - a momentary, non-stable reconnect.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(1003, false, false, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::WaitingForWifi), static_cast<int>(state.state()));
+
+    // The growth ladder still reflects the earlier failure.
+    TEST_ASSERT_EQUAL_UINT32(2000, state.retryDelayMs());
+}
+
+// A full end-to-end success (mqttResult(true), reaching Online) is the
+// only thing that resets the dedicated Wi-Fi retry backoff back to its
+// floor - proven here by growing it first, then reaching a genuinely
+// stable Online, then forcing a fresh Wi-Fi loss and confirming the very
+// next ConnectWifi is issued at the floor delay again.
+void test_full_success_resets_wifi_backoff_growth() {
+    DevMqttSmokeState state(1000, 60000);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(0, false, false, false)));
+    state.wifiAssociationResult(1, false);
+    TEST_ASSERT_EQUAL_UINT32(2000, state.retryDelayMs());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(1001, false, false, false)));
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ResolveDns),
+                      static_cast<int>(state.update(1002, true, false, false)));
+    state.dnsResult(1002, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
+                      static_cast<int>(state.update(1002, true, true, false)));
+    state.mqttResult(1002, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeState::Online), static_cast<int>(state.state()));
+
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(2000, false, true, false)));
+    TEST_ASSERT_EQUAL_UINT32(1000, state.retryDelayMs());
+}
+
+// The Wi-Fi recovery cooldown (recordConnectivityFailure()) only suppresses
+// ESCALATING to another forced full RecoverWifi - it must never suppress
+// the ordinary per-attempt Wi-Fi retry ladder itself, or the device could
+// never reconnect at all for the entire cooldown window while genuinely
+// offline.
+void test_ordinary_wifi_retry_not_blocked_by_active_recovery_cooldown() {
+    DevMqttSmokeState state(10, 40, 1000, /*wifiRecoveryThreshold=*/1, /*wifiRecoveryCooldownMs=*/100000);
+    state.update(0, false, false, false);
+    state.update(1, true, false, false);
+    state.dnsResult(1, true);
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectMqtt),
+                      static_cast<int>(state.update(1, true, true, false)));
+    state.mqttResult(1, false); // reaches threshold=1
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::RecoverWifi),
+                      static_cast<int>(state.update(1, true, true, false)));
+    TEST_ASSERT_TRUE(state.wifiRecoveryCooldownActive());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(2, false, true, false)));
+    state.wifiAssociationResult(2, false); // this reconnect attempt also fails
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::None),
+                      static_cast<int>(state.update(3, false, true, false)));
+
+    // The ordinary Wi-Fi retry still fires once its own backoff elapses,
+    // even though a recovery cooldown is active for a different purpose.
+    TEST_ASSERT_EQUAL(static_cast<int>(DevSmokeAction::ConnectWifi),
+                      static_cast<int>(state.update(12, false, true, false)));
+    TEST_ASSERT_TRUE(state.wifiRecoveryCooldownActive());
+}
+
 void test_observation_only_update_does_not_change_online_state() {
     DevMqttSmokeState state;
     state.update(0, false, false, false);
@@ -771,6 +896,10 @@ int main(int, char**) {
     RUN_TEST(test_full_mqtt_success_resets_connectivity_counters_and_recovery_state);
     RUN_TEST(test_wifi_recovery_cooldown_deadline_is_wrap_safe);
     RUN_TEST(test_connectivity_counter_is_untouched_by_a_normal_successful_cycle);
+    RUN_TEST(test_wifi_success_signal_without_confirmed_connection_eventually_retries);
+    RUN_TEST(test_momentary_wifi_reconnect_does_not_reset_backoff_growth);
+    RUN_TEST(test_full_success_resets_wifi_backoff_growth);
+    RUN_TEST(test_ordinary_wifi_retry_not_blocked_by_active_recovery_cooldown);
     RUN_TEST(test_observation_only_update_does_not_change_online_state);
     return UNITY_END();
 }

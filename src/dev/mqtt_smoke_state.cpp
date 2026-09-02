@@ -9,7 +9,7 @@ DevMqttSmokeState::DevMqttSmokeState(uint32_t initialRetryMs, uint32_t maxRetryM
                                      uint32_t wifiAssociationTimeoutMs)
     : state_(DevSmokeState::WaitingForWifi), initialRetryMs_(initialRetryMs), maxRetryMs_(maxRetryMs),
       ntpAttemptTimeoutMs_(ntpAttemptTimeoutMs), retryDelayMs_(initialRetryMs), retryAtMs_(0), actionIssued_(false),
-      wifiAssociationTimeoutMs_(wifiAssociationTimeoutMs),
+      wifiAssociationTimeoutMs_(wifiAssociationTimeoutMs), wifiRetryDelayMs_(initialRetryMs),
       wifiRecoveryThreshold_(wifiRecoveryThreshold), wifiRecoveryCooldownMs_(wifiRecoveryCooldownMs) {}
 
 bool DevMqttSmokeState::deadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
@@ -26,12 +26,25 @@ void DevMqttSmokeState::enter(DevSmokeState state, uint32_t nowMs) {
     retryDelayMs_ = initialRetryMs_;
     retryAtMs_ = nowMs;
     actionIssued_ = false;
+    // Deliberately NOT touched here: wifiRetryDelayMs_/wifiRetryAtMs_ (see
+    // their doc comments - only mqttResult(true) resets the growth, and
+    // the wifiRecoveryRequested_ branch in update() explicitly re-arms
+    // just the deadline for a prompt forced reconnect, never the growth).
+    wifiConfirmPending_ = false;
 }
 
 void DevMqttSmokeState::scheduleRetry(uint32_t nowMs) {
     retryAtMs_ = nowMs + retryDelayMs_;
     retryDelayMs_ = std::min(maxRetryMs_, retryDelayMs_ > maxRetryMs_ / 2 ? maxRetryMs_ : retryDelayMs_ * 2);
     actionIssued_ = false;
+}
+
+// Dedicated Wi-Fi reconnection backoff - see wifiRetryDelayMs_'s doc
+// comment in the header for why this is deliberately separate from
+// scheduleRetry() above.
+void DevMqttSmokeState::scheduleWifiRetry(uint32_t nowMs) {
+    wifiRetryAtMs_ = nowMs + wifiRetryDelayMs_;
+    wifiRetryDelayMs_ = std::min(maxRetryMs_, wifiRetryDelayMs_ > maxRetryMs_ / 2 ? maxRetryMs_ : wifiRetryDelayMs_ * 2);
 }
 
 void DevMqttSmokeState::recordConnectivityFailure(uint32_t nowMs) {
@@ -66,6 +79,14 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
         enter(DevSmokeState::WaitingForWifi, nowMs);
         ntpAttemptInFlight_ = false;
         wifiAttemptInFlight_ = false;
+        // A forced recovery is a deliberate, threshold-gated escalation
+        // (see recordConnectivityFailure()) and must reconnect promptly
+        // once the real disconnect is observed - never delayed behind a
+        // stale Wi-Fi retry deadline left over from an unrelated earlier
+        // Wi-Fi hiccup. Only the deadline is re-armed here, never the
+        // backoff's own growth (wifiRetryDelayMs_) - a forced recovery
+        // says nothing about whether the interface is now stable.
+        wifiRetryAtMs_ = nowMs;
         awaitingWifiRecoveryDisconnect_ = true;
         return DevSmokeAction::RecoverWifi;
     }
@@ -95,6 +116,21 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
             // all re-established from scratch once Wi-Fi returns.
             ntpAttemptInFlight_ = false;
             wifiAttemptInFlight_ = false;
+            // Seed the DEADLINE (never the growth - wifiRetryDelayMs_ is
+            // untouched, see its doc comment) from nowMs on every genuinely
+            // fresh loss-of-connectivity transition. Two independent
+            // reasons, not one: (1) a just-detected real loss deserves a
+            // prompt reconnect attempt - the exponential backoff exists to
+            // slow down repeated FAILED reconnect attempts, not to
+            // penalize noticing a fresh disconnect; growth still applies
+            // to the next attempt if this one also fails. (2) Without
+            // this, a wifiRetryAtMs_ left stale from long ago (e.g. still
+            // at its constructor default of 0 because no Wi-Fi-level
+            // failure had ever occurred yet) is indistinguishable from
+            // "far in the future" once nowMs has wrapped around close to
+            // it - the same 32-bit-circle hazard enter() already guards
+            // the shared retryAtMs_ against for every other stage.
+            wifiRetryAtMs_ = nowMs;
         }
         if (wifiAttemptInFlight_ && deadlineReached(nowMs, wifiAttemptDeadlineMs_)) {
             // The in-flight attempt's own bounded timeout elapsed without a
@@ -103,7 +139,7 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
             // failure: stop blocking future retries and schedule the next
             // one now, same shape as the NTP attempt timeout below.
             wifiAttemptInFlight_ = false;
-            scheduleRetry(nowMs);
+            scheduleWifiRetry(nowMs);
         }
         if (wifiAttemptInFlight_) {
             // Never reissue WiFi.begin() while a previous attempt might
@@ -115,8 +151,21 @@ DevSmokeAction DevMqttSmokeState::update(uint32_t nowMs, bool wifiConnected, boo
             // wifiAssociationResult(false) or this timeout is.
             return DevSmokeAction::None;
         }
-        if (!actionIssued_ && deadlineReached(nowMs, retryAtMs_)) {
-            actionIssued_ = true;
+        if (wifiConfirmPending_) {
+            // A success signal arrived (wifiAssociationResult(true)) but
+            // wifiConnected has not yet become true - see
+            // wifiConnectConfirmationPending()'s doc comment. Never
+            // reissue ConnectWifi while this window is open; once it
+            // times out without wifiConnected ever becoming true, treat
+            // it as a failed attempt so this can never wedge forever.
+            if (deadlineReached(nowMs, wifiConfirmDeadlineMs_)) {
+                wifiConfirmPending_ = false;
+                scheduleWifiRetry(nowMs);
+            } else {
+                return DevSmokeAction::None;
+            }
+        }
+        if (deadlineReached(nowMs, wifiRetryAtMs_)) {
             wifiAttemptInFlight_ = true;
             // Provisional - the caller is expected to call
             // wifiAssociationStarted() immediately alongside its actual
@@ -194,19 +243,24 @@ void DevMqttSmokeState::wifiAssociationResult(uint32_t nowMs, bool success) {
     if (state_ != DevSmokeState::WaitingForWifi || !wifiAttemptInFlight_) return;
     wifiAttemptInFlight_ = false;
     if (success) {
-        // The ordinary wifiConnected-driven cascade in update() (the
-        // caller's next call, once WiFi.status() actually reports
-        // WL_CONNECTED) is what actually advances past WaitingForWifi -
-        // this only needs to stop treating the attempt as in flight so a
-        // future retry is never blocked on it lingering past success.
+        // Not the final word by itself - see this method's doc comment in
+        // the header. Opens the bounded "awaiting confirmed connect"
+        // window instead of going fully idle: the ordinary
+        // wifiConnected-driven cascade in update() (the caller's next
+        // call, once WiFi.status() actually reports WL_CONNECTED) is
+        // still what actually advances past WaitingForWifi, but if that
+        // never happens within this window, update() treats it as a
+        // failed attempt on its own - see wifiConnectConfirmationPending().
+        wifiConfirmPending_ = true;
+        wifiConfirmDeadlineMs_ = nowMs + wifiAssociationTimeoutMs_;
         return;
     }
-    // A real failure signal - schedule the next retry now rather than
-    // waiting for the full wifiAssociationTimeoutMs to elapse. Guarded by
-    // the wifiAttemptInFlight_ check above, so a burst of multiple
-    // disconnect events for the same attempt only ever schedules one
-    // retry, never a storm.
-    scheduleRetry(nowMs);
+    // A real failure signal - schedule the next Wi-Fi retry now rather
+    // than waiting for the full wifiAssociationTimeoutMs to elapse.
+    // Guarded by the wifiAttemptInFlight_ check above, so a burst of
+    // multiple disconnect events for the same attempt only ever
+    // schedules one retry, never a storm.
+    scheduleWifiRetry(nowMs);
 }
 
 void DevMqttSmokeState::dnsResult(uint32_t nowMs, bool success) {
@@ -240,6 +294,11 @@ void DevMqttSmokeState::mqttResult(uint32_t nowMs, bool success) {
         wifiRecoveryCooldownActive_ = false;
         wifiRecoveryRequested_ = false;
         awaitingWifiRecoveryDisconnect_ = false;
+        // A full end-to-end success is the strongest available signal
+        // that the interface is genuinely stable, not merely a momentary
+        // association that could drop again immediately - see
+        // wifiRetryDelayMs_'s doc comment for why nothing else resets it.
+        wifiRetryDelayMs_ = initialRetryMs_;
     } else {
         scheduleRetry(nowMs);
         recordConnectivityFailure(nowMs);
@@ -247,10 +306,15 @@ void DevMqttSmokeState::mqttResult(uint32_t nowMs, bool success) {
 }
 
 DevSmokeState DevMqttSmokeState::state() const { return state_; }
-uint32_t DevMqttSmokeState::retryDelayMs() const { return retryDelayMs_; }
-uint32_t DevMqttSmokeState::retryAtMs() const { return retryAtMs_; }
+uint32_t DevMqttSmokeState::retryDelayMs() const {
+    return state_ == DevSmokeState::WaitingForWifi ? wifiRetryDelayMs_ : retryDelayMs_;
+}
+uint32_t DevMqttSmokeState::retryAtMs() const {
+    return state_ == DevSmokeState::WaitingForWifi ? wifiRetryAtMs_ : retryAtMs_;
+}
 bool DevMqttSmokeState::ntpAttemptInFlight() const { return ntpAttemptInFlight_; }
 bool DevMqttSmokeState::wifiAttemptInFlight() const { return wifiAttemptInFlight_; }
+bool DevMqttSmokeState::wifiConnectConfirmationPending() const { return wifiConfirmPending_; }
 uint32_t DevMqttSmokeState::consecutiveConnectivityFailures() const { return consecutiveConnectivityFailures_; }
 bool DevMqttSmokeState::wifiRecoveryCooldownActive() const { return wifiRecoveryCooldownActive_; }
 uint32_t DevMqttSmokeState::wifiRecoveryCooldownUntilMs() const { return wifiRecoveryCooldownUntilMs_; }

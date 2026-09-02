@@ -420,6 +420,30 @@ hardware and system-control dependencies are explicitly non-actuating. Ignored D
 credentials live only in a transient `MemoryStore`; this is not reboot persistence.
 Production NVS, BLE/Fleet Provisioning, and onboarding remain pending.
 
+**Connectivity recovery hardening** (both `esp32-c3-dev-mqtt` and
+`esp32-c3-dev-ring-simulator`): a real bench run showed the device connect
+successfully, then never recover from a later connectivity loss without a
+manual reboot - see `docs/dev-ring-simulator.md` > "Connectivity recovery
+hardening" for the full sanitized log and root-cause writeup. Two
+compounding causes, both fixed: `ARDUINO_EVENT_WIFI_STA_CONNECTED` (L2
+association only) was forwarded to `DevMqttSmokeState` as a full success
+signal identically to `..._GOT_IP`, which - combined with a latent
+`DevMqttSmokeState` bug where a success signal cleared the in-flight
+attempt with no further safeguard - could permanently strand the state
+machine in `WaitingForWifi` if `wifiConnected` never actually became true
+afterward; and the ESP32 Arduino core's own Wi-Fi auto-reconnect (on by
+default) was racing, uncoordinated, against `DevMqttSmokeState`'s own
+retry cadence. `DevMqttSmokeState` now has a bounded "awaiting confirmed
+connect" window that can never wedge again regardless of what a caller
+forwards, and a dedicated Wi-Fi reconnection backoff (separate from the
+unchanged per-stage DNS/Time/MQTT ladder) that grows only on a failed
+reconnect attempt and resets only on a full stable success - never merely
+by re-entering `WaitingForWifi`. Both entry points now only treat
+`GOT_IP` as success, call `WiFi.setAutoReconnect(false)`, and label each
+disconnect's origin (self-requested vs. not) in its log line. The outbox
+remains RAM-only - this hardening removes the need for a reboot on
+*ordinary* connectivity loss, it does not add persistence.
+
 ## DEV physical ring simulator isolation (Phase 3B.8)
 
 `src/dev/dev_ring_simulator_main.cpp` is compiled only by
@@ -430,15 +454,29 @@ those are linked into it. It reuses `DevMqttSmokeState` for connectivity
 bring-up (same Wi-Fi → DNS → NTP → MQTT cascade as the DEV MQTT smoke
 harness above) instead of duplicating it. Two hardware-independent,
 natively-tested classes carry the actual bench logic:
-`DevRingButtonController` (`src/dev/dev_ring_button.*`) debounces the
-physical button and emits a one-shot pulse only on the released-to-pressed
-edge; `DevRingEventCoordinator` + `publishPendingEvents()`
-(`src/dev/dev_ring_event.*`) turn that pulse into a `RING_DETECTED`
-`DeviceEvent`, enqueue it into a `MemoryEventOutbox`, and drain that
-outbox against `Esp32AwsIotTransport`/`MqttTopics::eventsIngest()` exactly
-like `main.cpp`'s production outbox loop - the same `event_id` survives
-any retry or offline period. See `docs/dev-ring-simulator.md` for the
-wiring, GPIO rationale, and manual test procedure.
+`DevRingButtonController` (`src/dev/dev_ring_button.*`, reused for both
+GPIOs) debounces one physical input and emits a one-shot pulse only on
+the released-to-pressed edge; `DevRingEventCoordinator` +
+`publishPendingEvents()` (`src/dev/dev_ring_event.*`) own a minimal
+`Idle`/`Ringing` call-session state machine over two such buttons - a
+GPIO4 pulse in `Idle` generates a new `call_id` and enqueues
+`RING_DETECTED`; a GPIO3 pulse in `Ringing`, or a DEV-only safety
+timeout, enqueues `RING_ENDED` reusing that same `call_id` and returns
+to `Idle` - and drain the resulting `MemoryEventOutbox` against
+`Esp32AwsIotTransport`/`MqttTopics::eventsIngest()` exactly like
+`main.cpp`'s production outbox loop, publishing strictly in enqueue
+order so a `RING_ENDED` can never be published ahead of its own session's
+`RING_DETECTED`. The same `event_id`/`call_id` survive any retry or
+offline period. See `docs/dev-ring-simulator.md` > "Call session state
+machine" for the full state diagram, GPIO rationale, and manual test
+procedure - the GPIO3/`RING_ENDED` addition, like the original GPIO4-only
+3B.8 pass, is now validated end to end on real hardware, integrated with
+the deployed coordinated backend (`hjca14/interBackend#27`) and installed
+coordinated app (`hjca14/interapp#24`); see `docs/dev-ring-simulator.md`
+> "Call session addition (GPIO3/`RING_ENDED`/`call_id`): hardware-
+validated, integrated with backend and app" for what that run confirmed
+and what remains open (Si3050, Linker Button, production pinning, and
+physical connectivity-loss recovery all remain unvalidated).
 
 `dev_ring_simulator_main.cpp`'s Wi-Fi event handler (`onWifiEvent()`),
 per-`DevSmokeAction` log lines, and boot diagnostics

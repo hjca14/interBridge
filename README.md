@@ -202,6 +202,59 @@ hardware - see
 [docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Command
 processing (Phase 3B.8 cumulative pass)".
 
+A further pass evolves this environment to simulate a complete call
+session rather than only its start. **GPIO4 still only ever starts** a
+simulated call (`RING_DETECTED`); **GPIO3 now simulates that same call's
+end** (`RING_ENDED`), wired the same way (external ~10 kΩ resistor to
+GND, momentary pulse to 3V3) as the already-validated GPIO4 test. Both
+events share one `call_id`, generated fresh per session; each still gets
+its own `event_id`. A minimal `Idle`/`Ringing` state machine
+(`DevRingEventCoordinator`, `src/dev/dev_ring_event.*`) rejects a GPIO3
+pulse with no active call and a second GPIO4 pulse while already
+Ringing, and a configurable DEV-only safety timeout (60s default) ends a
+session automatically if GPIO3 never pulses. Both events still go
+through the exact same outbox/retry/`Esp32AwsIotTransport` path as
+`RING_DETECTED` always has - no parallel MQTT path. GPIO3 is a new,
+deliberate, explicit DEV-only overlap with the Si3050's DTX pin, safe for
+the same reason GPIO4's DRX overlap is: this isolated environment never
+compiles or initializes Si3050 code and no Si3050 is attached while it
+runs. **Validated end to end on real hardware**, integrated with the
+deployed coordinated backend (`hjca14/interBackend#27`) and installed
+coordinated app (`hjca14/interapp#24`): GPIO4 started a session and
+published one `RING_DETECTED`; GPIO3 ended it and published `RING_ENDED`
+with a distinct `event_id` and the same `call_id`; the event reached the
+app via AWS IoT/`telemetry_ingestion`/`push_sender`/FCM, and the app
+ended its call presentation on the correlated `RING_ENDED`; a subsequent
+session got a new `call_id`. This validates the DEV pipeline and the
+cross-repo contract, not production hardware - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Call session
+addition (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated
+with backend and app" for exactly what is and is not covered (Si3050,
+Linker Button, production pinning, and physical connectivity-loss
+recovery all remain unvalidated).
+
+A subsequent pass hardens connectivity recovery after a real bench run
+connected successfully, then never recovered from a later connectivity
+loss without a manual reboot. Root cause: `ARDUINO_EVENT_WIFI_STA_CONNECTED`
+(L2 association only, before DHCP) was forwarded as a full success signal
+identically to `..._GOT_IP`, which - combined with a latent
+`DevMqttSmokeState` bug where a success signal cleared the in-flight
+attempt with no further safeguard - could permanently strand the
+connectivity state machine if a real IP was never actually obtained
+afterward; separately, the ESP32 Arduino core's own Wi-Fi auto-reconnect
+(on by default) was racing, uncoordinated, against this firmware's own
+retry cadence. Fixed: `DevMqttSmokeState` gained a bounded confirmation
+window that can never wedge again regardless of what a caller forwards,
+plus a dedicated Wi-Fi reconnection backoff (separate from the unchanged
+DNS/Time/MQTT ladder) that only resets on a full stable success; both DEV
+entry points now only treat `GOT_IP` as success, disable the driver's
+auto-reconnect, and label each disconnect's origin (self-requested vs.
+not). The outbox stays RAM-only - this removes the need for a reboot on
+*ordinary* connectivity loss, it does not add persistence. Not yet
+re-validated on real hardware - see
+[docs/dev-ring-simulator.md](docs/dev-ring-simulator.md) > "Connectivity
+recovery hardening".
+
 ## Si3050/Si3011-19 firmware foundation (Phase 3A + 3B.2 PCM clock)
 
 `src/intercom/si3050/` is a hardware-independent, natively-tested

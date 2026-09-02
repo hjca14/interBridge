@@ -21,6 +21,7 @@ constexpr size_t kMaxJsonPayloadBytes = 8192;
 // core::EventType.
 enum class ProtocolEventName {
     RingDetected,
+    RingEnded,
     OffHook,
     OnHook,
     CallStarted,
@@ -131,6 +132,12 @@ struct DeviceEvent {
     std::string deviceId;
     ProtocolEventName event;
     std::string eventId;
+    // Correlates a RING_DETECTED with its later RING_ENDED (same call
+    // session) - see docs/communication-protocol.md > Device Events >
+    // call_id. Optional/retrocompatible: omitted from the JSON entirely
+    // when empty, so any event that isn't part of a call session (every
+    // pre-existing event type) serializes exactly as before.
+    std::string callId;
     std::string timestamp; // ISO-8601 UTC; empty if no valid wall-clock time yet
     std::string toJson() const;
 };

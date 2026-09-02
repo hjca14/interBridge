@@ -708,6 +708,7 @@ Where applicable:
 ```text
 device_id
 event_id
+call_id
 command_id
 timestamp
 uptime_ms
@@ -722,6 +723,16 @@ the example in section 18. This is a deliberate asymmetry, not an
 inconsistency: prefixes exist so a human/log reader can tell at a glance
 what generated an ID, and only the device generates `device_id`/
 `event_id`. Custom JSON payloads must not exceed 8 KiB.
+
+`call_id` (firmware-generated, prefix `call-`, same 32-lowercase-hex
+encoding) correlates two events that describe the same call session,
+currently `RING_DETECTED` and `RING_ENDED` (section 16.1) - it is omitted
+entirely from every event that isn't part of a call session, exactly like
+`event_id`/`timestamp` are omitted when not meaningful. `event_id`
+identifies one specific message; `call_id` identifies the session that
+message belongs to. The two are never interchangeable and a `RING_ENDED`
+must never reuse its own session's `RING_DETECTED` `event_id` as if it
+were the same message.
 
 `device_id` inside JSON is diagnostic information only. Authorization comes from AWS IoT certificate/policy/Thing context.
 
@@ -787,6 +798,7 @@ Initial vocabulary:
 
 ```text
 RING_DETECTED
+RING_ENDED
 OFF_HOOK
 ON_HOOK
 CALL_STARTED
@@ -805,6 +817,126 @@ ERROR
 
 Do not emit events whose real semantic source is not implemented yet.
 
+### 16.1 `RING_DETECTED` / `RING_ENDED` and `call_id`
+
+`RING_DETECTED` and `RING_ENDED` together describe one call session, from
+the ring signal's start to its end. This contract is coordinated across
+all three repositories - firmware (this repo), backend
+(`hjca14/interBackend#27`), and app (`hjca14/interapp#24`) - and has been
+validated end to end on real hardware in the DEV environment, integrated
+with the deployed backend and installed app; see "Cross-repo coordination
+and validation status" below for exactly what that run confirmed and what
+still remains open (each side's own pull request still needs its own
+merge, and production infrastructure remains separate and unvalidated).
+`RING_ENDED` currently only has a producer in the
+bench-only DEV ring simulator (`esp32-c3-dev-ring-simulator`, see
+`docs/dev-ring-simulator.md` > "Call session state machine"), never in
+production firmware - GPIO4/GPIO3 remain temporary DEV-only simulators
+of the ring start/end signal, not a production ring detector.
+
+`event_id` identifies one specific message; `call_id` identifies the
+call session and is shared between the `RING_DETECTED` and `RING_ENDED`
+that describe the same session (see section 14's `call_id` paragraph for
+the full identifier contract). The firmware publishes `RING_ENDED`; the
+backend processes it and forwards the call's end to the app; the app
+ends only the specific call session whose `call_id` matches - never by
+`event_id`, and never a different session that merely arrived around the
+same time.
+
+```json
+{
+  "protocol_version": 1,
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
+  "event_id": "evt-12345678900000000000000000000001",
+  "call_id": "call-99999999999999999999999999999999",
+  "event": "RING_DETECTED",
+  "timestamp": "2026-08-11T17:30:25Z",
+  "uptime_ms": 123456
+}
+```
+
+```json
+{
+  "protocol_version": 1,
+  "device_id": "ib-0123456789abcdef0123456789abcdef",
+  "event_id": "evt-12345678900000000000000000000002",
+  "call_id": "call-99999999999999999999999999999999",
+  "event": "RING_ENDED",
+  "timestamp": "2026-08-11T17:31:10Z",
+  "uptime_ms": 168456
+}
+```
+
+Rules:
+
+- `RING_DETECTED` always creates a brand-new `call_id` and always has its
+  own `event_id`.
+- `RING_ENDED` always reuses the exact `call_id` of the `RING_DETECTED`
+  that started the same session, and always has a **different**
+  `event_id` from it - the two are always two distinct messages, never
+  one message republished under a second name.
+- Backend correlation of a call session must use `call_id`, never
+  `event_id` and never timestamp proximity alone (clock skew, replay, or
+  network reordering can all break a timestamp-only correlation).
+- A `RING_ENDED` must never be treated as valid, or considered for
+  notification purposes, ahead of its own session's `RING_DETECTED` -
+  the firmware-side outbox guarantees enqueue/publish order per session
+  (see `docs/dev-ring-simulator.md`), but backend ingestion should not
+  assume delivery order is otherwise guaranteed by the transport itself.
+- There is currently no coordinated wire field for *why* a `RING_ENDED`
+  happened (a physical hang-up vs. a DEV-only safety timeout, see
+  `docs/dev-ring-simulator.md`); the DEV simulator keeps that reason in
+  its own local log only, and does not invent an uncoordinated field for
+  it.
+
+#### Cross-repo coordination and validation status
+
+The `RING_DETECTED`/`RING_ENDED`/`call_id` contract itself is coordinated
+across firmware, backend, and app - it is not this firmware repository's
+unilateral proposal, and the shared integrated validation round across all
+three has been completed on real hardware in the DEV environment (see
+below for exactly what that confirmed). It is tracked by three pull
+requests, one per repository, each still open pending its own merge:
+
+```text
+firmware   hjca14/interBridge#23
+backend    hjca14/interBackend#27
+app        hjca14/interapp#24
+```
+
+What "coordinated" means here, precisely:
+
+- The wire shape (fields, semantics, `call_id`/`event_id` roles) is
+  agreed across all three sides, not just documented from the firmware's
+  side alone.
+- **The complete cycle has been exercised end to end on real hardware, in
+  the DEV environment, integrated with the deployed backend
+  (`hjca14/interBackend#27`) and the installed app (`hjca14/interapp#24`)**:
+  GPIO4 starting a session and publishing one `RING_DETECTED`, GPIO3
+  ending that session and publishing `RING_ENDED` with the same `call_id`
+  and a distinct `event_id`, the event traversing firmware → AWS IoT →
+  `telemetry_ingestion` → `push_sender` → FCM → app, the app ending its
+  call presentation on the correlated `RING_ENDED`, and a subsequent
+  session receiving a new `call_id`. See `docs/dev-ring-simulator.md` >
+  "Call session addition (GPIO3/`RING_ENDED`/`call_id`): hardware-
+  validated, integrated with backend and app" for the full record.
+- This is DEV-environment validation, not production: none of the three
+  pull requests above have merged yet, and this does not by itself
+  validate production infrastructure, final provisioning, or final BLE.
+- **Still not validated on real hardware**: the connectivity-recovery
+  hardening's actual loss-and-recovery behavior in this same firmware PR
+  (that run confirmed normal connectivity, not a connectivity
+  interruption), the timeout race, offline/reconnect replay, and
+  `OPEN_DOOR` during an active call. See `docs/dev-ring-simulator.md` for
+  exactly what remains open.
+- GPIO4 and GPIO3 remain temporary DEV-only bench simulators of the ring
+  signal's start and end, never a production pin assignment. This run
+  used the same external-resistor + momentary-3V3-jumper rig as GPIO4's
+  original validation for both pins, never the Linker Button module.
+- The Si3050, Si3018/Si3019, a real analog intercom line, physical
+  ringing/its end, audio, off-hook, and physical door opening all remain
+  unvalidated - none of this work tests any of them.
+
 ---
 
 ## 17. Event Reliability / Outbox
@@ -817,6 +949,7 @@ Candidate replayable events:
 
 ```text
 RING_DETECTED
+RING_ENDED
 CALL_STARTED
 CALL_ENDED
 DOOR_OPENED

@@ -102,19 +102,34 @@ public:
     void wifiAssociationStarted(uint32_t nowMs);
     // Reports an explicit, caller-observed Wi-Fi association outcome for
     // the attempt currently in flight (see wifiAttemptInFlight()) -
-    // forwarded from a real Wi-Fi event (ARDUINO_EVENT_WIFI_STA_CONNECTED/
-    // GOT_IP for success, ARDUINO_EVENT_WIFI_STA_DISCONNECTED for
-    // failure), never invoked directly from inside that event callback
-    // itself (the callback may run in a different task/context on real
-    // hardware; the caller must only record a minimal signal there and
-    // forward it into this method from its own single-threaded main
-    // loop). success=true simply stops treating the attempt as in flight
-    // early - the ordinary wifiConnected-driven cascade in update() is
-    // still what actually advances the state once it observes
-    // WL_CONNECTED. success=false ends the attempt and immediately
-    // schedules the next retry with the ordinary backoff (see
-    // scheduleRetry()), rather than waiting for the full
-    // wifiAssociationTimeoutMs to elapse. A call with no attempt
+    // forwarded from a real Wi-Fi event, never invoked directly from
+    // inside that event callback itself (the callback may run in a
+    // different task/context on real hardware; the caller must only
+    // record a minimal signal there and forward it into this method from
+    // its own single-threaded main loop).
+    //
+    // success=true must be forwarded ONLY from ARDUINO_EVENT_WIFI_STA_GOT_IP
+    // - never from ARDUINO_EVENT_WIFI_STA_CONNECTED (L2 association only,
+    // before DHCP). A real-hardware run showed the two being conflated:
+    // the caller forwarded plain L2-connect as "success" too, which -
+    // combined with a subsequent drop before DHCP ever completed - could
+    // permanently strand the machine in WaitingForWifi with no further
+    // ConnectWifi ever issued again (wifiAttemptInFlight() already false,
+    // but wifiConnected/WL_CONNECTED never became true either), requiring
+    // a manual reboot to recover. This method no longer trusts success=true
+    // as the final word by itself: it starts a bounded "awaiting confirmed
+    // connect" window (see wifiConnectConfirmationPending()) instead of
+    // immediately going idle, so even a caller that still (incorrectly)
+    // forwards L2-connect, or a GOT_IP that is itself followed by an
+    // unreported drop, can never wedge this state machine - see update()'s
+    // handling of that window for the guaranteed recovery path.
+    //
+    // success=false ends the attempt and immediately schedules the next
+    // Wi-Fi retry (see retryDelayMs()/retryAtMs() below - while
+    // state()==WaitingForWifi they report this dedicated Wi-Fi retry
+    // ladder, not the shared per-stage one DNS/Time/MQTT use), rather
+    // than waiting for the full wifiAssociationTimeoutMs to elapse. A call
+    // with no attempt
     // currently in flight (state_ is not WaitingForWifi, or no
     // ConnectWifi has been issued yet for this attempt) is a no-op - safe
     // to call from an event handler that may fire outside any pending
@@ -122,6 +137,13 @@ public:
     // ordinary wifiConnected-driven "!wifiConnected -> WaitingForWifi"
     // path in update() already handles on its own).
     void wifiAssociationResult(uint32_t nowMs, bool success);
+    // True from a success signal (see wifiAssociationResult()) until
+    // either wifiConnected genuinely becomes true (the real completion -
+    // ordinary cascade proceeds) or this window's own bounded timeout
+    // elapses without that happening, at which point it is treated as a
+    // failed attempt and the ordinary Wi-Fi retry backoff resumes. This is
+    // the safety net described on wifiAssociationResult() above.
+    bool wifiConnectConfirmationPending() const;
     // Explicit DNS resolution during the initial WaitingForDns bootstrap
     // stage (before NTP). success=false counts as a connectivity failure -
     // see consecutiveConnectivityFailures().
@@ -137,10 +159,22 @@ public:
     // Reports the outcome of the actual TLS/socket MQTT connect (+
     // subscribe) attempt - only ever called after a successful preflight.
     // success=true (a full connect+subscribe) clears the connectivity
-    // failure counter and any active Wi-Fi recovery cooldown; success=false
-    // counts as a connectivity failure.
+    // failure counter and any active Wi-Fi recovery cooldown, and is also
+    // the ONLY thing that resets the dedicated Wi-Fi reconnection backoff
+    // (see retryDelayMs()) back to its floor - a full end-to-end success
+    // is the strongest available signal that the interface is genuinely
+    // stable, not merely a momentary association that may drop again
+    // immediately. success=false counts as a connectivity failure.
     void mqttResult(uint32_t nowMs, bool success);
     DevSmokeState state() const;
+    // While state()==WaitingForWifi, these report the dedicated Wi-Fi
+    // reconnection backoff (grows on every Wi-Fi-level failure/timeout;
+    // does NOT reset merely because the interface briefly reassociated -
+    // see mqttResult()'s doc comment for the only thing that resets it).
+    // In every other state, they report the ordinary shared per-stage
+    // backoff DNS/Time/MQTT retries use (reset to initialRetryMs on every
+    // clean stage transition, exactly as before this class's call-session
+    // recovery-hardening pass).
     uint32_t retryDelayMs() const;
     uint32_t retryAtMs() const;
     // Whether a ConfigureTime action's SNTP attempt is currently considered
@@ -183,6 +217,7 @@ public:
 private:
     void enter(DevSmokeState state, uint32_t nowMs);
     void scheduleRetry(uint32_t nowMs);
+    void scheduleWifiRetry(uint32_t nowMs);
     void recordConnectivityFailure(uint32_t nowMs);
 
     DevSmokeState state_;
@@ -197,6 +232,23 @@ private:
     uint32_t wifiAssociationTimeoutMs_;
     bool wifiAttemptInFlight_ = false;
     uint32_t wifiAttemptDeadlineMs_ = 0;
+    // "Awaiting confirmed connect" window - see wifiAssociationResult()/
+    // wifiConnectConfirmationPending()'s doc comments.
+    bool wifiConfirmPending_ = false;
+    uint32_t wifiConfirmDeadlineMs_ = 0;
+    // Dedicated Wi-Fi reconnection backoff - deliberately separate from
+    // retryDelayMs_/retryAtMs_ below (which DNS/Time/MQTT continue to use
+    // exactly as before). Only the DEADLINE (wifiRetryAtMs_) is reseeded
+    // from nowMs on a fresh loss-of-connectivity transition (a prompt
+    // first reconnect attempt is correct behavior, and avoids a 32-bit
+    // millis() wraparound hazard on a long-untouched deadline); the
+    // GROWTH (this field) is never reset merely by that transition - only
+    // an explicit failed/timed-out reconnect ATTEMPT grows it further, and
+    // only mqttResult(true) (a full, genuinely stable success) resets it
+    // back to the floor. See retryDelayMs()/retryAtMs()'s doc comments for
+    // the context-sensitive public accessors.
+    uint32_t wifiRetryDelayMs_;
+    uint32_t wifiRetryAtMs_ = 0;
 
     uint32_t wifiRecoveryThreshold_;
     uint32_t wifiRecoveryCooldownMs_;

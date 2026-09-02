@@ -45,6 +45,19 @@
 // existing IEventOutbox contract - see DevRingEventCoordinator/
 // publishPendingEvents (src/dev/dev_ring_event.*).
 //
+// This pass (call-session simulator): GPIO4 still only ever starts a
+// simulated call (RING_DETECTED), and GPIO3 now simulates that same
+// call's end (RING_ENDED), correlated by a shared call_id - a minimal
+// two-state (Idle/Ringing) machine owned by DevRingEventCoordinator, plus
+// a DEV-only kDevCallTimeoutMs safety timeout so a simulated call can
+// never remain Ringing forever if GPIO3 never pulses. This is still
+// exclusively a bench/DEV convenience for exercising
+// firmware -> MQTT -> backend -> push -> app: neither GPIO simulates real
+// intercom-line ringing/off-hook/audio, and neither the Si3050 nor the
+// Linker Button module is validated by this environment - see
+// docs/dev-ring-simulator.md > "Call session state machine" and
+// dev_ring_simulator_config.h for the full pin rationale.
+//
 // Cumulative DEV integration pass: this environment now also subscribes to
 // the commands topic and processes them through DevCommandEnvironment (see
 // dev_command_environment.h) - the exact same
@@ -107,18 +120,24 @@ private:
     NtpSyncState syncState_;
 };
 
-// Reads the physical button. The bench component actually wired here is
-// a "Linker Button" module (PCB with VCC/GND/SIG, not a bare dry-contact
-// switch): its own documentation states SIG=LOW when released and
-// SIG=HIGH when pressed - the opposite polarity of a dry contact pulled
-// up internally and grounded on press, which an earlier version of this
-// file incorrectly assumed (INPUT_PULLUP + active-low). Plain INPUT (no
-// internal pull-up/pull-down - the module actively drives the pin both
-// ways) + active-high matches the module's real datasheet behavior. See
-// docs/dev-ring-simulator.md > Wiring diagram.
+// Reads one of the two DEV bench inputs (GPIO4 "start"/GPIO3 "end" - see
+// dev_ring_simulator_config.h). Both are wired the same way: normally LOW
+// through an external ~10 kOhm resistor to GND, pulsed momentarily to
+// 3V3 - the exact scheme the successful GPIO4 hardware validation used
+// (see docs/dev-ring-simulator.md > Bench test history). Plain INPUT (no
+// internal pull-up/pull-down - the external resistor already defines the
+// resting level) + active-high. This class is intentionally pin-agnostic
+// so the same code path is exercised for both buttons; an earlier version
+// of this file also documented an alternative "Linker Button" module
+// wiring for GPIO4 (VCC/GND/SIG, self-driven both ways) - that module is
+// still not validated and is not what this class assumes today.
 class Esp32DevRingButtonInput final : public IDevRingButtonInput {
 public:
-    bool isPressed() override { return digitalRead(kDevRingButtonPin) == HIGH; }
+    explicit Esp32DevRingButtonInput(uint8_t pin) : pin_(pin) {}
+    bool isPressed() override { return digitalRead(pin_) == HIGH; }
+
+private:
+    uint8_t pin_;
 };
 
 AwsIotConnectionConfig connectionConfig() {
@@ -139,9 +158,16 @@ MemoryStore devStore;
 DeviceCredentialStore credentials(devStore);
 Esp32RandomSource randomSource;
 MemoryEventOutbox eventOutbox;
-Esp32DevRingButtonInput buttonInput;
-DevRingButtonController buttonController(buttonInput);
-DevRingEventCoordinator ringCoordinator(buttonController, randomSource, eventOutbox, INTERBRIDGE_DEV_DEVICE_ID);
+// GPIO4 (start of a simulated call, RING_DETECTED) and GPIO3 (end of the
+// same simulated call, RING_ENDED) - see dev_ring_simulator_config.h for
+// the full pin rationale and docs/dev-ring-simulator.md > "Call session
+// state machine" for the two-state coordinator both feed into.
+Esp32DevRingButtonInput startButtonInput(kDevRingButtonPin);
+Esp32DevRingButtonInput endButtonInput(kDevRingEndButtonPin);
+DevRingButtonController startButtonController(startButtonInput);
+DevRingButtonController endButtonController(endButtonInput);
+DevRingEventCoordinator ringCoordinator(startButtonController, endButtonController, randomSource, eventOutbox,
+                                        INTERBRIDGE_DEV_DEVICE_ID);
 MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
 Esp32AwsIotTransport transport(connectionConfig(), credentials);
 // Shared DEV command-processing composition (InMemoryDedupCache/
@@ -182,7 +208,7 @@ const char* resetReasonName(esp_reset_reason_t reason) {
         case ESP_RST_TASK_WDT: return "task_watchdog";
         case ESP_RST_WDT: return "watchdog";
         case ESP_RST_BROWNOUT: return "brownout";
-        default: return "other";
+        default: return "unknown";
     }
 }
 
@@ -192,10 +218,20 @@ const char* resetReasonName(esp_reset_reason_t reason) {
 // would drift against future core versions). Anything else stays
 // numeric-only in the log line already printed alongside this. Mirrors
 // mqtt_smoke_main.cpp's identical helper verbatim.
+//
+// WIFI_REASON_ASSOC_LEAVE (8) in particular must never be assumed to mean
+// "the AP kicked us" - it is exactly the reason code the ESP32 Wi-Fi
+// driver reports for a disconnect WE ourselves requested (WiFi.disconnect())
+// too. See onWifiEvent()'s own origin= annotation below, which is the
+// actual way to tell the two apart - this name alone is not enough.
 const char* wifiDisconnectReasonName(uint8_t reason) {
     switch (reason) {
         case WIFI_REASON_NO_AP_FOUND: return "no_ap_found";
         case WIFI_REASON_TIMEOUT: return "timeout";
+        case WIFI_REASON_ASSOC_LEAVE: return "assoc_leave";
+        case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake_timeout";
+        case WIFI_REASON_AUTH_EXPIRE: return "auth_expire";
+        case WIFI_REASON_BEACON_TIMEOUT: return "beacon_timeout";
         default: return nullptr;
     }
 }
@@ -286,22 +322,40 @@ void performWifiScan(uint32_t now) {
 // called directly from this callback.
 volatile bool wifiAssociatedEventPending = false;
 volatile bool wifiDisconnectedEventPending = false;
+// Set synchronously, single-threaded, by the RecoverWifi case handler in
+// loop() right before its own WiFi.disconnect() call - read (and cleared)
+// here so the resulting ARDUINO_EVENT_WIFI_STA_DISCONNECTED can be logged
+// with its true origin. WIFI_REASON_ASSOC_LEAVE (8) in particular is
+// exactly the code the driver also reports for a disconnect WE requested
+// ourselves - a real bench run showed this and it must never be silently
+// read as "the AP kicked us" without checking this flag first.
+volatile bool wifiLocalDisconnectExpected = false;
 
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
         const uint8_t reason = info.wifi_sta_disconnected.reason;
         wifiDisconnectedEventPending = true;
+        const bool local = wifiLocalDisconnectExpected;
+        wifiLocalDisconnectExpected = false;
         const char* name = wifiDisconnectReasonName(reason);
+        const char* origin = local ? "local_recovery" : "remote_or_unknown";
         if (name) {
-            Serial.printf("[DEV RING] wifi event=disconnected reason=%u (%s)\n",
-                          static_cast<unsigned>(reason), name);
+            Serial.printf("[DEV RING] wifi event=disconnected reason=%u (%s) origin=%s\n",
+                          static_cast<unsigned>(reason), name, origin);
         } else {
-            Serial.printf("[DEV RING] wifi event=disconnected reason=%u\n",
-                          static_cast<unsigned>(reason));
+            Serial.printf("[DEV RING] wifi event=disconnected reason=%u origin=%s\n",
+                          static_cast<unsigned>(reason), origin);
         }
     } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
-        wifiAssociatedEventPending = true;
-        Serial.println("[DEV RING] wifi event=connected");
+        // L2 association only - DHCP/IP has not completed yet. This must
+        // never be forwarded as a success signal; only GOT_IP below does
+        // that. A real bench run showed the two conflated (both treated
+        // as "connected" here), which - combined with a drop before DHCP
+        // ever completed - could permanently strand the connectivity
+        // state machine in WaitingForWifi, requiring a manual reboot to
+        // recover. See docs/dev-ring-simulator.md > "Connectivity
+        // recovery hardening".
+        Serial.println("[DEV RING] wifi event=associated awaiting_ip=true");
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
         wifiAssociatedEventPending = true;
         Serial.println("[DEV RING] wifi event=got_ip");
@@ -337,18 +391,34 @@ void safeStatus(const char* operation, bool ok) {
     Serial.printf("[DEV RING] %s: %s\n", operation, ok ? "ok" : "failed");
 }
 
+// The full credential/scan summary (logWifiConfigAndScanSummary()) is
+// deliberately NOT repeated every heartbeat while Wi-Fi is down - nothing
+// in it changes tick to tick (the scan itself only ever runs once per
+// boot), and CI/manual-test feedback on an earlier pass of this file
+// flagged the resulting repetition as log spam. It is still repeated
+// occasionally (kWifiSummaryRepeatMs) so a serial monitor attached late
+// still sees it without waiting for a reboot, just far less often than
+// every 15s heartbeat.
+constexpr uint32_t kWifiSummaryRepeatMs = 120u * 1000u;
+uint32_t lastWifiSummaryLogAtMs = 0;
+bool wifiSummaryEverLogged = false;
+
 void heartbeat(uint32_t now) {
     if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
     heartbeatAt = now + kHeartbeatMs;
     const bool wifiUp = WiFi.status() == WL_CONNECTED;
-    Serial.printf("[DEV RING] local_status=%s wifi=%s time=%s mqtt=%s outbox_size=%u uptime_s=%lu\n",
-                  stateName(connectivity.state()), wifiUp ? "up" : "down",
+    // RSSI is only meaningful once associated; -127 is the conventional
+    // "no signal"/not-applicable sentinel WiFi.RSSI() itself returns when
+    // not connected, printed as-is rather than a separate branch.
+    Serial.printf("[DEV RING] local_status=%s wifi=%s rssi=%d time=%s mqtt=%s outbox_size=%u uptime_s=%lu\n",
+                  stateName(connectivity.state()), wifiUp ? "up" : "down", WiFi.RSSI(),
                   clockSource.hasValidTime() ? "valid" : "pending", transport.isConnected() ? "up" : "down",
                   static_cast<unsigned>(eventOutbox.size()), static_cast<unsigned long>(now / 1000));
-    // Repeats the sanitized credential/scan summary while Wi-Fi is down, so
-    // it stays visible even if the serial monitor is attached well after
-    // boot and missed the setup()/ConnectWifi prints.
-    if (!wifiUp) logWifiConfigAndScanSummary(now);
+    if (!wifiUp && (!wifiSummaryEverLogged || DevMqttSmokeState::deadlineReached(now, lastWifiSummaryLogAtMs))) {
+        logWifiConfigAndScanSummary(now);
+        lastWifiSummaryLogAtMs = now + kWifiSummaryRepeatMs;
+        wifiSummaryEverLogged = true;
+    }
 }
 
 // Publishes the same periodic presence signal mqtt_smoke_main.cpp does
@@ -387,14 +457,29 @@ void setup() {
     // only happens once loop() runs) so no early disconnect/connect event
     // can be missed - same ordering as mqtt_smoke_main.cpp.
     WiFi.onEvent(onWifiEvent);
+    // The ESP32 Arduino core's own auto-reconnect (on by default) retries
+    // association internally, independent of - and racing against -
+    // DevMqttSmokeState's own explicit ConnectWifi/backoff cadence. A real
+    // bench run showed exactly this: connected/disconnected event bursts
+    // that did not correspond one-to-one with this firmware's own
+    // WiFi.begin() calls. Disabling it makes this firmware's own state
+    // machine the single, sole source of every reconnection attempt - see
+    // docs/dev-ring-simulator.md > "Connectivity recovery hardening".
+    WiFi.setAutoReconnect(false);
     logWifiConfigAndScanSummary(millis());
 
-    // No internal pull-up: the Linker Button module actively drives SIG
-    // both ways (LOW released, HIGH pressed) - see
-    // Esp32DevRingButtonInput's doc comment.
+    // No internal pull-up/pull-down: each external ~10 kOhm resistor to
+    // GND already defines the resting LOW level - see
+    // Esp32DevRingButtonInput's doc comment. Enabling an internal pull
+    // here would fight that external resistor rather than complement it.
     pinMode(kDevRingButtonPin, INPUT);
-    Serial.printf("[DEV RING] button initialized gpio=%u mode=INPUT active=high module=linker\n",
+    Serial.printf("[DEV RING] start button initialized gpio=%u mode=INPUT active=high rig=external_pulldown_10k "
+                  "role=call_start\n",
                   static_cast<unsigned>(kDevRingButtonPin));
+    pinMode(kDevRingEndButtonPin, INPUT);
+    Serial.printf("[DEV RING] end button initialized gpio=%u mode=INPUT active=high rig=external_pulldown_10k "
+                  "role=call_end\n",
+                  static_cast<unsigned>(kDevRingEndButtonPin));
 
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
@@ -502,6 +587,14 @@ void loop() {
                                   static_cast<unsigned>(commandEnv.pendingResponseCount()));
                 }
             }
+            if (connected && subscribed) {
+                // A full end-to-end success is what actually resets the
+                // Wi-Fi reconnection backoff (DevMqttSmokeState::mqttResult())
+                // back to its floor - logged explicitly so a real bench run
+                // can confirm recovery genuinely completed, not merely that
+                // Wi-Fi briefly reassociated.
+                Serial.println("[DEV RING] network stable; wifi retry backoff reset");
+            }
             connectivity.mqttResult(now, connected && subscribed);
             safeStatus("MQTT connect", connected && subscribed);
             if (!connected || !subscribed) {
@@ -519,11 +612,17 @@ void loop() {
             // never ESP.restart().
             Serial.println("[DEV RING] wifi recovery requested");
             if (transport.isConnected()) transport.disconnect();
+            // Marks the disconnect event this call is about to trigger as
+            // self-inflicted, so onWifiEvent() can log its true origin
+            // instead of leaving reason=8 (WIFI_REASON_ASSOC_LEAVE) to be
+            // misread as "the AP kicked us" - see wifiLocalDisconnectExpected.
+            wifiLocalDisconnectExpected = true;
             // wifioff=false keeps the radio on; eraseap=false keeps the
             // stored Wi-Fi credentials - only the current association is
             // dropped. The ordinary ConnectWifi/backoff flow (unchanged)
             // re-associates from here.
             WiFi.disconnect(false, false);
+            Serial.println("[DEV RING] wifi disconnect requested origin=local_recovery");
             Serial.printf("[DEV RING] wifi recovery cooldown until_ms=%lu\n",
                           static_cast<unsigned long>(connectivity.wifiRecoveryCooldownUntilMs()));
             break;
@@ -534,9 +633,43 @@ void loop() {
     // independent of connectivity state - a press while offline still
     // enqueues (see DevRingEventCoordinator::update()) and is replayed
     // once the outbox drain below can reach the broker again.
-    std::string eventId = ringCoordinator.update(now, clockSource.hasValidTime(), clockSource.unixTimeSeconds());
-    if (!eventId.empty()) {
-        Serial.println("[DEV RING] valid press detected; RING_DETECTED enqueued");
+    const DevCallSessionOutcome outcome =
+        ringCoordinator.update(now, clockSource.hasValidTime(), clockSource.unixTimeSeconds());
+    bool eventEnqueuedThisLoop = false;
+    switch (outcome.kind) {
+        case DevCallSessionEventKind::RingDetected:
+            eventEnqueuedThisLoop = true;
+            Serial.printf("[DEV RING] valid start detected on GPIO%u; RING_DETECTED enqueued call_id=%s\n",
+                          static_cast<unsigned>(kDevRingButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::RingEndedByButton:
+            eventEnqueuedThisLoop = true;
+            Serial.printf("[DEV RING] valid end detected on GPIO%u; RING_ENDED enqueued call_id=%s\n",
+                          static_cast<unsigned>(kDevRingEndButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::RingEndedByTimeout:
+            eventEnqueuedThisLoop = true;
+            // The timeout reason is deliberately local-log-only, not a
+            // wire payload field: docs/communication-protocol.md does not
+            // yet define one, and this DEV simulator must not invent a
+            // field the backend was never coordinated on - see
+            // docs/dev-ring-simulator.md > "Call session state machine" >
+            // Safety timeout.
+            Serial.printf("[DEV RING] call timed out after %lums with no GPIO%u pulse; RING_ENDED enqueued "
+                          "call_id=%s reason=timeout(local-only)\n",
+                          static_cast<unsigned long>(kDevCallTimeoutMs), static_cast<unsigned>(kDevRingEndButtonPin),
+                          outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::StartIgnoredAlreadyRinging:
+            Serial.printf("[DEV RING] GPIO%u press ignored; call_id=%s already active\n",
+                          static_cast<unsigned>(kDevRingButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::EndIgnoredNoActiveCall:
+            Serial.printf("[DEV RING] GPIO%u press ignored; no active call\n",
+                          static_cast<unsigned>(kDevRingEndButtonPin));
+            break;
+        case DevCallSessionEventKind::None:
+            break;
     }
 
     if (transport.isConnected()) {
@@ -553,7 +686,7 @@ void loop() {
         // Logged at heartbeat cadence too, but an explicit line right
         // after a fresh enqueue makes the "waiting for reconnection"
         // state obvious without waiting up to 15s for the heartbeat.
-        if (!eventId.empty()) {
+        if (eventEnqueuedThisLoop) {
             Serial.println("[DEV RING] offline; event queued, awaiting reconnection");
         }
     }

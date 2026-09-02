@@ -1632,6 +1632,167 @@ this pass:)*
   accumulate capabilities from the other DEV environments. GPIO4/
   `RING_DETECTED` remains only a temporary DEV substitute for the real
   Si3050-based ring detector, not a production mechanism.
+- **Call-session extension of the 3B.8 DEV ring simulator: GPIO3 now
+  simulates the end of the same simulated call (`RING_ENDED`), correlated
+  with GPIO4's `RING_DETECTED` by a new, shared `call_id`.** Following the
+  DEV environment evolution rule directly above, this keeps every
+  previously-validated capability (Wi-Fi/NTP/MQTT, health, command
+  processing via `DevCommandEnvironment`) intact and adds a minimal
+  `Idle`/`Ringing` state machine on top, owned by (the now two-button)
+  `DevRingEventCoordinator` (`src/dev/dev_ring_event.h/.cpp`): a GPIO4
+  pulse in `Idle` generates a new `call_id` and enqueues `RING_DETECTED`;
+  a GPIO3 pulse in `Ringing`, or a DEV-only safety timeout
+  (`kDevCallTimeoutMs`, 60s default, aligned with the app's own
+  ring-timeout fallback) if GPIO3 never pulses, enqueues `RING_ENDED`
+  reusing that exact `call_id` and returns to `Idle`. A GPIO3 pulse with
+  no active call, and a second GPIO4 pulse while already `Ringing`, are
+  both explicitly ignored (no new event, no state change) rather than
+  silently mis-tracked. `protocol/messages.h/.cpp` gained
+  `ProtocolEventName::RingEnded` and an optional `DeviceEvent::callId`
+  (omitted from the JSON, and therefore fully retrocompatible, for every
+  event that isn't part of a call session);
+  `docs/communication-protocol.md` section 16.1 records the `RING_ENDED`/
+  `call_id` wire contract (at the time of this specific bullet, only a
+  firmware-side proposal - later coordinated with the backend and app,
+  see the follow-up bullet below).
+  GPIO3 is a second, equally provisional DEV-only overlap - this time
+  with `kSi3050PinPcmDtx` (DTX) - justified for exactly the same reason
+  as GPIO4/DRX (`esp32-c3-dev-ring-simulator` never compiles or
+  initializes Si3050 code, and no Si3050 is attached while it runs), with
+  the same compile-time-asserted single-approved-pin guard in
+  `dev_ring_simulator_config.h`. A genuine, previously-latent ordering bug
+  was found and fixed while implementing this: `publishPendingEvents()`
+  (`src/dev/dev_ring_event.cpp`) used to keep iterating past a failed
+  publish, which could have let a later-enqueued `RING_ENDED` publish
+  successfully ahead of an earlier-enqueued `RING_DETECTED` still stuck at
+  the front of the outbox after a failed retry attempt for it specifically
+  - it now stops at the first failed publish, preserving strict FIFO
+  publish order. Proven by 16 native tests in a rewritten
+  `test/test_dev_ring_event` (state machine transitions/ignored edges,
+  `event_id`/`call_id` distinctness and reuse, debounce on both GPIOs, the
+  GPIO3-vs-timeout race producing only one `RING_ENDED`, the publish-order
+  fix, and restart always starting `Idle`) - all pre-existing native
+  suites are unaffected. At the time of this specific bullet, not yet
+  exercised on real hardware; a later pass closed that gap - see
+  `docs/dev-ring-simulator.md` > "Call session addition
+  (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated with
+  backend and app" for the real-hardware record, and its "Call session
+  manual test procedure" for exactly which steps that run exercised. This
+  does not claim the Si3050 was tested, that a real intercom line's ring
+  end was physically detected, that the Linker Button was validated, or
+  that GPIO3/GPIO4 are final production pins.
+- **Real-hardware finding + fix: `esp32-c3-dev-ring-simulator` connected
+  successfully, then lost connectivity and never recovered without a
+  manual reboot.** Two independent, compounding defects in this
+  repository's own code (not the AP/router): (1)
+  `ARDUINO_EVENT_WIFI_STA_CONNECTED` (L2 association only, before DHCP)
+  was forwarded to `DevMqttSmokeState` as a full success signal
+  identically to `..._GOT_IP` - combined with a latent bug in
+  `DevMqttSmokeState` itself (a success signal cleared the in-flight
+  attempt immediately with no further safeguard), this could permanently
+  strand the state machine in `WaitingForWifi` with `actionIssued_` stuck
+  `true` and no pending transition to ever reset it, if `wifiConnected`
+  then never actually became true - exactly what a real bench log showed.
+  `reason=8` (`WIFI_REASON_ASSOC_LEAVE`) disconnects were also ambiguous:
+  the driver reports that same code for both an AP-initiated drop and this
+  firmware's own `RecoverWifi`-triggered `WiFi.disconnect()`. (2) The
+  ESP32 Arduino core's own Wi-Fi auto-reconnect (on by default) was never
+  disabled, letting it retry association internally, racing against
+  `DevMqttSmokeState`'s own explicit `ConnectWifi`/backoff cadence as a
+  second, uncoordinated source of connect/disconnect events. **Fixed**:
+  `DevMqttSmokeState` (`src/dev/mqtt_smoke_state.h/.cpp`) gained a bounded
+  "awaiting confirmed connect" window
+  (`wifiConnectConfirmationPending()`) so an unconfirmed/premature success
+  signal can never wedge it again (defense in depth, not only a
+  caller-side fix), plus a dedicated Wi-Fi reconnection backoff - separate
+  from the unchanged per-stage DNS/Time/MQTT ladder - that grows only on
+  an explicit failed/timed-out reconnect attempt and resets only on a
+  full, genuinely stable success (`mqttResult(true)`), never merely by
+  re-entering `WaitingForWifi` (a real, related bug: the original design
+  reset backoff to the floor on every re-entry, including a momentary
+  reassociation that dropped again before ever stabilizing). A genuinely
+  fresh loss-of-connectivity transition still reseeds just the retry
+  *deadline* from `nowMs` (both the semantically correct reaction to a new
+  loss, and a fix for a 32-bit `millis()`-wraparound hazard on a
+  long-untouched deadline, found and fixed during this same work before it
+  was ever committed) - never the backoff *growth* itself. Both DEV
+  entry points now handle `STA_CONNECTED`/`STA_GOT_IP` distinctly (only
+  `GOT_IP` is a success signal), call `WiFi.setAutoReconnect(false)` once
+  in `setup()`, and log each disconnect's origin
+  (`origin=local_recovery`/`remote_or_unknown`) via a flag set immediately
+  before `RecoverWifi`'s own `WiFi.disconnect()` call.
+  `wifiDisconnectReasonName()` also now names `WIFI_REASON_ASSOC_LEAVE`/
+  `HANDSHAKE_TIMEOUT`/`AUTH_EXPIRE`/`BEACON_TIMEOUT` explicitly. Heartbeat
+  log spam reduced (the full credential/scan summary no longer repeats
+  every 15s heartbeat while offline; RSSI added to the terse line
+  instead), and `previous_reset=` now names an unrecognized reset reason
+  `unknown` rather than `other`. Proven by 4 new tests in
+  `test/test_dev_mqtt_state` (26 → 30) exercising exactly these two fixed
+  defects plus the two related backoff/wraparound bugs found while fixing
+  them; all pre-existing suites (including the other 26 in this file)
+  remain unchanged and passing. The outbox is still RAM-only - this pass
+  fixes *ordinary* connectivity-loss recovery so a reboot is no longer
+  *required* for that case, but does not add persistence (see Future Work
+  below); `event_id`/`call_id`/timestamp are still never regenerated on
+  retry, and `publishPendingEvents()`'s strict-FIFO ordering (see the
+  call-session entry above) is untouched. GPIO3/GPIO4, the call-session
+  state machine, and `DevCommandEnvironment` are completely untouched by
+  this pass. See `docs/dev-ring-simulator.md` > "Connectivity recovery
+  hardening" for the full sanitized log, root-cause writeup, and the
+  pending manual real-hardware retest procedure - **not yet re-validated
+  on real hardware**.
+- **Documentation-only follow-up: the `RING_DETECTED`/`RING_ENDED`/
+  `call_id` contract is now coordinated across firmware, backend, and
+  app - no longer only a firmware-side proposal.** Three still-open pull
+  requests, one per repository, track it: `hjca14/interBridge#23` (this
+  one), `hjca14/interBackend#27`, and `hjca14/interapp#24` - all three
+  still gated on the same shared, integrated validation round before any
+  of them merges. `docs/communication-protocol.md` section 16.1 and
+  `docs/dev-ring-simulator.md` were updated to state this correctly
+  (previously they read as "proposed, not yet backend-coordinated," which
+  had gone stale). This is a documentation-only correction: no firmware
+  code, test, configuration, or behavior changed. Still true and
+  unchanged by this correction: `event_id` identifies one message,
+  `call_id` identifies the call session and is shared between a
+  `RING_DETECTED` and its `RING_ENDED`; the firmware publishes
+  `RING_ENDED`, the backend processes and forwards the call's end, and
+  the app ends only the session whose `call_id` matches; GPIO4/GPIO3
+  remain temporary DEV-only simulators, never a production pin
+  assignment; and the Si3050 and Linker Button module remain
+  electrically unvalidated. At the time of this specific bullet,
+  GPIO3/`RING_ENDED` and the complete call cycle were still not validated
+  on real hardware - see the following bullet for the subsequent
+  hardware run that closed that gap (the connectivity-recovery hardening
+  itself remains not physically validated).
+- **Real-hardware finding: the coordinated call-session contract
+  (GPIO3/`RING_ENDED`/`call_id`) was validated end to end on a real
+  ESP32-C3 Super Mini, integrated with the deployed coordinated backend
+  (`hjca14/interBackend#27`) and the installed coordinated app
+  (`hjca14/interapp#24`).** Confirmed, with valid local DEV credentials:
+  Wi-Fi/NTP/AWS IoT MQTT/mTLS/health completed and the device appeared
+  online in the app; GPIO4 started a session and published exactly one
+  `RING_DETECTED`; GPIO3 ended that same session and published
+  `RING_ENDED` with a distinct `event_id` and the same `call_id`; the
+  event traversed firmware → AWS IoT → `telemetry_ingestion` →
+  `push_sender` → FCM → app, and the app ended its call presentation on
+  the correlated `RING_ENDED`; a subsequent session received a new
+  `call_id`. This validates the DEV bench pipeline and the cross-repo
+  contract - it does **not** validate the Si3050, Si3018/Si3019, a real
+  analog intercom line, physical ringing or its end, audio, off-hook,
+  physical door opening, the Linker Button module (this run used the
+  same external-resistor + momentary-3V3-jumper rig as GPIO4's original
+  validation for both pins), GPIO3/GPIO4 as a production pin assignment,
+  production firmware/provisioning/BLE/infrastructure beyond the deployed
+  DEV environment, or the connectivity-recovery hardening's actual
+  loss-and-recovery behavior (this run confirmed normal connectivity, not
+  a connectivity interruption - see the connectivity-recovery bullet
+  above, still pending its own physical retest). The firmware still boots
+  into `Idle` and the outbox remains RAM-only, unchanged by this run. See
+  `docs/dev-ring-simulator.md` > "Call session addition
+  (GPIO3/`RING_ENDED`/`call_id`): hardware-validated, integrated with
+  backend and app" for the full record, and
+  `docs/communication-protocol.md` section 16.1's "Cross-repo
+  coordination and validation status" for the contract-level summary.
 
 ## Future Work
 

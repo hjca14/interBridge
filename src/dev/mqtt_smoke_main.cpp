@@ -102,7 +102,7 @@ const char* resetReasonName(esp_reset_reason_t reason) {
         case ESP_RST_TASK_WDT: return "task_watchdog";
         case ESP_RST_WDT: return "watchdog";
         case ESP_RST_BROWNOUT: return "brownout";
-        default: return "other";
+        default: return "unknown";
     }
 }
 
@@ -111,10 +111,20 @@ const char* resetReasonName(esp_reset_reason_t reason) {
 // not a hand-copied duplicate of the whole wifi_err_reason_t enum (which
 // would drift against future core versions). Anything else stays
 // numeric-only in the log line already printed alongside this.
+//
+// WIFI_REASON_ASSOC_LEAVE (8) in particular must never be assumed to mean
+// "the AP kicked us" - it is exactly the reason code the ESP32 Wi-Fi
+// driver reports for a disconnect WE ourselves requested (WiFi.disconnect())
+// too. See onWifiEvent()'s own origin= annotation below, which is the
+// actual way to tell the two apart - this name alone is not enough.
 const char* wifiDisconnectReasonName(uint8_t reason) {
     switch (reason) {
         case WIFI_REASON_NO_AP_FOUND: return "no_ap_found";
         case WIFI_REASON_TIMEOUT: return "timeout";
+        case WIFI_REASON_ASSOC_LEAVE: return "assoc_leave";
+        case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake_timeout";
+        case WIFI_REASON_AUTH_EXPIRE: return "auth_expire";
+        case WIFI_REASON_BEACON_TIMEOUT: return "beacon_timeout";
         default: return nullptr;
     }
 }
@@ -226,22 +236,37 @@ void performWifiScan(uint32_t now) {
 // machine.
 volatile bool wifiAssociatedEventPending = false;
 volatile bool wifiDisconnectedEventPending = false;
+// Set synchronously, single-threaded, by the RecoverWifi case handler in
+// loop() right before its own WiFi.disconnect() call - read (and cleared)
+// here so the resulting ARDUINO_EVENT_WIFI_STA_DISCONNECTED can be logged
+// with its true origin. WIFI_REASON_ASSOC_LEAVE (8) in particular is
+// exactly the code the driver also reports for a disconnect WE requested
+// ourselves - a real bench run showed this and it must never be silently
+// read as "the AP kicked us" without checking this flag first.
+volatile bool wifiLocalDisconnectExpected = false;
 
 void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
         const uint8_t reason = info.wifi_sta_disconnected.reason;
         wifiDisconnectedEventPending = true;
+        const bool local = wifiLocalDisconnectExpected;
+        wifiLocalDisconnectExpected = false;
         const char* name = wifiDisconnectReasonName(reason);
+        const char* origin = local ? "local_recovery" : "remote_or_unknown";
         if (name) {
-            Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u (%s)\n",
-                          static_cast<unsigned>(reason), name);
+            Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u (%s) origin=%s\n",
+                          static_cast<unsigned>(reason), name, origin);
         } else {
-            Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u\n",
-                          static_cast<unsigned>(reason));
+            Serial.printf("[DEV MQTT] wifi event=disconnected reason=%u origin=%s\n",
+                          static_cast<unsigned>(reason), origin);
         }
     } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
-        wifiAssociatedEventPending = true;
-        Serial.println("[DEV MQTT] wifi event=connected");
+        // L2 association only - DHCP/IP has not completed yet. This must
+        // never be forwarded as a success signal; only GOT_IP below does
+        // that - see dev_ring_simulator_main.cpp's identical comment and
+        // docs/dev-ring-simulator.md > "Connectivity recovery hardening"
+        // for the real-hardware hang this conflation could cause.
+        Serial.println("[DEV MQTT] wifi event=associated awaiting_ip=true");
     } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
         wifiAssociatedEventPending = true;
         Serial.println("[DEV MQTT] wifi event=got_ip");
@@ -279,20 +304,27 @@ const char* stateName(DevSmokeState state) {
     }
     return "unknown";
 }
+// See dev_ring_simulator_main.cpp's identical constant/rationale: the full
+// credential/scan summary is deliberately not repeated every heartbeat.
+constexpr uint32_t kWifiSummaryRepeatMs = 120u * 1000u;
+uint32_t lastWifiSummaryLogAtMs = 0;
+bool wifiSummaryEverLogged = false;
+
 void heartbeat(uint32_t now) {
     if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
     heartbeatAt = now + kHeartbeatMs;
     const bool wifiUp = WiFi.status() == WL_CONNECTED;
-    Serial.printf("[DEV MQTT] local_status=%s wifi=%s time=%s mqtt=%s uptime_s=%lu heap_free=%u heap_min=%u stack_words=%u\n",
-                  stateName(connectivity.state()), wifiUp ? "up" : "down",
+    Serial.printf("[DEV MQTT] local_status=%s wifi=%s rssi=%d time=%s mqtt=%s uptime_s=%lu heap_free=%u heap_min=%u stack_words=%u\n",
+                  stateName(connectivity.state()), wifiUp ? "up" : "down", WiFi.RSSI(),
                   clockSource.hasValidTime() ? "valid" : "pending",
                   transport.isConnected() ? "up" : "down",
                   static_cast<unsigned long>(now / 1000), ESP.getFreeHeap(), ESP.getMinFreeHeap(),
                   static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
-    // Repeats the sanitized credential/scan summary while Wi-Fi is down, so
-    // it stays visible even if the serial monitor is attached well after
-    // boot and missed the setup()/ConnectWifi prints.
-    if (!wifiUp) logWifiConfigAndScanSummary(now);
+    if (!wifiUp && (!wifiSummaryEverLogged || DevMqttSmokeState::deadlineReached(now, lastWifiSummaryLogAtMs))) {
+        logWifiConfigAndScanSummary(now);
+        lastWifiSummaryLogAtMs = now + kWifiSummaryRepeatMs;
+        wifiSummaryEverLogged = true;
+    }
 }
 
 void publishHealth(uint32_t now) {
@@ -318,6 +350,12 @@ void setup() {
     Serial.println("[DEV MQTT] local configuration loaded into transient DEV memory (values not logged)");
     Serial.printf("[DEV MQTT] previous_reset=%s\n", resetReasonName(esp_reset_reason()));
     WiFi.onEvent(onWifiEvent);
+    // The ESP32 Arduino core's own auto-reconnect (on by default) retries
+    // association internally, independent of - and racing against -
+    // DevMqttSmokeState's own explicit ConnectWifi/backoff cadence - see
+    // dev_ring_simulator_main.cpp's identical call and
+    // docs/dev-ring-simulator.md > "Connectivity recovery hardening".
+    WiFi.setAutoReconnect(false);
     logWifiConfigAndScanSummary(millis());
     credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
     credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
@@ -435,6 +473,12 @@ void loop() {
                                   static_cast<unsigned>(commandEnv.pendingResponseCount()));
                 }
             }
+            if (connected && subscribed) {
+                // A full end-to-end success is what actually resets the
+                // Wi-Fi reconnection backoff (DevMqttSmokeState::mqttResult())
+                // back to its floor.
+                Serial.println("[DEV MQTT] network stable; wifi retry backoff reset");
+            }
             connectivity.mqttResult(now, connected && subscribed);
             safeStatus("MQTT connect", connected && subscribed);
             if (!connected || !subscribed) {
@@ -454,11 +498,16 @@ void loop() {
             Serial.println("[DEV MQTT] wifi recovery requested");
             if (transport.isConnected()) transport.disconnect();
             subscribed = false;
+            // Marks the disconnect event this call is about to trigger as
+            // self-inflicted, so onWifiEvent() can log its true origin -
+            // see wifiLocalDisconnectExpected's doc comment.
+            wifiLocalDisconnectExpected = true;
             // wifioff=false keeps the radio on; eraseap=false keeps the
             // stored Wi-Fi credentials - only the current association is
             // dropped. The ordinary ConnectWifi/backoff flow (unchanged)
             // re-associates from here.
             WiFi.disconnect(false, false);
+            Serial.println("[DEV MQTT] wifi disconnect requested origin=local_recovery");
             Serial.printf("[DEV MQTT] wifi recovery cooldown until_ms=%lu\n",
                           static_cast<unsigned long>(connectivity.wifiRecoveryCooldownUntilMs()));
             break;
