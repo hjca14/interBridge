@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -46,12 +47,22 @@ class IBleProvisioning {
 public:
     virtual ~IBleProvisioning() = default;
 
-    // Starts BLE advertising for provisioning with the given (non-secret)
-    // advertisement metadata, securing the session with
-    // proofOfPossession. Real PoP generation/storage is not implemented
-    // yet - see provisioning_manager.h.
+    // Requests the start of BLE advertising for provisioning with the
+    // given (non-secret) advertisement metadata, securing the session
+    // with proofOfPossession. Real PoP generation/storage is not
+    // implemented yet - see provisioning_manager.h. A true return means
+    // only that the request was made with valid inputs - see
+    // isAdvertising()'s doc comment for why that is not the same as
+    // advertising being confirmed active.
     virtual bool startAdvertising(const BleAdvertisementInfo& info, const std::string& proofOfPossession) = 0;
     virtual void stopAdvertising() = 0;
+    // True once BLE advertising is confirmed active. A bench run showed
+    // this matters: the real adapter's underlying WiFiProv call has no
+    // synchronous success/failure return, so a successful
+    // startAdvertising() call alone must never be treated as advertising
+    // being active - see Esp32BleProvisioning::notifyAdvertisingStarted()
+    // and BleOnboardingWindow below, which exist specifically to keep
+    // that request/confirmation distinction fail-closed.
     virtual bool isAdvertising() const = 0;
 
     // True once a central (the app) has established a secure session.
@@ -85,6 +96,11 @@ public:
 
     // Forwarded by the Arduino system-event callback in the isolated DEV
     // composition. Arguments are intentionally metadata-only.
+    //
+    // notifyAdvertisingStarted() must only be called on a real, observed
+    // ARDUINO_EVENT_PROV_START - never merely because startAdvertising()
+    // returned true. See isAdvertising()'s doc comment.
+    void notifyAdvertisingStarted();
     void notifySecureSessionEstablished();
     void notifyDisconnected();
     void notifyCredentials(const std::string& ssid, const std::string& password);
@@ -95,6 +111,63 @@ private:
     bool advertising_;
     bool sessionActive_;
     std::optional<WifiCredentialsPayload> receivedCredentials_;
+};
+
+// Tracks the "start requested -> confirmed active -> window closed"
+// lifecycle for one BLE onboarding attempt. Deliberately
+// hardware-independent (nowMs is caller-supplied, exactly like
+// DevMqttSmokeState in src/dev/mqtt_smoke_state.h) so this state machine
+// is natively unit-testable without any Arduino/ESP-IDF headers.
+//
+// This exists because WiFiProv.beginProvision() (see
+// Esp32BleProvisioning::startAdvertising()) has no synchronous success/
+// failure return. A real bench run showed the consequence: the previous
+// isolated DEV entry point opened its 5-minute window the instant the
+// start request was made, so a device that never actually started BLE
+// advertising still printed a plausible-looking "onboarding window
+// closed: timeout" - no evidence it had ever tried. requestStart()
+// therefore only arms a short confirmation deadline; only confirmStart()
+// (driven by the real ARDUINO_EVENT_PROV_START event) opens the actual
+// onboarding window. If confirmation never arrives, update() reports
+// StartNotConfirmed instead of ever reporting a timeout for a window
+// that never opened - fail-closed by construction. See
+// docs/ble-onboarding.md's "Physical validation" section.
+enum class BleOnboardingWindowEvent { None, StartNotConfirmed, WindowTimedOut };
+
+class BleOnboardingWindow {
+public:
+    BleOnboardingWindow(uint32_t confirmationTimeoutMs, uint32_t windowMs);
+
+    // Call once the start request has been made (e.g. right after a
+    // successful Esp32BleProvisioning::startAdvertising() call).
+    void requestStart(uint32_t nowMs);
+    // Call when the real start confirmation event arrives
+    // (ARDUINO_EVENT_PROV_START). No-op if requestStart() was never
+    // called, or the attempt already resolved (confirmed, or its
+    // confirmation deadline already passed) - a late confirmation must
+    // never resurrect an attempt update() has already closed.
+    void confirmStart(uint32_t nowMs);
+    // Closes the window immediately regardless of its own timeout (e.g.
+    // on ARDUINO_EVENT_PROV_END).
+    void close();
+
+    // Call once per loop tick. Returns StartNotConfirmed the first tick
+    // it observes the confirmation deadline reached while still awaiting
+    // confirmation, or WindowTimedOut the first tick it observes the
+    // window deadline reached while open - each fires exactly once per
+    // attempt, never repeated on a later tick.
+    BleOnboardingWindowEvent update(uint32_t nowMs);
+
+    bool isAwaitingConfirmation() const;
+    bool isOpen() const;
+
+private:
+    uint32_t confirmationTimeoutMs_;
+    uint32_t windowMs_;
+    bool awaitingConfirmation_ = false;
+    bool open_ = false;
+    uint32_t confirmationDeadlineMs_ = 0;
+    uint32_t windowDeadlineMs_ = 0;
 };
 
 // Test double: lets a test simulate a session starting and credentials

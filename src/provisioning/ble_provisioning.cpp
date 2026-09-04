@@ -10,6 +10,16 @@
 
 namespace interbridge {
 
+namespace {
+// Wrap-safe "has nowMs reached deadlineMs" check, same signed-subtraction
+// technique as DevMqttSmokeState::deadlineReached() in
+// src/dev/mqtt_smoke_state.cpp - duplicated locally rather than shared
+// across those two independent modules.
+bool deadlineReached(uint32_t nowMs, uint32_t deadlineMs) {
+    return static_cast<int32_t>(nowMs - deadlineMs) >= 0;
+}
+} // namespace
+
 BleAdvertisementInfo buildBleAdvertisementInfo(const std::string& deviceId) {
     size_t hintLength = std::min<size_t>(4, deviceId.size());
     std::string hint = deviceId.substr(deviceId.size() - hintLength, hintLength);
@@ -34,7 +44,9 @@ bool Esp32BleProvisioning::startAdvertising(const BleAdvertisementInfo& info, co
     WiFiProv.beginProvision(WIFI_PROV_SCHEME_BLE, WIFI_PROV_SCHEME_HANDLER_FREE_BTDM,
                             WIFI_PROV_SECURITY_1, proofOfPossession.c_str(),
                             info.deviceName.c_str());
-    advertising_ = true;
+    // beginProvision() has no synchronous success/failure return, so this
+    // is only the start REQUEST. advertising_ stays false until a real
+    // ARDUINO_EVENT_PROV_START is observed - see notifyAdvertisingStarted().
     return true;
 #else
     (void)info;
@@ -73,6 +85,7 @@ std::optional<WifiCredentialsPayload> Esp32BleProvisioning::pollReceivedCredenti
     return result;
 }
 
+void Esp32BleProvisioning::notifyAdvertisingStarted() { advertising_ = true; }
 void Esp32BleProvisioning::notifySecureSessionEstablished() { sessionActive_ = true; }
 void Esp32BleProvisioning::notifyDisconnected() { sessionActive_ = false; }
 void Esp32BleProvisioning::notifyCredentials(const std::string& ssid, const std::string& password) {
@@ -80,6 +93,44 @@ void Esp32BleProvisioning::notifyCredentials(const std::string& ssid, const std:
     receivedCredentials_ = WifiCredentialsPayload{ssid, password};
 }
 void Esp32BleProvisioning::notifyFailure() { sessionActive_ = false; }
+
+BleOnboardingWindow::BleOnboardingWindow(uint32_t confirmationTimeoutMs, uint32_t windowMs)
+    : confirmationTimeoutMs_(confirmationTimeoutMs), windowMs_(windowMs) {}
+
+void BleOnboardingWindow::requestStart(uint32_t nowMs) {
+    awaitingConfirmation_ = true;
+    open_ = false;
+    confirmationDeadlineMs_ = nowMs + confirmationTimeoutMs_;
+}
+
+void BleOnboardingWindow::confirmStart(uint32_t nowMs) {
+    if (!awaitingConfirmation_) {
+        return;
+    }
+    awaitingConfirmation_ = false;
+    open_ = true;
+    windowDeadlineMs_ = nowMs + windowMs_;
+}
+
+void BleOnboardingWindow::close() {
+    awaitingConfirmation_ = false;
+    open_ = false;
+}
+
+BleOnboardingWindowEvent BleOnboardingWindow::update(uint32_t nowMs) {
+    if (awaitingConfirmation_ && deadlineReached(nowMs, confirmationDeadlineMs_)) {
+        awaitingConfirmation_ = false;
+        return BleOnboardingWindowEvent::StartNotConfirmed;
+    }
+    if (open_ && deadlineReached(nowMs, windowDeadlineMs_)) {
+        open_ = false;
+        return BleOnboardingWindowEvent::WindowTimedOut;
+    }
+    return BleOnboardingWindowEvent::None;
+}
+
+bool BleOnboardingWindow::isAwaitingConfirmation() const { return awaitingConfirmation_; }
+bool BleOnboardingWindow::isOpen() const { return open_; }
 
 FakeBleProvisioning::FakeBleProvisioning(BleSecurityMode mode)
     : securityMode_(mode), advertising_(false), sessionActive_(false), startResult_(true) {}

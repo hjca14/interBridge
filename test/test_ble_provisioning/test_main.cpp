@@ -76,6 +76,79 @@ void test_fake_can_model_sanitized_start_failure_and_retry() {
     TEST_ASSERT_TRUE(ble.isAdvertising());
 }
 
+// Real bench observation: a physical run printed "onboarding window
+// closed: timeout" while nRF Connect never saw an InterBridge-XXXX
+// device - the WiFiProv start request had been wrongly treated as proof
+// advertising was active. These tests prove the fix: a start request
+// alone never confirms advertising; only a real ARDUINO_EVENT_PROV_START
+// (via notifyAdvertisingStarted()/BleOnboardingWindow::confirmStart())
+// does, and a missing confirmation fails closed rather than opening a
+// window for a service that never started.
+
+void test_real_transport_start_request_alone_does_not_confirm_advertising() {
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    TEST_ASSERT_FALSE(ble.isAdvertising());
+
+    BleOnboardingWindow window(10000, 300000);
+    window.requestStart(0);
+    TEST_ASSERT_TRUE(window.isAwaitingConfirmation());
+    TEST_ASSERT_FALSE(window.isOpen());
+    TEST_ASSERT_FALSE(ble.isAdvertising());
+}
+
+void test_prov_start_confirmation_activates_advertising_and_window() {
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    BleOnboardingWindow window(10000, 300000);
+
+    window.requestStart(0);
+    ble.notifyAdvertisingStarted();
+    window.confirmStart(50);
+
+    TEST_ASSERT_TRUE(ble.isAdvertising());
+    TEST_ASSERT_TRUE(window.isOpen());
+    TEST_ASSERT_FALSE(window.isAwaitingConfirmation());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::None), static_cast<int>(window.update(50 + 299999)));
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::WindowTimedOut),
+                       static_cast<int>(window.update(50 + 300000)));
+    TEST_ASSERT_FALSE(window.isOpen());
+}
+
+void test_missing_start_confirmation_fails_closed() {
+    BleOnboardingWindow window(10000, 300000);
+    window.requestStart(0);
+
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::None), static_cast<int>(window.update(9999)));
+    TEST_ASSERT_TRUE(window.isAwaitingConfirmation());
+
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::StartNotConfirmed),
+                       static_cast<int>(window.update(10000)));
+    TEST_ASSERT_FALSE(window.isAwaitingConfirmation());
+    TEST_ASSERT_FALSE(window.isOpen());
+
+    // A confirmation arriving after the deadline was already missed must
+    // not resurrect this attempt.
+    window.confirmStart(10001);
+    TEST_ASSERT_FALSE(window.isOpen());
+
+    // The failure must not repeat on a later tick.
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::None), static_cast<int>(window.update(20000)));
+}
+
+void test_retry_remains_possible_after_a_failed_start() {
+    BleOnboardingWindow window(10000, 300000);
+    window.requestStart(0);
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::StartNotConfirmed),
+                       static_cast<int>(window.update(10000)));
+
+    // A fresh retry (e.g. after Esp32BleProvisioning::stopAdvertising()
+    // followed by a new startAdvertising() call) opens a full new window.
+    window.requestStart(20000);
+    TEST_ASSERT_TRUE(window.isAwaitingConfirmation());
+    window.confirmStart(20050);
+    TEST_ASSERT_TRUE(window.isOpen());
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -88,5 +161,9 @@ int main(int argc, char** argv) {
     RUN_TEST(test_session_active_defaults_false_and_is_settable);
     RUN_TEST(test_real_transport_lifecycle_metadata_never_exposes_credentials);
     RUN_TEST(test_fake_can_model_sanitized_start_failure_and_retry);
+    RUN_TEST(test_real_transport_start_request_alone_does_not_confirm_advertising);
+    RUN_TEST(test_prov_start_confirmation_activates_advertising_and_window);
+    RUN_TEST(test_missing_start_confirmation_fails_closed);
+    RUN_TEST(test_retry_remains_possible_after_a_failed_start);
     return UNITY_END();
 }

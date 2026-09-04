@@ -23,6 +23,8 @@ The upstream contracts consulted are PlatformIO's Espressif 32 6.12.0 release/pa
 
 The DEV firmware treats receipt of the first authenticated encrypted credential request as the observable evidence that both a BLE central and a secure Security 1 session exist. Arduino's wrapper does not expose separate public callbacks for “link connected” and “security handshake complete”; serial messages intentionally do not claim finer timing than its public event API provides.
 
+This is a separate concern from advertising itself starting. `WiFiProv.beginProvision()` has no synchronous success/failure return, so the DEV firmware never treats the start *request* as evidence advertising is active; only the real `ARDUINO_EVENT_PROV_START` event does, via `Esp32BleProvisioning::notifyAdvertisingStarted()` and `BleOnboardingWindow` (`src/provisioning/ble_provisioning.h`). If that confirmation does not arrive within a short, explicit deadline, the attempt fails closed (sanitized "start not confirmed" log, provisioning manager released) rather than opening the five-minute window at all — see "Physical validation" below for the real-hardware gap this closes.
+
 ### Android constraints and Flutter status
 
 - Android 12+ requires runtime `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT`; earlier Android versions can require location permission for BLE scanning.
@@ -48,14 +50,17 @@ pre-existing DEV environment retains its default table.
 
 ## Physical validation still pending
 
-No flash or radio test was performed. Phase 3C.1 remains open until:
+**Real bench observation (first physical attempt):** after flashing `esp32-c3-dev-ble-provisioning`, the serial log eventually printed `onboarding window closed: timeout`, but nRF Connect never showed an `InterBridge-XXXX` device — the only nameless BLE entry visible did not disappear when the board was disconnected, so it was not the ESP32. The firmware had treated the `WiFiProv.beginProvision()` call itself as proof that advertising was active and had started its five-minute window and timer from that request, with no observation of the real start event. There was no evidence BLE advertising ever actually started. The firmware now requires the real `ARDUINO_EVENT_PROV_START` confirmation (with its own short, explicit timeout) before opening the window or claiming the service is active — see the previous section and `BleOnboardingWindow`'s doc comment in `src/provisioning/ble_provisioning.h`.
+
+No flash or radio test has yet confirmed advertising actually starts. Phase 3C.1 remains open until:
 
 1. flash the isolated image on the ESP32-C3;
-2. observe advertising on Android;
-3. confirm `InterBridge-XXXX`;
+2. confirm the serial log reaches `[BLE] onboarding service active` (i.e. `ARDUINO_EVENT_PROV_START` was actually observed, not just requested) before trusting anything on the Android/nRF Connect side;
+3. observe advertising on Android/nRF Connect and confirm `InterBridge-XXXX` matches the name the serial log printed;
 4. connect;
 5. establish Security 1 with the correct PoP;
 6. reject an incorrect PoP;
 7. disconnect and reconnect;
-8. confirm closure after five minutes;
-9. confirm no secret appears in serial logs.
+8. confirm closure after five minutes from confirmed start (not from the request);
+9. confirm a start that is never confirmed (e.g. radio/BLE stack failure) logs a sanitized "start not confirmed" failure instead of a misleading window timeout;
+10. confirm no secret appears in serial logs.

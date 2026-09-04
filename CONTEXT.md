@@ -78,6 +78,29 @@ checklist are consolidated in `docs/ble-onboarding.md`. This is a foundation,
 not completion of 3C.1: advertising, connection, correct/incorrect PoP,
 reconnection and timeout still require bench validation.
 
+**Diagnostic hardening after the first physical attempt:** that first bench
+run printed `onboarding window closed: timeout` while nRF Connect never saw
+an `InterBridge-XXXX` device - the DEV entry point had treated the
+`WiFiProv.beginProvision()` start *request* as proof advertising was active
+and opened its five-minute window/timer from that request alone, with no
+observed evidence BLE ever actually started. The fix (still diagnostic-only,
+no hardware retest yet) adds `Esp32BleProvisioning::notifyAdvertisingStarted()`
+and a new, natively-testable `BleOnboardingWindow` (both in
+`src/provisioning/ble_provisioning.h/.cpp`) so the window only opens on a
+real observed `ARDUINO_EVENT_PROV_START`; a short, explicit confirmation
+deadline fails closed (sanitized "start not confirmed" log, provisioning
+manager released) instead of ever reporting a timeout for a window that
+never opened. `ARDUINO_EVENT_PROV_INIT`/`ARDUINO_EVENT_PROV_START` are now
+also observed and sanitized-logged in `src/dev/ble_provisioning_main.cpp`,
+which gained a longer deliberate post-`Serial.begin()` delay and boot banner
+so a bench USB-serial monitor reliably catches the first lines. 4 new native
+tests in `test_ble_provisioning` (12 total) cover: a start request alone
+never confirms advertising; `ARDUINO_EVENT_PROV_START` activates both
+`isAdvertising()` and the window; a missing confirmation fails closed and
+does not resurrect on a late confirmation; retry remains possible after a
+failed start. See `docs/ble-onboarding.md`'s "Physical validation" section
+for the full real bench observation and the updated checklist.
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for the full module
@@ -1869,7 +1892,7 @@ crypto:
 | `test_fleet_provisioning` | Full success path, and each individual failure mode (keygen/cert-request/register-thing) |
 | `test_factory_reset` | Wi-Fi/provisioned-flag cleared, identity/credentials/**setup_code** preserved |
 | `test_mqtt_transport` | `FakeDeviceTransport` connect/publish/subscribe/deliver, armed connect failures |
-| `test_ble_provisioning` **(new)** | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes |
+| `test_ble_provisioning` | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, and (added after the first bench attempt) `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, and retry-after-failure |
 | `test_status_indicator` **(new)** | `FakeStatusIndicator` show/clear/count behavior |
 
 **How this was validated (no PlatformIO/gcc in this environment - same
