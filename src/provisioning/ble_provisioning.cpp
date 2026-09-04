@@ -80,19 +80,17 @@ BleSecurityMode Esp32BleProvisioning::securityMode() const {
 }
 
 std::optional<WifiCredentialsPayload> Esp32BleProvisioning::pollReceivedCredentials() {
-    auto result = receivedCredentials_;
-    receivedCredentials_.reset();
-    return result;
+    return std::nullopt;
 }
 
 void Esp32BleProvisioning::notifyAdvertisingStarted() { advertising_ = true; }
 void Esp32BleProvisioning::notifySecureSessionEstablished() { sessionActive_ = true; }
 void Esp32BleProvisioning::notifyDisconnected() { sessionActive_ = false; }
-void Esp32BleProvisioning::notifyCredentials(const std::string& ssid, const std::string& password) {
-    sessionActive_ = true;
-    receivedCredentials_ = WifiCredentialsPayload{ssid, password};
-}
-void Esp32BleProvisioning::notifyFailure() { sessionActive_ = false; }
+void Esp32BleProvisioning::notifyCredentialsReceived() { credentialState_ = WifiCredentialState::Connecting; }
+void Esp32BleProvisioning::notifyWifiConnected() { credentialState_ = WifiCredentialState::Connected; }
+void Esp32BleProvisioning::notifyCredentialsRejected() { credentialState_ = WifiCredentialState::Rejected; }
+
+WifiCredentialState Esp32BleProvisioning::wifiCredentialState() const { return credentialState_; }
 
 BleOnboardingWindow::BleOnboardingWindow(uint32_t confirmationTimeoutMs, uint32_t windowMs)
     : confirmationTimeoutMs_(confirmationTimeoutMs), windowMs_(windowMs) {}

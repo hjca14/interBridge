@@ -79,10 +79,24 @@ public:
     virtual std::optional<WifiCredentialsPayload> pollReceivedCredentials() = 0;
 };
 
-// ESP32 adapter. In the isolated Phase 3C.1 build it uses Arduino-ESP32's
-// official WiFiProv wrapper, which delegates to ESP-IDF Wi-Fi Provisioning
-// Manager and Protocomm. Other compositions retain the fail-closed adapter
-// until production PoP storage and lifecycle wiring are designed.
+// Observable Wi-Fi credential-application state from the official
+// wifi_provisioning flow (ARDUINO_EVENT_PROV_CRED_*), tracked separately
+// from isSessionActive() (the BLE/Protocomm link itself). Per the
+// official manager's default behavior, a rejected credential attempt
+// does NOT end the BLE session or close the onboarding window - the app
+// can retry with different credentials while the window stays open; see
+// notifyCredentialsRejected(). Deliberately carries no SSID/password:
+// the official manager already applies received credentials to the
+// Wi-Fi stack itself (that is what receiving them triggers internally),
+// so this adapter never needs, stores, or exposes a copy - see
+// notifyCredentialsReceived().
+enum class WifiCredentialState { Idle, Connecting, Connected, Rejected };
+
+// ESP32 adapter. In the isolated Phase 3C.1/3C.3 build it uses
+// Arduino-ESP32's official WiFiProv wrapper, which delegates to ESP-IDF
+// Wi-Fi Provisioning Manager and Protocomm. Other compositions retain the
+// fail-closed adapter until production PoP storage and lifecycle wiring
+// are designed.
 class Esp32BleProvisioning : public IBleProvisioning {
 public:
     explicit Esp32BleProvisioning(BleSecurityMode requestedMode = BleSecurityMode::Security2);
@@ -92,6 +106,11 @@ public:
     bool isAdvertising() const override;
     bool isSessionActive() const override;
     BleSecurityMode securityMode() const override;
+    // Always returns std::nullopt on this adapter: the official
+    // wifi_provisioning manager applies received Wi-Fi credentials to the
+    // stack itself, so this adapter never buffers or exposes a copy at
+    // this layer - see WifiCredentialState and notifyCredentialsReceived().
+    // Present only to satisfy IBleProvisioning's shared interface.
     std::optional<WifiCredentialsPayload> pollReceivedCredentials() override;
 
     // Forwarded by the Arduino system-event callback in the isolated DEV
@@ -103,14 +122,26 @@ public:
     void notifyAdvertisingStarted();
     void notifySecureSessionEstablished();
     void notifyDisconnected();
-    void notifyCredentials(const std::string& ssid, const std::string& password);
-    void notifyFailure();
+    // Forwarded on ARDUINO_EVENT_PROV_CRED_RECV. Takes no credential data
+    // by design - see WifiCredentialState's doc comment.
+    void notifyCredentialsReceived();
+    // Forwarded on ARDUINO_EVENT_PROV_CRED_SUCCESS: the official manager
+    // confirms the device actually connected to Wi-Fi with the received
+    // credentials.
+    void notifyWifiConnected();
+    // Forwarded on ARDUINO_EVENT_PROV_CRED_FAIL: the official manager
+    // rejected the credentials (e.g. wrong password, AP not found). Does
+    // not affect isSessionActive() - see WifiCredentialState's doc
+    // comment.
+    void notifyCredentialsRejected();
+
+    WifiCredentialState wifiCredentialState() const;
 
 private:
     BleSecurityMode securityMode_;
     bool advertising_;
     bool sessionActive_;
-    std::optional<WifiCredentialsPayload> receivedCredentials_;
+    WifiCredentialState credentialState_ = WifiCredentialState::Idle;
 };
 
 // Tracks the "start requested -> confirmed active -> window closed"

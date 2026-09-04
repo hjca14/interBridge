@@ -59,13 +59,67 @@ void test_real_transport_lifecycle_metadata_never_exposes_credentials() {
     Esp32BleProvisioning ble(BleSecurityMode::Security1);
     ble.notifySecureSessionEstablished();
     TEST_ASSERT_TRUE(ble.isSessionActive());
-    ble.notifyCredentials("private-ssid", "private-password");
-    auto credentials = ble.pollReceivedCredentials();
-    TEST_ASSERT_TRUE(credentials.has_value());
-    TEST_ASSERT_EQUAL_STRING("private-ssid", credentials->ssid.c_str());
-    TEST_ASSERT_FALSE(ble.pollReceivedCredentials().has_value());
     ble.notifyDisconnected();
     TEST_ASSERT_FALSE(ble.isSessionActive());
+}
+
+// Phase 3C.3: the official wifi_provisioning manager applies received
+// Wi-Fi credentials to the stack itself, so Esp32BleProvisioning never
+// buffers or exposes a copy - see WifiCredentialState's doc comment in
+// ble_provisioning.h. notifyCredentialsReceived() takes no ssid/password
+// argument at all: this is a compile-time guarantee, not just a runtime
+// one - the class has no method through which a credential string could
+// even be passed in, let alone retained.
+
+void test_wifi_credential_state_defaults_idle() {
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    TEST_ASSERT_EQUAL(static_cast<int>(WifiCredentialState::Idle), static_cast<int>(ble.wifiCredentialState()));
+}
+
+void test_credentials_received_transitions_to_connecting_without_any_credential_argument() {
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    ble.notifyCredentialsReceived();
+    TEST_ASSERT_EQUAL(static_cast<int>(WifiCredentialState::Connecting), static_cast<int>(ble.wifiCredentialState()));
+}
+
+void test_wifi_connected_reflects_official_cred_success_event() {
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    ble.notifyCredentialsReceived();
+    ble.notifyWifiConnected();
+    TEST_ASSERT_EQUAL(static_cast<int>(WifiCredentialState::Connected), static_cast<int>(ble.wifiCredentialState()));
+}
+
+void test_credentials_rejected_does_not_end_session_and_permits_retry() {
+    // Per the official manager's default behavior, a rejected attempt
+    // must not end the BLE session/window - the app can resubmit
+    // different credentials while the window stays open.
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    ble.notifySecureSessionEstablished();
+    ble.notifyCredentialsReceived();
+
+    ble.notifyCredentialsRejected();
+    TEST_ASSERT_EQUAL(static_cast<int>(WifiCredentialState::Rejected), static_cast<int>(ble.wifiCredentialState()));
+    TEST_ASSERT_TRUE(ble.isSessionActive());
+
+    // Retry: a fresh credential submission over the same still-active
+    // session resumes the normal Connecting -> Connected path.
+    ble.notifyCredentialsReceived();
+    TEST_ASSERT_EQUAL(static_cast<int>(WifiCredentialState::Connecting), static_cast<int>(ble.wifiCredentialState()));
+    ble.notifyWifiConnected();
+    TEST_ASSERT_EQUAL(static_cast<int>(WifiCredentialState::Connected), static_cast<int>(ble.wifiCredentialState()));
+}
+
+void test_esp32_adapter_never_retains_or_exposes_received_credentials() {
+    // pollReceivedCredentials() exists only to satisfy IBleProvisioning's
+    // shared interface (ProvisioningManager/FakeBleProvisioning still use
+    // it for a hypothetical non-official-manager implementation) - on
+    // this adapter it must always report absent, even after a full
+    // received -> connected credential cycle, since nothing on this class
+    // ever stores a credential string to return.
+    Esp32BleProvisioning ble(BleSecurityMode::Security1);
+    ble.notifyCredentialsReceived();
+    ble.notifyWifiConnected();
+    TEST_ASSERT_FALSE(ble.pollReceivedCredentials().has_value());
 }
 
 void test_fake_can_model_sanitized_start_failure_and_retry() {
@@ -246,6 +300,11 @@ int main(int argc, char** argv) {
     RUN_TEST(test_start_advertising_records_info_and_pop);
     RUN_TEST(test_session_active_defaults_false_and_is_settable);
     RUN_TEST(test_real_transport_lifecycle_metadata_never_exposes_credentials);
+    RUN_TEST(test_wifi_credential_state_defaults_idle);
+    RUN_TEST(test_credentials_received_transitions_to_connecting_without_any_credential_argument);
+    RUN_TEST(test_wifi_connected_reflects_official_cred_success_event);
+    RUN_TEST(test_credentials_rejected_does_not_end_session_and_permits_retry);
+    RUN_TEST(test_esp32_adapter_never_retains_or_exposes_received_credentials);
     RUN_TEST(test_fake_can_model_sanitized_start_failure_and_retry);
     RUN_TEST(test_real_transport_start_request_alone_does_not_confirm_advertising);
     RUN_TEST(test_prov_start_confirmation_activates_advertising_and_window);
