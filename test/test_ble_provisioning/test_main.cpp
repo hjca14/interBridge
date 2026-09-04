@@ -1,5 +1,8 @@
 #include <unity.h>
 
+#include <fstream>
+#include <string>
+
 #include "../../src/provisioning/ble_provisioning.h"
 
 using namespace interbridge;
@@ -189,6 +192,49 @@ void test_close_after_locally_rejected_request_leaves_no_window_armed() {
     TEST_ASSERT_FALSE(window.isOpen());
 }
 
+// Regression guard for a real security incident: a temporary
+// CORE_DEBUG_LEVEL=5 in env:esp32-c3-dev-ble-provisioning's build_flags
+// let an upstream WiFiProv.cpp log line print the DEV PoP during bench
+// diagnosis (see docs/ble-onboarding.md's "Physical validation" section).
+// Reads the repo's actual platformio.ini rather than a copy, so it can't
+// go stale - this must run with the repo root as the working directory,
+// exactly as `pio test -e native` does.
+void test_isolated_ble_env_does_not_enable_verbose_core_debug() {
+    std::ifstream file("platformio.ini");
+    TEST_ASSERT_TRUE_MESSAGE(file.is_open(), "platformio.ini not found relative to the test working directory");
+
+    const std::string targetSection = "[env:esp32-c3-dev-ble-provisioning]";
+    std::string line;
+    bool inTargetSection = false;
+    bool sawTargetSection = false;
+    bool found = false;
+    while (std::getline(file, line)) {
+        size_t firstNonSpace = line.find_first_not_of(" \t");
+        if (firstNonSpace == std::string::npos) {
+            continue;
+        }
+        if (line[firstNonSpace] == '[') {
+            inTargetSection = (line.compare(firstNonSpace, targetSection.size(), targetSection) == 0);
+            sawTargetSection = sawTargetSection || inTargetSection;
+            continue;
+        }
+        if (!inTargetSection || line[firstNonSpace] == ';') {
+            // Only real build_flags entries count - not comments (e.g. the
+            // one in platformio.ini itself warning against re-adding this).
+            continue;
+        }
+        if (line.find("CORE_DEBUG_LEVEL") != std::string::npos) {
+            found = true;
+            break;
+        }
+    }
+
+    TEST_ASSERT_TRUE_MESSAGE(sawTargetSection, "[env:esp32-c3-dev-ble-provisioning] section not found in platformio.ini");
+    TEST_ASSERT_FALSE_MESSAGE(found,
+                               "CORE_DEBUG_LEVEL must not be set for esp32-c3-dev-ble-provisioning - it previously "
+                               "leaked the DEV PoP via an upstream WiFiProv.cpp log line");
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -207,5 +253,6 @@ int main(int argc, char** argv) {
     RUN_TEST(test_retry_remains_possible_after_a_failed_start);
     RUN_TEST(test_confirm_start_on_the_same_tick_as_request_still_opens_window);
     RUN_TEST(test_close_after_locally_rejected_request_leaves_no_window_armed);
+    RUN_TEST(test_isolated_ble_env_does_not_enable_verbose_core_debug);
     return UNITY_END();
 }

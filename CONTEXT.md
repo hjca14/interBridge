@@ -55,9 +55,13 @@ unavailable hardware/AWS/crypto, and clearly-labeled stubs where it does.
 IoT MQTT/mTLS connection and has been validated on a bench device. The
 production composition root still cannot complete a real AWS IoT connection,
 BLE provisioning session, or signed OTA update. An isolated Phase 3C.1 target
-now starts Arduino's official `WiFiProv`/ESP-IDF Unified Provisioning BLE
-service with Security 1; physical interoperability remains unvalidated.** See
-Hardware Dependencies and Open Questions.
+starts Arduino's official `WiFiProv`/ESP-IDF Unified Provisioning BLE service
+with Security 1, and BLE advertisement, Android discovery, and the Security 1
+session up to its intentionally-blocked Wi-Fi-credentials step are now
+physically validated on a real ESP32-C3 - see "Phase 3C.1 BLE foundation"
+below. Actual Wi-Fi credential transfer (3C.3), incorrect-PoP rejection, and
+mid-window reconnect remain unvalidated.** See Hardware Dependencies and Open
+Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
 (now v1.3) and the firmware agree on the onboarding architecture,
@@ -73,10 +77,18 @@ The toolchain is now reproducibly pinned to platform-espressif32 6.12.0,
 Arduino-ESP32 2.0.17, and ESP-IDF 4.4.7. The isolated
 `esp32-c3-dev-ble-provisioning` target uses the official `WiFiProv` wrapper,
 Security 1 and a local gitignored PoP; it does not compile production or DEV
-call-simulator composition roots. The Android contract and pending physical
-checklist are consolidated in `docs/ble-onboarding.md`. This is a foundation,
-not completion of 3C.1: advertising, connection, correct/incorrect PoP,
-reconnection and timeout still require bench validation.
+call-simulator composition roots. The Android contract and physical
+validation status are consolidated in `docs/ble-onboarding.md`. **BLE
+advertisement, Android/nRF Connect discovery, and the Security 1 session up
+to its intentionally-blocked Wi-Fi-credentials step are now physically
+validated on a real ESP32-C3, including the five-minute timeout correctly
+closing advertising** (see the third bench attempt below) - this is no
+longer merely a foundation for those specific behaviors. Still unvalidated:
+incorrect-PoP rejection, mid-window disconnect/reconnect, and actual Wi-Fi
+credential transfer (3C.3, not implemented - do not treat any of this as
+proof credentials can be transferred or that `ProvisioningManager`
+integration works, since this isolated image does not include
+`ProvisioningManager` at all).
 
 **Diagnostic hardening after the first physical attempt:** that first bench
 run printed `onboarding window closed: timeout` while nRF Connect never saw
@@ -126,10 +138,51 @@ locally rejected request leaves no window armed (nor resurrectable by a
 late confirmation). Validated: all 40 native suites (351 assertions) via
 the same locally available MSVC used throughout this work, **and** real
 `pio run` succeeded for both `esp32-c3-dev-ble-provisioning` and `esp32-c3`
-in this session (toolchain packages were locally cached). Still no flash,
-no radio test - see `docs/ble-onboarding.md`'s updated checklist, whose
-next required step is collecting that verbose capture (never logging
-PoP/SSID/password/protobuf/crypto material even at verbose level).
+in this session (toolchain packages were locally cached).
+
+**Third bench attempt: physical success, with a security incident that was
+then fixed.** With the ordering fix and the temporary verbose logging above
+in place, the verbose capture found the real root cause of every prior
+attempt: `WiFiProv` correctly reported `Already Provisioned` and reconnected
+to a Wi-Fi network from a prior flash's persisted NVS state, instead of ever
+opening BLE - not a BLE/Protocomm defect. This is expected, correct
+`WiFiProv`/NVS behavior, not a bug: bench retesting this isolated image on a
+board that was ever provisioned (by this image or any other) requires an
+explicit flash/NVS erase first, since there is no in-band way yet to reopen
+the window on an already-provisioned device. (Production will not erase
+state on every boot - the intended, not-yet-implemented design is a
+five-second physical button hold that clears *only* stored Wi-Fi
+provisioning state and reopens the pairing window, preserving `device_id`/
+`setup_code` identity and any already-issued AWS IoT credentials - added to
+Future Work below.) After erasing NVS and reflashing, `ARDUINO_EVENT_PROV_INIT`
+and `ARDUINO_EVENT_PROV_START` both fired, the ESP advertised as
+`InterBridge-6490`, Android/nRF Connect discovered it, the real Android app
+connected and advanced through the Security 1 onboarding flow to its
+intentionally-blocked Wi-Fi-credentials step (3C.3 remains unimplemented and
+unvalidated), and after five minutes advertising stopped with a new
+connection no longer possible. **However, the same verbose capture that
+found the NVS root cause also let a different upstream `WiFiProv.cpp` log
+line print the DEV PoP to serial** - a real security regression in the bench
+build configuration. That PoP is now treated as compromised and was rotated
+locally; the gitignored `include/interbridge_ble_dev_secrets.h` was never
+committed, so this was a bench-serial exposure only, not a repository leak.
+Fix: `CORE_DEBUG_LEVEL`, `Serial.setDebugOutput(true)`, and
+`esp_log_level_set()` were all removed from `env:esp32-c3-dev-ble-provisioning`
+(no other environment was ever affected); `ARDUINO_EVENT_PROV_DEINIT` logging
+and the numeric-only default-case event dump (both added purely for this
+diagnostic pass) were removed too, so normal operation now emits only the
+same sanitized `[BLE] ...` lines the very first hardening pass defined; and a
+new native regression test, `test_isolated_ble_env_does_not_enable_verbose_core_debug`
+(15 total in `test_ble_provisioning`), reads this repo's actual `platformio.ini` and fails if `CORE_DEBUG_LEVEL` is
+ever set for this environment again. Validated: all 40 native suites (352
+assertions) via MSVC, **and** real `pio run` succeeded again for both
+`esp32-c3-dev-ble-provisioning` and `esp32-c3` after the cleanup, confirming
+the removal compiles cleanly against the actual pinned framework. The
+cleaned-up build itself has not yet been reflashed on hardware - expected to
+behave identically to this successful attempt since only diagnostic
+instrumentation was removed, but not yet physically reconfirmed. See
+`docs/ble-onboarding.md`'s "Physical validation" section for the complete,
+current status of what is and is not confirmed.
 
 ## Architecture
 
@@ -1893,6 +1946,21 @@ are the Open Questions and Technical Debt items above, plus:)*
 - Once real PlatformIO/toolchain access is available, run
   `pio run -e esp32-c3` and `pio test -e native` as the authoritative
   build/test verification (see Tests for what substituted for this).
+- Implement the physical five-second config/reset button hold as the
+  in-band way to reopen BLE onboarding on an already-provisioned device:
+  it must clear *only* stored Wi-Fi provisioning state, not `device_id`/
+  `setup_code` identity or already-issued AWS IoT credentials, and must
+  not require a full flash/NVS erase the way current bench retesting
+  does (see "Phase 3C.1 BLE foundation"'s third bench attempt). This is
+  distinct from, and must not be confused with, `factory_reset_coordinator.h`'s
+  full factory reset.
+- Physically reconfirm BLE onboarding on the cleaned-up
+  `esp32-c3-dev-ble-provisioning` build (verbose debug removed) - expected
+  to behave identically to the validated third bench attempt, but not yet
+  reflashed - plus the still-unvalidated incorrect-PoP-rejection and
+  mid-window-disconnect/reconnect checks, and (a separate, larger effort)
+  actual Wi-Fi credential transfer (3C.3) and `ProvisioningManager`
+  integration, neither implemented nor validated yet.
 
 ## Tests
 
@@ -1922,7 +1990,7 @@ crypto:
 | `test_fleet_provisioning` | Full success path, and each individual failure mode (keygen/cert-request/register-thing) |
 | `test_factory_reset` | Wi-Fi/provisioned-flag cleared, identity/credentials/**setup_code** preserved |
 | `test_mqtt_transport` | `FakeDeviceTransport` connect/publish/subscribe/deliver, armed connect failures |
-| `test_ble_provisioning` | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, (added after the first bench attempt) `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, and retry-after-failure, and (added after the second bench attempt) the requestStart()-before-startAdvertising() ordering fix - same-tick confirmation still opens the window, a locally rejected request leaves nothing armed |
+| `test_ble_provisioning` (15 tests) | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, (after the first bench attempt) `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, and retry-after-failure, (after the second bench attempt) the requestStart()-before-startAdvertising() ordering fix - same-tick confirmation still opens the window, a locally rejected request leaves nothing armed, and (after the third bench attempt's PoP-exposure incident) a regression guard reading the repo's own `platformio.ini` to fail if `CORE_DEBUG_LEVEL` is ever set for `env:esp32-c3-dev-ble-provisioning` again |
 | `test_status_indicator` **(new)** | `FakeStatusIndicator` show/clear/count behavior |
 
 **How this was validated (no PlatformIO/gcc in this environment - same

@@ -2,7 +2,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_log.h>
 #include <esp_system.h>
 
 #include "../../include/interbridge_ble_dev_secrets.h"
@@ -45,9 +44,6 @@ void onWifiEvent(arduino_event_t* event) {
         case ARDUINO_EVENT_PROV_INIT:
             Serial.println("[BLE] provisioning manager initialized");
             break;
-        case ARDUINO_EVENT_PROV_DEINIT:
-            Serial.println("[BLE] provisioning manager deinitialized");
-            break;
         case ARDUINO_EVENT_PROV_START:
             // The only real evidence that BLE advertising is active -
             // see BleOnboardingWindow's doc comment. The device name is
@@ -81,11 +77,6 @@ void onWifiEvent(arduino_event_t* event) {
             Serial.println("[BLE] disconnected");
             break;
         default:
-            // Numeric-only: arduino_event_id_t is not secret. Useful when
-            // diagnosing a start that never confirms - it shows whether
-            // any OTHER Arduino system event (Wi-Fi/IP/etc.) fired at all
-            // during the confirmation window.
-            Serial.printf("[BLE] event: id=%d\n", static_cast<int>(event->event_id));
             break;
     }
 }
@@ -97,20 +88,13 @@ void setup() {
     Serial.println();
     Serial.println("[BLE] InterBridge onboarding (isolated Phase 3C.1 bench build) booting");
 
-    // Diagnostic-only, scoped to this isolated bench target alone (see
-    // build_flags for env:esp32-c3-dev-ble-provisioning): raises the
-    // ESP-IDF component log level (wifi_prov_mgr/protocomm/Bluetooth
-    // controller, among others) to verbose so a start that never
-    // confirms has an internal error/component name to point at, instead
-    // of only the sanitized outcome this file itself prints. This never
-    // prints PoP/SSID/password/protobuf/certificate material - those
-    // never pass through ESP-IDF's own logger by construction in this
-    // flow - but it is bench-only instrumentation: do not enable it in
-    // any other environment, and do not share a raw capture from this
-    // build without reviewing it first.
-    Serial.setDebugOutput(true);
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
-
+    // Do NOT call Serial.setDebugOutput(true) or esp_log_level_set() with
+    // a verbose level here. A temporary verbose ESP-IDF debug level was
+    // used once to diagnose a real bench failure and, as a direct
+    // consequence, exposed the DEV PoP through an upstream WiFiProv.cpp
+    // log line - see docs/ble-onboarding.md's "Physical validation"
+    // section. Only this file's own explicit, sanitized Serial.print*
+    // calls may reach the serial port in this environment.
     WiFi.onEvent(onWifiEvent);
 
     currentAdvertisementInfo = advertisementInfo();
