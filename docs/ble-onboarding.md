@@ -42,6 +42,8 @@ pio run -e esp32-c3-dev-ble-provisioning
 
 This composition contains only the BLE adapter and DEV entry point. It excludes the production root, AWS/MQTT composition, Si3050 code, and GPIO3/GPIO4 call simulators, preserving all accumulated behavior. At timeout the adapter calls ESP-IDF 4.4.7's public `wifi_prov_mgr_deinit()` API from `wifi_provisioning/manager.h`; that API stops an active provisioning service and releases manager/scheme resources, while the selected `WIFI_PROV_SCHEME_HANDLER_FREE_BTDM` handler releases Bluetooth controller memory. The timeout therefore ends the real provisioning service rather than merely changing local state. Logs contain only window/name/security mode, authenticated request observation, success/failure, disconnect and timeout—never PoP, SSID, Wi-Fi password, protobuf payload, or cryptographic material.
 
+This environment alone also sets `CORE_DEBUG_LEVEL=5` (Verbose) and the DEV entry point calls `Serial.setDebugOutput(true)` and `esp_log_level_set("*", ESP_LOG_VERBOSE)` right after the boot banner — diagnostic-only bench instrumentation, added after the second bench attempt (below) found no internal error visible at the default log level. No other environment sets this flag. The extra volume is internal ESP-IDF component/state logging (`wifi_prov_mgr`, `protocomm`, the Bluetooth controller, etc.) — PoP/SSID/password/protobuf/certificate material never passes through that logger in this flow by construction, but review a raw capture before sharing it, and do not carry `CORE_DEBUG_LEVEL=5` into any other environment.
+
 The target alone selects Arduino-ESP32's official `huge_app.csv` partition
 table for a 4 MB flash device. It retains NVS and provides a single enlarged
 application slot without OTA, which is appropriate for this bench-only image.
@@ -52,15 +54,18 @@ pre-existing DEV environment retains its default table.
 
 **Real bench observation (first physical attempt):** after flashing `esp32-c3-dev-ble-provisioning`, the serial log eventually printed `onboarding window closed: timeout`, but nRF Connect never showed an `InterBridge-XXXX` device — the only nameless BLE entry visible did not disappear when the board was disconnected, so it was not the ESP32. The firmware had treated the `WiFiProv.beginProvision()` call itself as proof that advertising was active and had started its five-minute window and timer from that request, with no observation of the real start event. There was no evidence BLE advertising ever actually started. The firmware now requires the real `ARDUINO_EVENT_PROV_START` confirmation (with its own short, explicit timeout) before opening the window or claiming the service is active — see the previous section and `BleOnboardingWindow`'s doc comment in `src/provisioning/ble_provisioning.h`.
 
+**Real bench observation (second physical attempt, after the fix above):** the serial log now reached `[BLE] provisioning manager initialized` (`ARDUINO_EVENT_PROV_INIT`) but then printed `[BLE] failure: onboarding service start not confirmed` — `ARDUINO_EVENT_PROV_START` never arrived within the confirmation deadline, and nRF Connect again found no `InterBridge-XXXX`. The manager initializes but the BLE/Protocomm service itself does not come up, with no internal error visible at the default log level. Two things followed from this: (1) a same-thread-ordering bug was found and fixed — the entry point called `BleOnboardingWindow::requestStart()` only *after* `startAdvertising()` returned, but `ARDUINO_EVENT_PROV_START` can be dispatched (on the system event task) essentially immediately once `WiFiProv.beginProvision()` is called, so a fast/synchronous confirmation could have been silently dropped as a no-op before the window was armed to receive it; `requestStart()` is now called first, with `close()` cleaning up if the subsequent `startAdvertising()` call is then locally rejected. (2) `CORE_DEBUG_LEVEL=5` plus runtime `esp_log_level_set("*", ESP_LOG_VERBOSE)` were added, scoped to this environment alone, so the **next** physical run can actually capture ESP-IDF's own internal error/component name for why the service never starts — see "DEV build and local secret" above. Neither change is itself claimed to fix the underlying failure; both are prerequisites for observing it.
+
 No flash or radio test has yet confirmed advertising actually starts. Phase 3C.1 remains open until:
 
 1. flash the isolated image on the ESP32-C3;
-2. confirm the serial log reaches `[BLE] onboarding service active` (i.e. `ARDUINO_EVENT_PROV_START` was actually observed, not just requested) before trusting anything on the Android/nRF Connect side;
-3. observe advertising on Android/nRF Connect and confirm `InterBridge-XXXX` matches the name the serial log printed;
-4. connect;
-5. establish Security 1 with the correct PoP;
-6. reject an incorrect PoP;
-7. disconnect and reconnect;
-8. confirm closure after five minutes from confirmed start (not from the request);
-9. confirm a start that is never confirmed (e.g. radio/BLE stack failure) logs a sanitized "start not confirmed" failure instead of a misleading window timeout;
-10. confirm no secret appears in serial logs.
+2. **collect the verbose serial capture from `[BLE] provisioning manager initialized` through either `[BLE] onboarding service active` or `[BLE] failure: onboarding service start not confirmed`, and identify the specific internal ESP-IDF component/error (if any) logged in between — this is the immediate next step and the reason for the `CORE_DEBUG_LEVEL=5` addition above. Never record PoP, SSID, Wi-Fi password, protobuf payload, or cryptographic material, even at verbose level — review the capture before sharing it;**
+3. confirm the serial log reaches `[BLE] onboarding service active` (i.e. `ARDUINO_EVENT_PROV_START` was actually observed, not just requested) before trusting anything on the Android/nRF Connect side;
+4. observe advertising on Android/nRF Connect and confirm `InterBridge-XXXX` matches the name the serial log printed;
+5. connect;
+6. establish Security 1 with the correct PoP;
+7. reject an incorrect PoP;
+8. disconnect and reconnect;
+9. confirm closure after five minutes from confirmed start (not from the request);
+10. confirm a start that is never confirmed (e.g. radio/BLE stack failure) logs a sanitized "start not confirmed" failure instead of a misleading window timeout;
+11. confirm no secret appears in serial logs, including the verbose capture from step 2.

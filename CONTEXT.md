@@ -101,6 +101,36 @@ does not resurrect on a late confirmation; retry remains possible after a
 failed start. See `docs/ble-onboarding.md`'s "Physical validation" section
 for the full real bench observation and the updated checklist.
 
+**Second bench attempt, still diagnostic-only:** with that fix flashed, the
+manager now reaches `ARDUINO_EVENT_PROV_INIT` but `ARDUINO_EVENT_PROV_START`
+still never arrives - `[BLE] failure: onboarding service start not
+confirmed`, still no `InterBridge-XXXX` in nRF Connect, and no internal
+error visible at the default log level. Two changes followed, both still
+unvalidated on real hardware: (1) a real same-thread ordering bug - the DEV
+entry point called `BleOnboardingWindow::requestStart()` only *after*
+`startAdvertising()` returned, but `ARDUINO_EVENT_PROV_START` can be
+dispatched (on the system event task) essentially immediately once
+`WiFiProv.beginProvision()` is called, so a fast confirmation could have
+been silently dropped as a no-op before the window was armed; `requestStart()`
+now runs first, with `close()` cleaning up if the following
+`startAdvertising()` call is locally rejected. (2) `CORE_DEBUG_LEVEL=5` plus
+runtime `esp_log_level_set("*", ESP_LOG_VERBOSE)`/`Serial.setDebugOutput(true)`
+were added, scoped to `env:esp32-c3-dev-ble-provisioning` alone (no other
+environment's build_flags changed), so the next physical run can surface
+ESP-IDF's own internal component/error for why the service never starts.
+`ARDUINO_EVENT_PROV_DEINIT` and a numeric-only default-case log were also
+added to `onWifiEvent()` for completeness. 2 more native tests (14 total in
+`test_ble_provisioning`) cover the ordering fix directly: a confirmation
+landing on the same tick as the request still opens the window, and a
+locally rejected request leaves no window armed (nor resurrectable by a
+late confirmation). Validated: all 40 native suites (351 assertions) via
+the same locally available MSVC used throughout this work, **and** real
+`pio run` succeeded for both `esp32-c3-dev-ble-provisioning` and `esp32-c3`
+in this session (toolchain packages were locally cached). Still no flash,
+no radio test - see `docs/ble-onboarding.md`'s updated checklist, whose
+next required step is collecting that verbose capture (never logging
+PoP/SSID/password/protobuf/crypto material even at verbose level).
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for the full module
@@ -1892,7 +1922,7 @@ crypto:
 | `test_fleet_provisioning` | Full success path, and each individual failure mode (keygen/cert-request/register-thing) |
 | `test_factory_reset` | Wi-Fi/provisioned-flag cleared, identity/credentials/**setup_code** preserved |
 | `test_mqtt_transport` | `FakeDeviceTransport` connect/publish/subscribe/deliver, armed connect failures |
-| `test_ble_provisioning` | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, and (added after the first bench attempt) `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, and retry-after-failure |
+| `test_ble_provisioning` | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, (added after the first bench attempt) `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, and retry-after-failure, and (added after the second bench attempt) the requestStart()-before-startAdvertising() ordering fix - same-tick confirmation still opens the window, a locally rejected request leaves nothing armed |
 | `test_status_indicator` **(new)** | `FakeStatusIndicator` show/clear/count behavior |
 
 **How this was validated (no PlatformIO/gcc in this environment - same

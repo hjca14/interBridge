@@ -149,6 +149,46 @@ void test_retry_remains_possible_after_a_failed_start() {
     TEST_ASSERT_TRUE(window.isOpen());
 }
 
+// A second bench run showed the provisioning manager initializing
+// (ARDUINO_EVENT_PROV_INIT) but never confirming a start - the isolated
+// DEV entry point was then changed to call requestStart() BEFORE
+// startAdvertising(), because ARDUINO_EVENT_PROV_START can be dispatched
+// (on the system event task) essentially immediately once
+// WiFiProv.beginProvision() is called, possibly before control even
+// returns to the caller. These tests prove that ordering fix at the
+// BleOnboardingWindow level: a confirmation landing on the very same
+// tick the window was armed still opens it, and a locally rejected
+// request (startAdvertising() returning false) leaves no window armed.
+
+void test_confirm_start_on_the_same_tick_as_request_still_opens_window() {
+    // Models ARDUINO_EVENT_PROV_START firing synchronously from within
+    // the same call that armed requestStart() - confirmStart() must not
+    // be lost as a no-op just because it landed on the very same tick.
+    BleOnboardingWindow window(10000, 300000);
+    window.requestStart(1000);
+    window.confirmStart(1000);
+    TEST_ASSERT_TRUE(window.isOpen());
+    TEST_ASSERT_FALSE(window.isAwaitingConfirmation());
+}
+
+void test_close_after_locally_rejected_request_leaves_no_window_armed() {
+    // Models startAdvertising() returning false (local validation
+    // rejected the request, e.g. empty PoP/device name) right after
+    // requestStart() armed the window - close() must leave nothing armed
+    // for a request that never actually went out to WiFiProv.
+    BleOnboardingWindow window(10000, 300000);
+    window.requestStart(1000);
+    window.close();
+    TEST_ASSERT_FALSE(window.isAwaitingConfirmation());
+    TEST_ASSERT_FALSE(window.isOpen());
+    TEST_ASSERT_EQUAL(static_cast<int>(BleOnboardingWindowEvent::None), static_cast<int>(window.update(50000)));
+
+    // A confirmation that still arrives late (e.g. a delayed event from
+    // the rejected attempt) must not resurrect it either.
+    window.confirmStart(50000);
+    TEST_ASSERT_FALSE(window.isOpen());
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -165,5 +205,7 @@ int main(int argc, char** argv) {
     RUN_TEST(test_prov_start_confirmation_activates_advertising_and_window);
     RUN_TEST(test_missing_start_confirmation_fails_closed);
     RUN_TEST(test_retry_remains_possible_after_a_failed_start);
+    RUN_TEST(test_confirm_start_on_the_same_tick_as_request_still_opens_window);
+    RUN_TEST(test_close_after_locally_rejected_request_leaves_no_window_armed);
     return UNITY_END();
 }
