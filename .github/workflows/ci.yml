@@ -58,6 +58,11 @@ jobs:
       - name: Compile DEV physical ring simulator firmware
         run: pio run -e esp32-c3-dev-ring-simulator
 
+      - name: Compile isolated DEV BLE provisioning firmware
+        run: |
+          cp include/interbridge_ble_dev_secrets.example.h include/interbridge_ble_dev_secrets.h
+          pio run -e esp32-c3-dev-ble-provisioning
+
       - name: Compile Si3050 clock probe generator (ESP32-C3)
         run: pio run -e esp32-c3-si3050-clock-probe
 

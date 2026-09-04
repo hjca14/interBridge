@@ -1,6 +1,6 @@
 # InterBridge Communication Protocol
 
-**Status:** Draft v1.3 — BLE-first onboarding update  
+**Status:** Draft v1.4 — Phase 3C.1 BLE transport contract
 **Protocol version:** `1`  
 **Target firmware:** InterBridge Firmware `0.1.x`  
 **Primary target:** ESP32-C3  
@@ -25,10 +25,11 @@ change log for the full list.
 firmware implementation - command timestamp format, the full error code
 set with per-code origin, and the closed `intercom_state` vocabulary.
 
-Neither revision implements AWS IoT Core, real MQTT/TLS, NTP, real BLE
-(ESP-IDF Unified Provisioning), real NVS, Lambda, API Gateway, or
-Cognito - see `CONTEXT.md` for exactly what remains stubbed ahead of
-Phase 1.
+The isolated Phase 3C.1 DEV environment implements real BLE through the
+official Arduino-ESP32 `WiFiProv` wrapper over ESP-IDF Unified Provisioning.
+The production composition still does not start that adapter. Production PoP
+storage, real NVS, Lambda, API Gateway, and Cognito remain unimplemented - see
+`CONTEXT.md`.
 
 ---
 
@@ -386,24 +387,19 @@ primary flow - see section 7.3 for when those are used instead.
 
 ### 7.2 Security mode
 
-Protocol v1 requires the strongest Protocomm security mode the pinned
-ESP-IDF version supports cleanly:
+Protocol v1 Phase 3C.1 fixes the following secure baseline:
 
 ```text
-Preferred:  Protocomm Security 2
-Fallback:   Protocomm Security 1
+Selected:   Protocomm Security 1 with a distinct PoP
+Future:     Security 2 only after a separate firmware/client protocol migration
 Forbidden:  plaintext / unsecured provisioning
 ```
 
-Each physical device uses a unique, high-entropy Proof of Possession
-(PoP). The exact ESP-IDF version is pinned by the firmware build, and
-provisioning interoperability must be tested against the corresponding
-mobile implementation before release. If Security 2 cannot currently be
-completed end-to-end because of framework/version limitations, the
-firmware must keep the abstraction, document the limitation, and never
-silently fall back to plaintext - see CONTEXT.md for the current status
-of this integration (the firmware's `BleSecurityMode` enum has no
-plaintext value at all, by construction).
+Arduino-ESP32 2.0.17 officially exposes Security 1 through `WiFiProv`, so no
+mixed-framework migration is needed. Each physical device uses a unique,
+high-entropy PoP. The permanent 12-digit `setup_code` is neither the PoP nor a
+secret. The complete transport/mobile contract is frozen in
+`docs/ble-onboarding.md`.
 
 `setup_code` and the BLE PoP must not silently be the same value. If
 derived from common manufacturing material, use explicit domain
@@ -489,6 +485,10 @@ Provisioning window:  5 minutes (from entering PROVISIONING_AVAILABLE)
 If the window elapses before reaching `PROVISIONED`, BLE advertising
 stops and the device returns to normal operation (`IDLE` if it was
 already provisioned before this attempt, `NOT_PROVISIONED` otherwise). A
+Phase 3C.1's pinned Arduino wrapper has no end method, so its adapter performs
+this shutdown through ESP-IDF's public `wifi_prov_mgr_deinit()` API; this stops
+the active provisioning service and releases its BLE scheme resources rather
+than only updating an application boolean. A
 failure at any single step does **not** require a reboot or a fresh
 button press to retry - the device recovers to `PROVISIONING_AVAILABLE`
 and keeps advertising as long as the overall window hasn't elapsed. This
