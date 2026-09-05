@@ -59,9 +59,18 @@ starts Arduino's official `WiFiProv`/ESP-IDF Unified Provisioning BLE service
 with Security 1, and BLE advertisement, Android discovery, and the Security 1
 session up to its intentionally-blocked Wi-Fi-credentials step are now
 physically validated on a real ESP32-C3 - see "Phase 3C.1 BLE foundation"
-below. Actual Wi-Fi credential transfer (3C.3), incorrect-PoP rejection, and
-mid-window reconnect remain unvalidated.** See Hardware Dependencies and Open
-Questions.
+below. Phase 3C.3's happy path (receiving correct Wi-Fi credentials over
+that same session and connecting) is now also physically validated with
+the real InterApp - see "Phase 3C.3 Wi-Fi credential receipt" below. That
+same bench pass found invalid-credential recovery broken (the manager
+retried a rejected credential forever); it was fixed and has since been
+physically re-validated on real hardware - a wrong SSID and, separately,
+an invalid password each produced the expected failure, the firmware
+reset its provisioning state machine and stayed on the same BLE window,
+and a correct credential submitted afterward connected, all without a
+reboot or reflash. Incorrect-PoP rejection and mid-window reconnect
+remain unvalidated.**
+See Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
 (now v1.3) and the firmware agree on the onboarding architecture,
@@ -83,12 +92,15 @@ advertisement, Android/nRF Connect discovery, and the Security 1 session up
 to its intentionally-blocked Wi-Fi-credentials step are now physically
 validated on a real ESP32-C3, including the five-minute timeout correctly
 closing advertising** (see the third bench attempt below) - this is no
-longer merely a foundation for those specific behaviors. Still unvalidated:
-incorrect-PoP rejection, mid-window disconnect/reconnect, and actual Wi-Fi
-credential transfer (3C.3, not implemented - do not treat any of this as
-proof credentials can be transferred or that `ProvisioningManager`
-integration works, since this isolated image does not include
-`ProvisioningManager` at all).
+longer merely a foundation for those specific behaviors. See "Phase 3C.3
+Wi-Fi credential receipt" below: its happy path (correct credentials) is
+now also physically validated; invalid-credential recovery was found
+broken on that same bench pass, was fixed, and has since been physically
+re-validated. Still unvalidated: incorrect-PoP rejection and mid-window
+disconnect/reconnect. Do not treat any of this as proof the device is
+claimed/registered/connected to AWS IoT once Wi-Fi connects, or that
+`ProvisioningManager` integration works - this isolated image does not
+include `ProvisioningManager` at all.
 
 **Diagnostic hardening after the first physical attempt:** that first bench
 run printed `onboarding window closed: timeout` while nRF Connect never saw
@@ -183,6 +195,107 @@ behave identically to this successful attempt since only diagnostic
 instrumentation was removed, but not yet physically reconfirmed. See
 `docs/ble-onboarding.md`'s "Physical validation" section for the complete,
 current status of what is and is not confirmed.
+
+## Phase 3C.3 Wi-Fi credential receipt
+
+3C.2 (the Android app: discovery, connection, Security 1 up to the
+then-intentionally-blocked Wi-Fi-credentials step) merged separately (app
+repository, not this one). This pass implements the firmware side of the
+next step in the same isolated `esp32-c3-dev-ble-provisioning` image: the
+DEV entry point now also handles the official `ARDUINO_EVENT_PROV_CRED_RECV`/
+`_SUCCESS`/`_FAIL` events (the `prov-config` apply/status half of Unified
+Provisioning), still via official `WiFiProv`/ESP-IDF Wi-Fi Provisioning
+Manager over the same Security 1 session - no new GATT service, no AWS
+IoT/Fleet Provisioning/certificate/claim flow, no change to production
+architecture or `ProvisioningManager`.
+
+`Esp32BleProvisioning` gained a `WifiCredentialState` enum
+(`Idle`/`Connecting`/`Connected`/`Rejected`, in `src/provisioning/
+ble_provisioning.h/.cpp`) set exclusively by three new no-argument methods
+(`notifyCredentialsReceived()`, `notifyWifiConnected()`,
+`notifyCredentialsRejected()`) - a compile-time guarantee that no credential
+string can reach this class at all, not just a runtime one. This replaces
+the previous `notifyCredentials(ssid, password)`/`receivedCredentials_`
+buffer on this class, which was removed: the official manager already
+applies received credentials to the Wi-Fi stack itself, so buffering a
+second copy here was both unnecessary and exactly the kind of own-buffer
+credential retention the PoP-exposure incident (previous section) argues
+against. `pollReceivedCredentials()` remains on this class only to satisfy
+the shared `IBleProvisioning` interface (`ProvisioningManager`/
+`FakeBleProvisioning` still use the real polling contract) and now always
+returns absent - confirmed to have zero production effect, since
+production's `Esp32BleProvisioning` instance in `main.cpp` is constructed
+with `BleSecurityMode::Security2`, which already makes `startAdvertising()`
+fail closed before any real WiFiProv call, so it never received real
+credentials through this path either before or after this change.
+
+A rejected credential attempt (`ARDUINO_EVENT_PROV_CRED_FAIL`, logged with
+only a sanitized numeric `wifi_prov_sta_fail_reason_t`) deliberately does
+NOT touch `BleOnboardingWindow` or `isSessionActive()` - matching the
+official manager's default auto-stop-only-on-success behavior, the window
+stays open so the app can resubmit different credentials. `ARDUINO_EVENT_
+PROV_END`'s log now distinguishes a genuine post-success completion from
+any other end. 6 new native tests (20 total in `test_ble_provisioning`)
+cover: the default `Idle` state; `notifyCredentialsReceived()` transitions
+to `Connecting`; `notifyWifiConnected()` reaches `Connected`; a rejected
+attempt neither ends the session nor blocks a subsequent successful retry;
+and `pollReceivedCredentials()` still reports absent after a full
+received-to-connected cycle. Validated: all 40 native suites (357
+assertions) via the same locally available MSVC used throughout this work,
+**and** real `pio run` succeeded for `esp32-c3-dev-ble-provisioning`,
+`esp32-c3`, `esp32-c3-dev-mqtt`, and `esp32-c3-dev-ring-simulator` (the
+`event->event_info.prov_fail_reason` field name and every other
+framework-specific detail is therefore compile-verified against the actual
+pinned framework, not just recalled).
+
+**Fourth bench attempt: happy path physically validated; invalid-credential
+recovery found broken, now fixed.** The real InterApp (Phase 3C.2) submitted
+correct Wi-Fi credentials over an established Security 1 session and the
+firmware connected - `ARDUINO_EVENT_PROV_CRED_RECV`/`_SUCCESS` observed,
+`WifiCredentialState` reaching `Connected`, within the original five-minute
+window. The same pass submitted an *invalid* credential (wrong SSID/
+password) and found the manager retry it indefinitely, with no way to
+accept a corrected credential in the same window short of a flash/NVS erase
+and reflash. Fixed: `ARDUINO_EVENT_PROV_CRED_FAIL` now also calls the
+official `wifi_prov_mgr_reset_sm_state_on_failure()` - declared in the
+pinned ESP-IDF 4.4.7 `wifi_provisioning/manager.h`, confirmed present and
+linkable in the actual esp32c3 `libwifi_provisioning.a` (via `nm` on the
+`.a` itself, plus a real `pio run` link), and documented for exactly this:
+"restart provisioning in case invalid credentials are entered." Called only
+from `ARDUINO_EVENT_PROV_CRED_FAIL`, never from a plain BLE disconnect
+(`ARDUINO_EVENT_PROV_END`); never touches `BleOnboardingWindow` (the
+five-minute window/timeout are unaffected - no extension, no restart, no
+reboot), `device_id`, `setup_code`, or any other NVS namespace. 4 new native
+tests (24 total in `test_ble_provisioning`) cover: the window's original
+deadline is unaffected by a rejected-credential-then-reset cycle; a
+source-level guard (`ble_provisioning_main.cpp` is Arduino/ESP-IDF-only and
+cannot run natively) that the reset call exists exactly in the
+`ARDUINO_EVENT_PROV_CRED_FAIL` case; that it is never present in
+`ARDUINO_EVENT_PROV_END`'s case; and that the `CRED_FAIL` case never
+references a credential field. Confirmed the regression test actually fails
+when the reset call is removed and passes when restored. Validated: all 40
+native suites (361 assertions) via MSVC; real `pio run` succeeded for
+`esp32-c3-dev-ble-provisioning`, `esp32-c3`, `esp32-c3-dev-mqtt`, and
+`esp32-c3-dev-ring-simulator`.
+
+**Fifth bench attempt: invalid-credential recovery physically re-validated,
+closing Phase 3C.3.** The exact scenario left open after the fourth attempt
+was confirmed on the same real ESP32-C3 with the real InterApp: a
+credential with a nonexistent SSID produced the expected AP-not-found
+failure, and, separately, a credential with an invalid password produced
+the expected authentication failure; in both cases the firmware reset the
+official provisioning state machine (`wifi_prov_mgr_reset_sm_state_on_
+failure()`), remained on the original BLE advertising window/session with
+no reboot or reflash, and accepted a new session/configuration. A correct
+credential submitted afterward connected the ESP to Wi-Fi. The full
+sequence - failure, in-window retry, successful correction - was observed
+in the same bench sitting, inside the original five-minute window. This
+closes the last open item from Phase 3C.3's happy-path work; incorrect-PoP
+rejection and mid-window BLE disconnect/reconnect remain unvalidated (see
+`docs/ble-onboarding.md`'s "Still unvalidated" list).
+
+See `docs/ble-onboarding.md`'s "Phase 3C.3" and "Physical validation"
+sections for the complete contract and current status.
 
 ## Architecture
 
@@ -1958,9 +2071,19 @@ are the Open Questions and Technical Debt items above, plus:)*
   `esp32-c3-dev-ble-provisioning` build (verbose debug removed) - expected
   to behave identically to the validated third bench attempt, but not yet
   reflashed - plus the still-unvalidated incorrect-PoP-rejection and
-  mid-window-disconnect/reconnect checks, and (a separate, larger effort)
-  actual Wi-Fi credential transfer (3C.3) and `ProvisioningManager`
-  integration, neither implemented nor validated yet.
+  mid-window-disconnect/reconnect checks.
+- Physically validate 3C.3 (Wi-Fi credential receipt, implemented but
+  native-tested only - see "Phase 3C.3 Wi-Fi credential receipt") with a
+  coordinated bench test against the 3C.2 app once it can submit real
+  Wi-Fi credentials.
+- `ProvisioningManager` integration with the real `WiFiProv`-based
+  `Esp32BleProvisioning` remains a separate, larger effort: production's
+  instance is still constructed `BleSecurityMode::Security2` (fail-closed)
+  and `ProvisioningManager::checkForCredentials()` still expects to poll
+  raw credentials and drive the Wi-Fi connection itself, which no longer
+  matches how the isolated Security1/WiFiProv adapter actually works (the
+  official manager connects on its own) - reconciling that mismatch is
+  out of scope for 3C.3 and not yet designed.
 
 ## Tests
 
@@ -1990,7 +2113,7 @@ crypto:
 | `test_fleet_provisioning` | Full success path, and each individual failure mode (keygen/cert-request/register-thing) |
 | `test_factory_reset` | Wi-Fi/provisioned-flag cleared, identity/credentials/**setup_code** preserved |
 | `test_mqtt_transport` | `FakeDeviceTransport` connect/publish/subscribe/deliver, armed connect failures |
-| `test_ble_provisioning` (15 tests) | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, (after the first bench attempt) `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, and retry-after-failure, (after the second bench attempt) the requestStart()-before-startAdvertising() ordering fix - same-tick confirmation still opens the window, a locally rejected request leaves nothing armed, and (after the third bench attempt's PoP-exposure incident) a regression guard reading the repo's own `platformio.ini` to fail if `CORE_DEBUG_LEVEL` is ever set for `env:esp32-c3-dev-ble-provisioning` again |
+| `test_ble_provisioning` (24 tests) | `buildBleAdvertisementInfo()` (hint extraction, no secrets), `BleSecurityMode` has no plaintext value, security mode configurability, advertise/session-active fakes, `BleOnboardingWindow`'s start-request-vs-confirmed-advertising distinction, fail-closed missing confirmation, retry-after-failure, the requestStart()-before-startAdvertising() ordering fix, a `CORE_DEBUG_LEVEL` regression guard reading the repo's own `platformio.ini`, `WifiCredentialState` transitions (`Idle`/`Connecting`/`Connected`/`Rejected`), a rejected attempt permitting a subsequent successful retry without ending the session, `pollReceivedCredentials()` always reporting absent on the real adapter, and (invalid-credential recovery) the onboarding window's original deadline surviving a rejected-credential reset plus source-level guards that `wifi_prov_mgr_reset_sm_state_on_failure()` is called only from `ARDUINO_EVENT_PROV_CRED_FAIL`, never from `ARDUINO_EVENT_PROV_END`, and without referencing a credential field |
 | `test_status_indicator` **(new)** | `FakeStatusIndicator` show/clear/count behavior |
 
 **How this was validated (no PlatformIO/gcc in this environment - same

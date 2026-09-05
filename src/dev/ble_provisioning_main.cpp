@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_system.h>
+#include <wifi_provisioning/manager.h>
 
 #include "../../include/interbridge_ble_dev_secrets.h"
 #include "../provisioning/ble_provisioning.h"
@@ -10,13 +11,10 @@
 namespace {
 using namespace interbridge;
 
-// Real bench observation: the first physical attempt with this target
-// printed "onboarding window closed: timeout" while nRF Connect never
-// saw an "InterBridge-XXXX" device - the previous code treated the
-// WiFiProv.beginProvision() call itself as proof advertising was active,
-// so a service that never actually started still ran its full timer.
-// BleOnboardingWindow and notifyAdvertisingStarted() close that gap: the
-// window only opens once ARDUINO_EVENT_PROV_START is actually observed.
+// Phase 3C.3: this isolated bench entry point now also receives real
+// Wi-Fi credentials over the official ARDUINO_EVENT_PROV_CRED_* events -
+// see WifiCredentialState's doc comment in ble_provisioning.h for why
+// this firmware never buffers the SSID/password itself.
 Esp32BleProvisioning provisioning(BleSecurityMode::Security1);
 BleAdvertisementInfo currentAdvertisementInfo;
 
@@ -55,26 +53,67 @@ void onWifiEvent(arduino_event_t* event) {
             Serial.printf("[BLE] advertising as: %s\n", currentAdvertisementInfo.deviceName.c_str());
             break;
         case ARDUINO_EVENT_PROV_CRED_RECV:
-            // Receiving this event means Protocomm Security 1 has accepted
-            // the encrypted request. Never log either credential field.
+            // Receiving this event means Protocomm Security 1 accepted the
+            // encrypted request AND the official wifi_provisioning manager
+            // already has the credentials and is applying them to the
+            // Wi-Fi stack itself - this firmware never reads or copies
+            // event->event_info.prov_cred_recv.ssid/.password (deliberately
+            // not referenced below) and has no buffer of its own that could
+            // leak them. See WifiCredentialState's doc comment.
             provisioning.notifySecureSessionEstablished();
-            provisioning.notifyCredentials(
-                reinterpret_cast<const char*>(event->event_info.prov_cred_recv.ssid),
-                reinterpret_cast<const char*>(event->event_info.prov_cred_recv.password));
+            provisioning.notifyCredentialsReceived();
             Serial.println("[BLE] central connected");
             Serial.println("[BLE] secure session established (Security 1)");
+            Serial.println("[BLE] Wi-Fi credentials received");
+            Serial.println("[BLE] Wi-Fi connecting");
             break;
         case ARDUINO_EVENT_PROV_CRED_FAIL:
-            provisioning.notifyFailure();
-            Serial.println("[BLE] failure: provisioning credentials rejected");
+            // Rejected credentials do NOT end the BLE session or close the
+            // window - the official manager keeps listening so the app can
+            // retry with different credentials while the window is open.
+            provisioning.notifyCredentialsRejected();
+            Serial.printf("[BLE] failure: Wi-Fi credentials rejected (reason=%d)\n",
+                          static_cast<int>(event->event_info.prov_fail_reason));
+            // A real bench run showed the manager otherwise keeps retrying
+            // to connect with the just-rejected credentials indefinitely,
+            // never accepting a fresh wifi_config set request in the same
+            // window - the user would have needed a flash/NVS erase and a
+            // reflash to correct a typo'd Wi-Fi credential, defeating the
+            // whole point of an in-window retry. wifi_prov_mgr_reset_sm_
+            // state_on_failure() is the official, scoped API for exactly
+            // this ("restart provisioning in case invalid credentials are
+            // entered", per its own doc comment in
+            // wifi_provisioning/manager.h, part of the pinned ESP-IDF
+            // 4.4.7 Wi-Fi Provisioning Manager and confirmed present and
+            // linkable in the esp32c3 libwifi_provisioning.a this target
+            // actually links). It only resets this manager's own Wi-Fi
+            // connect/retry state machine for the credential that was just
+            // rejected - it never touches BleOnboardingWindow (the
+            // five-minute window/timeout are untouched), device_id,
+            // setup_code, or any other NVS namespace, and it is called
+            // only here, never from ARDUINO_EVENT_PROV_END/a plain BLE
+            // disconnect.
+            if (wifi_prov_mgr_reset_sm_state_on_failure() == ESP_OK) {
+                Serial.println("[BLE] provisioning state reset, awaiting new Wi-Fi configuration");
+            } else {
+                Serial.println("[BLE] failure: could not reset provisioning state");
+            }
             break;
         case ARDUINO_EVENT_PROV_CRED_SUCCESS:
-            Serial.println("[BLE] provisioning request accepted");
+            // Wi-Fi connectivity only - no AWS IoT/Fleet Provisioning/
+            // certificate/claim flow exists in this isolated image. See
+            // docs/ble-onboarding.md's "Physical validation" section.
+            provisioning.notifyWifiConnected();
+            Serial.println("[BLE] Wi-Fi connected");
             break;
         case ARDUINO_EVENT_PROV_END:
             provisioning.notifyDisconnected();
             onboardingWindow.close();
-            Serial.println("[BLE] disconnected");
+            if (provisioning.wifiCredentialState() == WifiCredentialState::Connected) {
+                Serial.println("[BLE] onboarding complete: Wi-Fi connected, provisioning service ended");
+            } else {
+                Serial.println("[BLE] disconnected");
+            }
             break;
         default:
             break;
@@ -86,7 +125,7 @@ void setup() {
     Serial.begin(115200);
     delay(kSerialSettleDelayMs);
     Serial.println();
-    Serial.println("[BLE] InterBridge onboarding (isolated Phase 3C.1 bench build) booting");
+    Serial.println("[BLE] InterBridge onboarding (isolated BLE bench build) booting");
 
     // Do NOT call Serial.setDebugOutput(true) or esp_log_level_set() with
     // a verbose level here. A temporary verbose ESP-IDF debug level was
