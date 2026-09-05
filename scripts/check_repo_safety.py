@@ -6,7 +6,22 @@ import re
 import subprocess
 import sys
 
-FORBIDDEN_TRACKED_PATH = "include/interbridge_dev_secrets.h"
+FORBIDDEN_TRACKED_PATHS = (
+    "include/interbridge_dev_secrets.h",
+    "include/interbridge_ble_dev_secrets.h",
+    "include/interbridge_dev_ble_mqtt_secrets.h",
+)
+# The five external files scripts/generate_dev_ble_mqtt_secrets_header.ps1
+# reads (by filename, case-insensitively) from an explicitly selected
+# directory OUTSIDE this repository - see docs/dev-ble-mqtt.md. They must
+# never be copied into the repository under any name.
+FORBIDDEN_EXTERNAL_CREDENTIAL_FILENAMES = {
+    "endpoint.txt",
+    "amazonrootca1.pem",
+    "device-certificate.pem.crt",
+    "private.pem.key",
+    "pop.txt",
+}
 PATTERNS = {
     "private key PEM": re.compile(
         rb"-----BEGIN ((?:RSA |EC )?PRIVATE KEY)-----\s+[A-Za-z0-9+/=\r\n]+-----END \1-----"
@@ -38,8 +53,11 @@ def main() -> int:
         # source; those pattern definitions are not credential material.
         if filename == "scripts/check_repo_safety.py":
             continue
-        if filename == FORBIDDEN_TRACKED_PATH:
+        if filename in FORBIDDEN_TRACKED_PATHS:
             failures.append(f"tracked local secrets file: {filename}")
+            continue
+        if Path(filename).name.lower() in FORBIDDEN_EXTERNAL_CREDENTIAL_FILENAMES:
+            failures.append(f"external DEV credential filename must never be tracked in the repo: {filename}")
             continue
         path = Path(filename)
         if not path.is_file():
@@ -54,11 +72,28 @@ def main() -> int:
     if len(definitions) != 7 or any(not value.startswith("REPLACE_WITH_") for value in definitions):
         failures.append("DEV secrets example must contain exactly seven obvious REPLACE_WITH_ placeholders")
 
-    ignored = subprocess.run(
-        ["git", "check-ignore", "--quiet", FORBIDDEN_TRACKED_PATH], check=False
-    ).returncode == 0
-    if not ignored:
-        failures.append("local DEV secrets header must be ignored")
+    # esp32-c3-dev-ble-mqtt's own combined example: AWS/MQTT identity + BLE
+    # PoP only - exactly six fields, and neither Wi-Fi macro may ever
+    # appear here (Wi-Fi comes exclusively from BLE Unified Provisioning/
+    # NVS - see docs/dev-ble-mqtt.md).
+    ble_mqtt_example_path = Path("include/interbridge_dev_ble_mqtt_secrets.example.h")
+    ble_mqtt_example = ble_mqtt_example_path.read_text()
+    ble_mqtt_definitions = re.findall(r'^#define INTERBRIDGE_DEV_[A-Z_]+ "([^"]+)"$', ble_mqtt_example, re.MULTILINE)
+    if len(ble_mqtt_definitions) != 6 or any(
+        not value.startswith("REPLACE_WITH_") for value in ble_mqtt_definitions
+    ):
+        failures.append(
+            "DEV BLE+MQTT secrets example must contain exactly six obvious REPLACE_WITH_ placeholders"
+        )
+    if re.search(r"INTERBRIDGE_DEV_WIFI_(SSID|PASSWORD)", ble_mqtt_example):
+        failures.append("DEV BLE+MQTT secrets example must never define a Wi-Fi SSID/password macro")
+
+    for forbidden_path in FORBIDDEN_TRACKED_PATHS:
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--quiet", forbidden_path], check=False
+        ).returncode == 0
+        if not ignored:
+            failures.append(f"local DEV secrets header must be ignored: {forbidden_path}")
 
     ignore_text = Path(".gitignore").read_text()
     for extension in ("*.pem", "*.key", "*.crt"):
@@ -77,6 +112,104 @@ def main() -> int:
         failures.append("DEV header generator is missing a required safety/escaping control")
     if 'R\"' in generator or "@'" in generator or '@"' in generator:
         failures.append("DEV header generator must not emit multiline raw/here strings")
+
+    ble_mqtt_generator_path = Path("scripts/generate_dev_ble_mqtt_secrets_header.ps1")
+    ble_mqtt_generator = ble_mqtt_generator_path.read_text()
+    required_ble_mqtt_generator_fragments = (
+        "git -C $repoRoot check-ignore",
+        "Credentials directory must be outside the repository",
+        "pop.txt",
+        r"'^[0-9a-f]{64}$'",
+        r'''.Replace("`r`n", '\n')''',
+    )
+    if any(fragment not in ble_mqtt_generator for fragment in required_ble_mqtt_generator_fragments):
+        failures.append("DEV BLE+MQTT header generator is missing a required safety/escaping control")
+    if 'R\"' in ble_mqtt_generator or "@'" in ble_mqtt_generator or '@"' in ble_mqtt_generator:
+        failures.append("DEV BLE+MQTT header generator must not emit multiline raw/here strings")
+    # Never accepts SSID/password/certificate/private-key/PoP as a CLI
+    # parameter - only CredentialsDirectory/DeviceId/Destination are
+    # declared in its param() block.
+    forbidden_ble_mqtt_generator_params = ("$Ssid", "$Password", "$Certificate", "$PrivateKey", "$Pop", "$RootCa")
+    if any(fragment in ble_mqtt_generator for fragment in forbidden_ble_mqtt_generator_params):
+        failures.append("DEV BLE+MQTT header generator must never accept credential material as a CLI parameter")
+    # Never prints a value, length, hash, or prefix derived from the
+    # certificate/private key/PoP it reads.
+    forbidden_ble_mqtt_generator_output = ("$pop", "$privateKey", "$certificate", "$rootCa", ".Length")
+    generator_output_lines = [line for line in ble_mqtt_generator.splitlines() if "Write-Host" in line]
+    if any(
+        fragment in line for line in generator_output_lines for fragment in forbidden_ble_mqtt_generator_output
+    ):
+        failures.append(
+            "DEV BLE+MQTT header generator must never print a certificate/private-key/PoP value or derivation"
+        )
+
+    # Bash equivalent of the .ps1 generator above (for benches where the
+    # PowerShell cask is installed but `pwsh` itself is unavailable) - same
+    # required safety/escaping controls, checked the same way.
+    ble_mqtt_bash_generator_path = Path("scripts/generate_dev_ble_mqtt_secrets_header.sh")
+    ble_mqtt_bash_generator = ble_mqtt_bash_generator_path.read_text()
+    required_ble_mqtt_bash_generator_fragments = (
+        "set -euo pipefail",
+        'git -C "$repo_root" check-ignore',
+        "Credentials directory must be outside the repository",
+        "pop.txt",
+        "^[0-9a-f]{64}$",
+        'sub(/\\r$/, "")',
+    )
+    if any(fragment not in ble_mqtt_bash_generator for fragment in required_ble_mqtt_bash_generator_fragments):
+        failures.append("DEV BLE+MQTT bash header generator is missing a required safety/escaping control")
+    # Never accepts SSID/password/certificate/private-key/PoP/root-CA as a
+    # CLI flag - only positional credentials_dir/device_id/destination are
+    # read from $1/$2/$3. Long-flag forms only: short/no-dash substrings
+    # like "certificate" collide with the required filename
+    # device-certificate.pem.crt, so are not usable as a reliable signal.
+    forbidden_ble_mqtt_bash_generator_params = (
+        "--ssid", "--password", "--certificate", "--private-key", "--pop", "--root-ca",
+    )
+    if any(
+        fragment in ble_mqtt_bash_generator.lower() for fragment in forbidden_ble_mqtt_bash_generator_params
+    ):
+        failures.append("DEV BLE+MQTT bash header generator must never accept credential material as a CLI parameter")
+    # Never prints a value, length, hash, or prefix derived from the
+    # certificate/private key/PoP it reads. Only `echo` is ever used for
+    # actual terminal-facing status output in this script - `printf` is
+    # used throughout for internal data flow (building the header content
+    # piped into $tmp_file, and escaping values piped into variables),
+    # never for a message a person reads, so checking only `echo` lines
+    # (unlike the Write-Host-only check in the .ps1 above) avoids flagging
+    # that legitimate internal use as if it were console output.
+    forbidden_ble_mqtt_bash_generator_output = (
+        "$pop", "$private_key", "$certificate", "$root_ca",
+        "$pop_escaped", "$private_key_escaped", "$certificate_escaped", "$root_ca_escaped",
+        "${#pop", "${#private_key", "${#certificate", "${#root_ca",
+    )
+    bash_generator_output_lines = [line for line in ble_mqtt_bash_generator.splitlines() if "echo" in line]
+    if any(
+        fragment in line
+        for line in bash_generator_output_lines
+        for fragment in forbidden_ble_mqtt_bash_generator_output
+    ):
+        failures.append(
+            "DEV BLE+MQTT bash header generator must never print a certificate/private-key/PoP value or derivation"
+        )
+
+    # The composed environment must never use, or even be able to compile
+    # against, a static Wi-Fi credential - Wi-Fi comes exclusively from BLE
+    # Unified Provisioning/NVS (see docs/dev-ble-mqtt.md). Checked here,
+    # not just by code review, so a future edit cannot silently reintroduce
+    # INTERBRIDGE_DEV_WIFI_SSID/PASSWORD or the two old per-purpose headers.
+    ble_mqtt_main_path = Path("src/dev/ble_mqtt_main.cpp")
+    ble_mqtt_main = ble_mqtt_main_path.read_text()
+    if re.search(r"INTERBRIDGE_DEV_WIFI_(SSID|PASSWORD)", ble_mqtt_main):
+        failures.append(f"{ble_mqtt_main_path} must never reference a static Wi-Fi SSID/password macro")
+    if '#include "interbridge_dev_ble_mqtt_secrets.h"' not in ble_mqtt_main:
+        failures.append(f"{ble_mqtt_main_path} must include the single combined DEV BLE+MQTT secrets header")
+    forbidden_ble_mqtt_main_includes = (
+        '#include "interbridge_dev_secrets.h"',
+        '#include "interbridge_ble_dev_secrets.h"',
+    )
+    if any(fragment in ble_mqtt_main for fragment in forbidden_ble_mqtt_main_includes):
+        failures.append(f"{ble_mqtt_main_path} must not include the older per-purpose DEV secrets headers")
 
     # The two DEV bench entry points must share exactly one command-processing
     # composition (see src/dev/dev_command_environment.h) rather than each

@@ -63,6 +63,11 @@ jobs:
           cp include/interbridge_ble_dev_secrets.example.h include/interbridge_ble_dev_secrets.h
           pio run -e esp32-c3-dev-ble-provisioning
 
+      - name: Compile Phase 3C.4 DEV BLE+MQTT composed firmware
+        run: |
+          cp include/interbridge_dev_ble_mqtt_secrets.example.h include/interbridge_dev_ble_mqtt_secrets.h
+          pio run -e esp32-c3-dev-ble-mqtt
+
       - name: Compile Si3050 clock probe generator (ESP32-C3)
         run: pio run -e esp32-c3-si3050-clock-probe
 

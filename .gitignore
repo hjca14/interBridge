@@ -15,6 +15,11 @@
 include/interbridge_dev_secrets.h
 include/interbridge_ble_dev_secrets.h
 
+# Local-only credentials for the composed Phase 3C.4 DEV BLE+MQTT
+# firmware (AWS/MQTT + BLE PoP only - Wi-Fi comes exclusively from BLE
+# Unified Provisioning/NVS, never a static header - see docs/dev-ble-mqtt.md).
+include/interbridge_dev_ble_mqtt_secrets.h
+
 # Credential material must remain external to the repository.
 *.pem
 *.key

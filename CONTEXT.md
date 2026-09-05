@@ -69,7 +69,13 @@ an invalid password each produced the expected failure, the firmware
 reset its provisioning state machine and stayed on the same BLE window,
 and a correct credential submitted afterward connected, all without a
 reboot or reflash. Incorrect-PoP rejection and mid-window reconnect
-remain unvalidated.**
+remain unvalidated. Phase 3C.4 adds a DEV composition
+(`esp32-c3-dev-ble-mqtt`) that chains this validated BLE onboarding into
+the also-separately-validated NTP/MQTT/health cascade and GPIO4/GPIO3
+call-session simulator on one bench image - **now physically validated
+end to end** on a real ESP32-C3 (BLE onboarding through DNS/NTP/MQTT/
+health/online status and a GPIO4/GPIO3 call round-trip, all in one boot,
+no reflash) - see "Phase 3C.4" below.**
 See Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
@@ -296,6 +302,121 @@ rejection and mid-window BLE disconnect/reconnect remain unvalidated (see
 
 See `docs/ble-onboarding.md`'s "Phase 3C.3" and "Physical validation"
 sections for the complete contract and current status.
+
+## Phase 3C.4: DEV BLE onboarding + connectivity composition
+
+**Physically validated end to end on real hardware (2026-09-05).** This
+pass adds `esp32-c3-dev-ble-mqtt`, the smallest DEV composition of everything
+already validated separately: the official BLE onboarding session
+(3C.1/3C.3 - Security 1, PoP, Wi-Fi credential receipt,
+invalid-credential recovery, all reused unmodified from
+`src/provisioning/ble_provisioning.h/.cpp`) now hands off into the exact
+NTP → AWS IoT/MQTT → health-report cascade `esp32-c3-dev-mqtt`/
+`esp32-c3-dev-ring-simulator` already validate (`DevMqttSmokeState`,
+`Esp32AwsIotTransport`, `HealthReporter`, `DevCommandEnvironment`, all
+unmodified), plus the same GPIO4/GPIO3 call-session simulator
+(`DevRingButtonController`/`DevRingEventCoordinator`, unmodified). On an ESP32-C3 Super Mini, BLE advertised and accepted a Security 1
+session with the DEV PoP, Wi-Fi credentials were received and applied,
+and - in the same boot, no reflash - DNS, NTP, AWS IoT/MQTT (mTLS), and a
+QoS1 command subscription all connected, a health report published, and
+the device appeared online in the app; a GPIO4 pulse then produced
+`RING_DETECTED` and a GPIO3 pulse produced `RING_ENDED`, both received
+correctly by the app. See `docs/dev-ble-mqtt.md` for the full contract,
+this result, the DNS precondition bug this pass found and fixed first
+(below), and what remains open - `WiFiProv`'s "already provisioned,
+reconnecting directly without opening BLE" behavior is still not
+physically re-confirmed together with the rest of this chain.
+
+Nothing here is a new state machine, credential store, MQTT client, or
+provisioning implementation - `src/dev/ble_mqtt_main.cpp` is
+composition/wiring only. The one new piece is the hand-off boundary
+itself: `BleMqttHandoffGate` (`src/dev/ble_mqtt_handoff.h`), a small
+one-shot latch deciding whether BLE onboarding or this environment's own
+`DevMqttSmokeState`-driven cascade currently owns `WiFi.begin()` - see
+`docs/dev-ble-mqtt.md`'s "Wi-Fi hand-off" section for why this exists
+(this composition has no compile-time Wi-Fi credentials of its own, so
+its `ConnectWifi` handler reconnects via the no-argument `WiFi.begin()`
+overload against whatever the driver already has stored, and must never
+race the official manager's own `esp_wifi_connect()` call while BLE still
+owns the attempt). Natively unit-tested in `test/test_ble_mqtt_handoff`
+(8 tests): the gate's own one-shot latch behavior, and an
+orchestration-level composition with the unmodified `DevMqttSmokeState`
+proving MQTT never starts before Wi-Fi/NTP are ready, a successful
+BLE-driven Wi-Fi connection alone starts the cascade (even before
+`ARDUINO_EVENT_PROV_END` formally hands off), a credential failure never
+reaches DNS/NTP/MQTT, Wi-Fi already saved from an earlier boot still
+reaches MQTT after the local hand-off, and a later Wi-Fi drop after
+hand-off is this environment's own reconnect to recover, not BLE's.
+
+`INTERBRIDGE_DEV_BLE_PROVISIONING` is defined as a build flag for this
+new environment too (see `platformio.ini`) - the exact same compile-time
+gate that activates `Esp32BleProvisioning`'s real WiFiProv-backed
+implementation, deliberately reused rather than duplicated behind a
+second flag. `board_build.partitions = huge_app.csv` is reused for the
+same reason `esp32-c3-dev-ble-provisioning` already needs it (more code
+than the default partition table's per-slot ceiling comfortably fits, no
+OTA need on this bench-only image).
+
+**No static Wi-Fi credential exists anywhere in this environment.** Unlike
+`esp32-c3-dev-mqtt`/`esp32-c3-dev-ring-simulator`, `ble_mqtt_main.cpp`
+never defines or references `INTERBRIDGE_DEV_WIFI_SSID`/
+`INTERBRIDGE_DEV_WIFI_PASSWORD` - `scripts/check_repo_safety.py` now
+greps for that specifically so a future edit cannot silently reintroduce
+one. It depends on exactly one new ignored local header,
+`include/interbridge_dev_ble_mqtt_secrets.h` (public template:
+`include/interbridge_dev_ble_mqtt_secrets.example.h`), carrying only
+`INTERBRIDGE_DEV_AWS_ENDPOINT`/`_DEVICE_ID`/`_ROOT_CA_PEM`/
+`_CERTIFICATE_PEM`/`_PRIVATE_KEY_PEM`/`_BLE_POP` - never the two older,
+per-purpose headers the isolated BLE and MQTT environments use. A new
+generator, `scripts/generate_dev_ble_mqtt_secrets_header.ps1` (mirroring
+`generate_dev_secrets_header.ps1`'s safety pattern), reads exactly five
+fixed-name files - `endpoint.txt`, `AmazonRootCA1.pem`,
+`device-certificate.pem.crt`, `private.pem.key`, `pop.txt` - from an
+explicitly selected directory outside the repository; never accepts any
+of that material as a CLI argument; validates `pop.txt` as exactly 64
+lowercase hex characters (`openssl rand -hex 32`'s format) and every file
+as present/non-empty/non-placeholder; validates the destination is
+Git-ignored before writing; and never prints a value, length, hash, or
+prefix derived from the certificate, private key, or PoP.
+`check_repo_safety.py` gained matching checks: the new example header's
+six-placeholder shape and absence of any Wi-Fi macro, the new generator's
+required safety fragments and forbidden CLI parameters/output, that
+`ble_mqtt_main.cpp` includes only the new combined header, and that none
+of the five external credential filenames (case-insensitive) nor any of
+the three ignored DEV secrets headers are ever tracked. See
+`docs/dev-ble-mqtt.md`'s "Local credentials and build" for the Mac
+runbook.
+
+Out of scope, unchanged from every prior phase: AWS IoT Fleet
+Provisioning, certificates issued at runtime, claim/ownership, production
+`setup_code`, OTA, and the eventual production physical reset (5-second
+button hold, fast-blinking LED, clears only Wi-Fi state - still not
+implemented anywhere, see Future Work). The manually-provisioned DEV
+MQTT device/credential material `esp32-c3-dev-mqtt`/
+`esp32-c3-dev-ring-simulator` already use is reused **only** for this
+bench environment, never presented as a production device identity.
+GPIO4/GPIO3 remain temporary DEV call-session substitutes only - neither
+the Si3050, the real Linker Button, nor the analog intercom line is
+exercised or validated here. See `docs/dev-ble-mqtt.md`'s "Bench
+validation" section for the full result and what still remains open (the
+already-provisioned reboot fork above).
+
+**Before the passing run above, a first attempt (2026-09-05) found a DNS
+precondition bug.** Wi-Fi connected (`wifi event=got_ip`) but
+`DNS: pending` never resolved, because `ResolveDns`/the `ConnectMqtt`
+preflight both required `WiFi.dnsIP() != IPAddress()` before even
+attempting `WiFi.hostByName(...)` - a value the Arduino-ESP32 wrapper does
+not reliably populate even with a valid local IP. The configured endpoint
+was independently confirmed resolvable (`nslookup`), ruling out endpoint/
+certificate/PoP/BLE. Fixed by requiring only `WiFi.status() ==
+WL_CONNECTED && WiFi.localIP() != IPAddress()` before attempting the
+lookup, extracted as `isReadyToAttemptDnsResolution()`
+(`src/dev/dev_dns_readiness.h/.cpp`, tested in
+`test/test_dev_dns_readiness`). See `docs/dev-ble-mqtt.md`'s "DNS
+precondition bug" section for the full account. Invalid-credential
+recovery itself is Phase 3C.3's own already-validated behavior, reused
+unmodified here, not a fresh test matrix run against this composed
+environment.
 
 ## Architecture
 
