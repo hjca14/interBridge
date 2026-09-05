@@ -1,9 +1,11 @@
 #pragma once
 
 // Placeholders only, used by compile-only CI. For local credentials, use
-// scripts/generate_dev_ble_mqtt_secrets_header.ps1; never hand-write
-// multiline raw strings in macros and never commit the generated ignored
-// header.
+// scripts/generate_dev_ble_mqtt_secrets_header.sh (macOS/Bash, no
+// installable dependency) or generate_dev_ble_mqtt_secrets_header.ps1
+// (PowerShell, where available) - both generate this same header; never
+// hand-write multiline raw strings in macros and never commit the
+// generated ignored header.
 //
 // Deliberately has NO Wi-Fi SSID/password fields: esp32-c3-dev-ble-mqtt
 // gets Wi-Fi exclusively from the official BLE Unified Provisioning

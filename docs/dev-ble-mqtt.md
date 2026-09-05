@@ -186,7 +186,22 @@ environments use.
      `openssl rand -hex 32 > ~/interbridge-dev-credentials/pop.txt`; treat
      it exactly like a password (see `docs/ble-onboarding.md`'s DEV PoP
      exposure incident for why).
-2. Run:
+2. Run one of the two equivalent generators - both read the same five
+   files, apply the same validation, and write the exact same header;
+   pick whichever is available on the Mac in use. `pwsh` (PowerShell) is
+   not guaranteed to be installed/on `PATH` even when the cask is present
+   (observed on an Intel Mac bench) - the Bash generator needs nothing
+   beyond what macOS ships:
+
+   **Bash (macOS, no installable dependency):**
+
+   ```sh
+   bash ./scripts/generate_dev_ble_mqtt_secrets_header.sh \
+     ~/interbridge-dev-credentials \
+     ib-<32-lowercase-hex>
+   ```
+
+   **PowerShell (where `pwsh` is available):**
 
    ```sh
    pwsh ./scripts/generate_dev_ble_mqtt_secrets_header.ps1 \
@@ -194,17 +209,17 @@ environments use.
      -DeviceId ib-<32-lowercase-hex>
    ```
 
-   It reads only those five files by fixed name, validates the endpoint
-   format, that `pop.txt` is exactly 64 lowercase hex characters, that
-   nothing is empty or still the example placeholder, that the
+   Either one reads only those five files by fixed name, validates the
+   endpoint format, that `pop.txt` is exactly 64 lowercase hex characters,
+   that nothing is empty or still the example placeholder, that the
    destination is Git-ignored, and that the credentials directory is
    outside the repository - then writes the six escaped one-line C++
    macros to `include/interbridge_dev_ble_mqtt_secrets.h` (generated fresh
-   each run; never edit it by hand). It never accepts certificate,
-   private key, PoP, SSID, or password material as a command-line
-   argument, and never prints a value, length, hash, or prefix derived
-   from the certificate, private key, or PoP - only confirms success and
-   echoes back the (non-secret) `device_id` you passed in.
+   each run; never edit it by hand). Neither accepts certificate, private
+   key, PoP, SSID, or password material as a command-line argument, and
+   neither ever prints a value, length, hash, or prefix derived from the
+   certificate, private key, or PoP - only confirms success and echoes
+   back the (non-secret) `device_id` you passed in.
 3. Run `pio run -e esp32-c3-dev-ble-mqtt` and flash that environment
    explicitly. Selecting it without the generated header fails at
    preprocessing with a clear error, exactly like the other DEV

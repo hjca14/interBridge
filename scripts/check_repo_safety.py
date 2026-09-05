@@ -143,6 +143,56 @@ def main() -> int:
             "DEV BLE+MQTT header generator must never print a certificate/private-key/PoP value or derivation"
         )
 
+    # Bash equivalent of the .ps1 generator above (for benches where the
+    # PowerShell cask is installed but `pwsh` itself is unavailable) - same
+    # required safety/escaping controls, checked the same way.
+    ble_mqtt_bash_generator_path = Path("scripts/generate_dev_ble_mqtt_secrets_header.sh")
+    ble_mqtt_bash_generator = ble_mqtt_bash_generator_path.read_text()
+    required_ble_mqtt_bash_generator_fragments = (
+        "set -euo pipefail",
+        'git -C "$repo_root" check-ignore',
+        "Credentials directory must be outside the repository",
+        "pop.txt",
+        "^[0-9a-f]{64}$",
+        'sub(/\\r$/, "")',
+    )
+    if any(fragment not in ble_mqtt_bash_generator for fragment in required_ble_mqtt_bash_generator_fragments):
+        failures.append("DEV BLE+MQTT bash header generator is missing a required safety/escaping control")
+    # Never accepts SSID/password/certificate/private-key/PoP/root-CA as a
+    # CLI flag - only positional credentials_dir/device_id/destination are
+    # read from $1/$2/$3. Long-flag forms only: short/no-dash substrings
+    # like "certificate" collide with the required filename
+    # device-certificate.pem.crt, so are not usable as a reliable signal.
+    forbidden_ble_mqtt_bash_generator_params = (
+        "--ssid", "--password", "--certificate", "--private-key", "--pop", "--root-ca",
+    )
+    if any(
+        fragment in ble_mqtt_bash_generator.lower() for fragment in forbidden_ble_mqtt_bash_generator_params
+    ):
+        failures.append("DEV BLE+MQTT bash header generator must never accept credential material as a CLI parameter")
+    # Never prints a value, length, hash, or prefix derived from the
+    # certificate/private key/PoP it reads. Only `echo` is ever used for
+    # actual terminal-facing status output in this script - `printf` is
+    # used throughout for internal data flow (building the header content
+    # piped into $tmp_file, and escaping values piped into variables),
+    # never for a message a person reads, so checking only `echo` lines
+    # (unlike the Write-Host-only check in the .ps1 above) avoids flagging
+    # that legitimate internal use as if it were console output.
+    forbidden_ble_mqtt_bash_generator_output = (
+        "$pop", "$private_key", "$certificate", "$root_ca",
+        "$pop_escaped", "$private_key_escaped", "$certificate_escaped", "$root_ca_escaped",
+        "${#pop", "${#private_key", "${#certificate", "${#root_ca",
+    )
+    bash_generator_output_lines = [line for line in ble_mqtt_bash_generator.splitlines() if "echo" in line]
+    if any(
+        fragment in line
+        for line in bash_generator_output_lines
+        for fragment in forbidden_ble_mqtt_bash_generator_output
+    ):
+        failures.append(
+            "DEV BLE+MQTT bash header generator must never print a certificate/private-key/PoP value or derivation"
+        )
+
     # The composed environment must never use, or even be able to compile
     # against, a static Wi-Fi credential - Wi-Fi comes exclusively from BLE
     # Unified Provisioning/NVS (see docs/dev-ble-mqtt.md). Checked here,
