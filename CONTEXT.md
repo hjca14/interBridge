@@ -69,7 +69,11 @@ an invalid password each produced the expected failure, the firmware
 reset its provisioning state machine and stayed on the same BLE window,
 and a correct credential submitted afterward connected, all without a
 reboot or reflash. Incorrect-PoP rejection and mid-window reconnect
-remain unvalidated.**
+remain unvalidated. Phase 3C.4 adds a DEV composition
+(`esp32-c3-dev-ble-mqtt`) that chains this validated BLE onboarding into
+the also-separately-validated NTP/MQTT/health cascade and GPIO4/GPIO3
+call-session simulator on one bench image - implemented, not yet
+physically validated end to end - see "Phase 3C.4" below.**
 See Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
@@ -296,6 +300,69 @@ rejection and mid-window BLE disconnect/reconnect remain unvalidated (see
 
 See `docs/ble-onboarding.md`'s "Phase 3C.3" and "Physical validation"
 sections for the complete contract and current status.
+
+## Phase 3C.4: DEV BLE onboarding + connectivity composition
+
+**Implemented, not yet physically validated.** This pass adds
+`esp32-c3-dev-ble-mqtt`, the smallest DEV composition of everything
+already validated separately: the official BLE onboarding session
+(3C.1/3C.3 - Security 1, PoP, Wi-Fi credential receipt,
+invalid-credential recovery, all reused unmodified from
+`src/provisioning/ble_provisioning.h/.cpp`) now hands off into the exact
+NTP → AWS IoT/MQTT → health-report cascade `esp32-c3-dev-mqtt`/
+`esp32-c3-dev-ring-simulator` already validate (`DevMqttSmokeState`,
+`Esp32AwsIotTransport`, `HealthReporter`, `DevCommandEnvironment`, all
+unmodified), plus the same GPIO4/GPIO3 call-session simulator
+(`DevRingButtonController`/`DevRingEventCoordinator`, unmodified). See
+`docs/dev-ble-mqtt.md` for the full contract, the exact assumption this
+composition makes about `WiFiProv`'s "already provisioned, reconnecting
+directly without opening BLE" behavior (not yet physically re-confirmed
+together with the rest of this chain), and the short bench validation
+checklist.
+
+Nothing here is a new state machine, credential store, MQTT client, or
+provisioning implementation - `src/dev/ble_mqtt_main.cpp` is
+composition/wiring only. The one new piece is the hand-off boundary
+itself: `BleMqttHandoffGate` (`src/dev/ble_mqtt_handoff.h`), a small
+one-shot latch deciding whether BLE onboarding or this environment's own
+`DevMqttSmokeState`-driven cascade currently owns `WiFi.begin()` - see
+`docs/dev-ble-mqtt.md`'s "Wi-Fi hand-off" section for why this exists
+(this composition has no compile-time Wi-Fi credentials of its own, so
+its `ConnectWifi` handler reconnects via the no-argument `WiFi.begin()`
+overload against whatever the driver already has stored, and must never
+race the official manager's own `esp_wifi_connect()` call while BLE still
+owns the attempt). Natively unit-tested in `test/test_ble_mqtt_handoff`
+(8 tests): the gate's own one-shot latch behavior, and an
+orchestration-level composition with the unmodified `DevMqttSmokeState`
+proving MQTT never starts before Wi-Fi/NTP are ready, a successful
+BLE-driven Wi-Fi connection alone starts the cascade (even before
+`ARDUINO_EVENT_PROV_END` formally hands off), a credential failure never
+reaches DNS/NTP/MQTT, Wi-Fi already saved from an earlier boot still
+reaches MQTT after the local hand-off, and a later Wi-Fi drop after
+hand-off is this environment's own reconnect to recover, not BLE's.
+
+`INTERBRIDGE_DEV_BLE_PROVISIONING` is defined as a build flag for this
+new environment too (see `platformio.ini`) - the exact same compile-time
+gate that activates `Esp32BleProvisioning`'s real WiFiProv-backed
+implementation, deliberately reused rather than duplicated behind a
+second flag. `board_build.partitions = huge_app.csv` is reused for the
+same reason `esp32-c3-dev-ble-provisioning` already needs it (more code
+than the default partition table's per-slot ceiling comfortably fits, no
+OTA need on this bench-only image).
+
+Out of scope, unchanged from every prior phase: AWS IoT Fleet
+Provisioning, certificates issued at runtime, claim/ownership, production
+`setup_code`, OTA, and the eventual production physical reset (5-second
+button hold, fast-blinking LED, clears only Wi-Fi state - still not
+implemented anywhere, see Future Work). The manually-provisioned DEV
+MQTT device/credential material `esp32-c3-dev-mqtt`/
+`esp32-c3-dev-ring-simulator` already use is reused **only** for this
+bench environment, never presented as a production device identity.
+GPIO4/GPIO3 remain temporary DEV call-session substitutes only - neither
+the Si3050, the real Linker Button, nor the analog intercom line is
+exercised or validated here. See `docs/dev-ble-mqtt.md`'s "Bench
+validation checklist" for what a physical bench pass still needs to
+confirm.
 
 ## Architecture
 

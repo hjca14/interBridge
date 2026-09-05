@@ -1,0 +1,625 @@
+#ifndef INTERBRIDGE_DEV_BLE_MQTT
+#error "ble_mqtt_main.cpp is only for INTERBRIDGE_DEV_BLE_MQTT"
+#endif
+#if !__has_include("interbridge_dev_secrets.h")
+#error "DEV BLE+MQTT build requires ignored include/interbridge_dev_secrets.h; copy the example first"
+#endif
+#if !__has_include("interbridge_ble_dev_secrets.h")
+#error "DEV BLE+MQTT build requires ignored include/interbridge_ble_dev_secrets.h; copy the example first"
+#endif
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
+#include <esp_sntp.h>
+#include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <wifi_provisioning/manager.h>
+#include <string>
+
+#include "interbridge_dev_secrets.h"
+#include "interbridge_ble_dev_secrets.h"
+#include "ble_mqtt_handoff.h"
+#include "dev_ring_simulator_config.h"
+#include "dev_ring_button.h"
+#include "dev_ring_event.h"
+#include "mqtt_smoke_state.h"
+#include "dev_command_diagnostics.h"
+#include "dev_command_environment.h"
+#include "../hardware/clock.h"
+#include "../hardware/ntp_sync_state.h"
+#include "../core/random_id.h"
+#include "../core/version.h"
+#include "../network/health_reporter.h"
+#include "../network/mqtt_topics.h"
+#include "../network/mqtt_transport.h"
+#include "../protocol/event_outbox.h"
+#include "../protocol/messages.h"
+#include "../provisioning/ble_provisioning.h"
+#include "../storage/credential_store.h"
+#include "../storage/memory_store.h"
+
+// Phase 3C.4: the smallest DEV composition that chains everything already
+// physically validated separately into one bench image - after BLE
+// onboarding (3C.1/3C.3: Security 1, PoP, Wi-Fi credential receipt and
+// invalid-credential recovery, all now merged and unmodified in
+// src/provisioning/ble_provisioning.h/.cpp) hands off a connected Wi-Fi
+// interface, this environment continues, unmodified, into the exact
+// NTP -> AWS IoT/MQTT -> health-report cascade esp32-c3-dev-mqtt and
+// esp32-c3-dev-ring-simulator already validate (DevMqttSmokeState,
+// Esp32AwsIotTransport, HealthReporter, DevCommandEnvironment), and keeps
+// the same two GPIO ring-session simulator inputs
+// (DevRingButtonController/DevRingEventCoordinator) those environments
+// already validate. See docs/dev-ble-mqtt.md for the full contract, the
+// exact assumptions this composition makes about WiFiProv's "already
+// provisioned" behavior (not yet physically re-confirmed together with the
+// rest of this chain - see BleMqttHandoffGate's doc comment on
+// StartNotConfirmed), and the bench validation checklist.
+//
+// Nothing here is a new state machine, a new credential store, a new MQTT
+// client, or a new provisioning implementation - every piece is the exact
+// class/file the two prior DEV environments and the two prior BLE phases
+// already use; this file is composition/wiring only, mirroring
+// dev_command_environment.h's own rationale for existing at all.
+//
+// Out of scope, unchanged from every prior phase: AWS IoT Fleet
+// Provisioning, certificates issued at runtime, claim/ownership, production
+// setup_code, OTA, and the eventual 5-second physical reset button/fast-LED
+// product design (see docs/dev-ble-mqtt.md > "Not implemented here"). GPIO4/
+// GPIO3 remain temporary DEV call-session substitutes only - neither the
+// Si3050, the real Linker Button, nor the analog intercom line is exercised
+// or validated by this environment.
+namespace {
+using namespace interbridge;
+constexpr uint16_t kMqttPort = 8883;
+constexpr uint16_t kMqttKeepAliveSeconds = 300;
+constexpr uint16_t kMqttTimeoutMs = 1000;
+constexpr uint32_t kSerialSettleDelayMs = 1000;
+constexpr uint32_t kHeartbeatMs = 15000;
+// DEV backend considers a device stale after 120s - see mqtt_smoke_main.cpp's
+// identical constant/rationale.
+constexpr uint32_t kDevHealthIntervalMs = 60u * 1000u;
+
+constexpr uint32_t kDevProvisioningWindowMs = 5u * 60u * 1000u;
+// Short and explicit: how long to wait for ARDUINO_EVENT_PROV_START after
+// requesting a start before treating it as unconfirmed - see
+// BleOnboardingWindow's doc comment (src/provisioning/ble_provisioning.h)
+// and, for what "unconfirmed" means specifically in THIS composed
+// environment (unlike the isolated 3C.1 build), BleMqttHandoffGate's doc
+// comment below.
+constexpr uint32_t kProvStartConfirmationTimeoutMs = 10u * 1000u;
+
+// Mirrors mqtt_smoke_main.cpp's/dev_ring_simulator_main.cpp's identical
+// NtpClock exactly - hardware/clock.h's Esp32Clock::hasValidTime() is a
+// deliberate stub that always reports no valid time (see CONTEXT.md), so
+// every DEV bench harness needs its own real IClock backed by the shared
+// NtpSyncState gate.
+class NtpClock final : public IClock {
+public:
+    uint32_t monotonicMs() const override { return millis(); }
+    void syncStarted() { syncState_.synchronizationStarted(); }
+    void syncCompleted(uint32_t nowMs) { syncState_.synchronizationCompleted(nowMs); }
+    bool hasValidTime() const override { return syncState_.isTrustworthy(millis(), syncInProgress()); }
+    bool syncInProgress() const { return sntp_get_sync_status() == SNTP_SYNC_STATUS_IN_PROGRESS; }
+    int64_t unixTimeSeconds() const override { return static_cast<int64_t>(time(nullptr)); }
+private:
+    NtpSyncState syncState_;
+};
+
+// Same pin-scheme rationale as dev_ring_simulator_main.cpp's identical
+// class: plain INPUT (no internal pull-up/pull-down - the external ~10 kOhm
+// resistor to GND already defines the resting LOW level), active-high.
+class Esp32DevRingButtonInput final : public IDevRingButtonInput {
+public:
+    explicit Esp32DevRingButtonInput(uint8_t pin) : pin_(pin) {}
+    bool isPressed() override { return digitalRead(pin_) == HIGH; }
+
+private:
+    uint8_t pin_;
+};
+
+AwsIotConnectionConfig connectionConfig() {
+    AwsIotConnectionConfig config;
+    config.endpoint = INTERBRIDGE_DEV_AWS_ENDPOINT;
+    config.rootCaPem = INTERBRIDGE_DEV_ROOT_CA_PEM;
+    config.port = kMqttPort;
+    config.keepAliveSeconds = kMqttKeepAliveSeconds;
+    config.timeoutMs = kMqttTimeoutMs;
+    return config;
+}
+
+NtpClock clockSource;
+// DEV-only transient composition, same rationale as every other DEV bench
+// entry point: credentials and the event outbox do not need to survive
+// reboot on this bench-only image.
+MemoryStore devStore;
+DeviceCredentialStore credentials(devStore);
+Esp32RandomSource randomSource;
+MemoryEventOutbox eventOutbox;
+// GPIO4 (start of a simulated call, RING_DETECTED) and GPIO3 (end of the
+// same simulated call, RING_ENDED) - see dev_ring_simulator_config.h and
+// docs/dev-ring-simulator.md > "Call session state machine". Reused
+// unmodified from esp32-c3-dev-ring-simulator.
+Esp32DevRingButtonInput startButtonInput(kDevRingButtonPin);
+Esp32DevRingButtonInput endButtonInput(kDevRingEndButtonPin);
+DevRingButtonController startButtonController(startButtonInput);
+DevRingButtonController endButtonController(endButtonInput);
+DevRingEventCoordinator ringCoordinator(startButtonController, endButtonController, randomSource, eventOutbox,
+                                        INTERBRIDGE_DEV_DEVICE_ID);
+MqttTopics topics(devMqttTopicsConfig(INTERBRIDGE_DEV_DEVICE_ID));
+Esp32AwsIotTransport transport(connectionConfig(), credentials);
+// Shared DEV command-processing composition - the exact same class
+// esp32-c3-dev-mqtt/esp32-c3-dev-ring-simulator use (see
+// src/dev/dev_command_environment.h). A valid OPEN_DOOR still only ever
+// reaches ACCEPTED then REJECTED/CAPABILITY_DISABLED; no door/system action
+// is ever genuinely actuated by this bench firmware.
+DevCommandEnvironment commandEnv(INTERBRIDGE_DEV_DEVICE_ID, clockSource, transport, topics);
+DevMqttSmokeState connectivity;
+HealthReporter healthReporter(kDevHealthIntervalMs);
+uint32_t heartbeatAt = 0;
+DevSmokeState lastLoggedState = DevSmokeState::WaitingForWifi;
+bool subscribed = false;
+
+// Requested BleSecurityMode::Security1 with the local DEV PoP - identical
+// to the isolated esp32-c3-dev-ble-provisioning target. INTERBRIDGE_DEV_BLE_
+// PROVISIONING (defined as this environment's own build flag - see
+// platformio.ini) is the exact same compile-time gate
+// Esp32BleProvisioning::startAdvertising() already checks to activate its
+// real WiFiProv-backed implementation; this is a deliberate reuse of that
+// gate, not a parallel one.
+Esp32BleProvisioning provisioning(BleSecurityMode::Security1);
+BleAdvertisementInfo currentAdvertisementInfo;
+BleOnboardingWindow onboardingWindow(kProvStartConfirmationTimeoutMs, kDevProvisioningWindowMs);
+BleMqttHandoffGate handoff;
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "power_on";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT: return "task_watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_BROWNOUT: return "brownout";
+        default: return "unknown";
+    }
+}
+
+// Same named-subset rationale as mqtt_smoke_main.cpp's identical helper -
+// referencing esp_wifi_types.h's own named constants directly, never a
+// hand-copied duplicate of the whole enum.
+const char* wifiDisconnectReasonName(uint8_t reason) {
+    switch (reason) {
+        case WIFI_REASON_NO_AP_FOUND: return "no_ap_found";
+        case WIFI_REASON_TIMEOUT: return "timeout";
+        case WIFI_REASON_ASSOC_LEAVE: return "assoc_leave";
+        case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake_timeout";
+        case WIFI_REASON_AUTH_EXPIRE: return "auth_expire";
+        case WIFI_REASON_BEACON_TIMEOUT: return "beacon_timeout";
+        default: return nullptr;
+    }
+}
+
+// Set only from the system event callback below (a different task from the
+// main loop task) and consumed only from loop() via drainWifiEventSignals() -
+// identical pattern/rationale to mqtt_smoke_main.cpp/dev_ring_simulator_
+// main.cpp. No DevMqttSmokeState method is ever called directly from the
+// callback itself.
+volatile bool wifiAssociatedEventPending = false;
+volatile bool wifiDisconnectedEventPending = false;
+// Set synchronously, single-threaded, right before this file's own
+// WiFi.disconnect() call (RecoverWifi) - read (and cleared) in the event
+// callback so a resulting disconnect can be logged with its true origin.
+// See mqtt_smoke_main.cpp's identical flag for the WIFI_REASON_ASSOC_LEAVE
+// caveat this guards against.
+volatile bool wifiLocalDisconnectExpected = false;
+
+void onSystemEvent(arduino_event_t* event) {
+    switch (event->event_id) {
+        case ARDUINO_EVENT_PROV_INIT:
+            Serial.println("[BLE+MQTT] provisioning manager initialized");
+            break;
+        case ARDUINO_EVENT_PROV_START:
+            // The only real evidence BLE advertising is active - see
+            // BleOnboardingWindow's doc comment.
+            provisioning.notifyAdvertisingStarted();
+            onboardingWindow.confirmStart(millis());
+            Serial.println("[BLE+MQTT] onboarding service active");
+            Serial.printf("[BLE+MQTT] advertising as: %s\n", currentAdvertisementInfo.deviceName.c_str());
+            break;
+        case ARDUINO_EVENT_PROV_CRED_RECV:
+            // The official manager already has the credentials and is
+            // applying them to the Wi-Fi stack itself - this firmware never
+            // reads event->event_info.prov_cred_recv.ssid/.password. See
+            // WifiCredentialState's doc comment (ble_provisioning.h).
+            provisioning.notifySecureSessionEstablished();
+            provisioning.notifyCredentialsReceived();
+            Serial.println("[BLE+MQTT] central connected");
+            Serial.println("[BLE+MQTT] secure session established (Security 1)");
+            Serial.println("[BLE+MQTT] Wi-Fi credentials received");
+            Serial.println("[BLE+MQTT] Wi-Fi connecting");
+            break;
+        case ARDUINO_EVENT_PROV_CRED_FAIL:
+            // Rejected credentials do NOT end the BLE session or close the
+            // window - the official manager keeps listening so the app can
+            // retry with different credentials while the window is open.
+            // wifi_prov_mgr_reset_sm_state_on_failure() is the exact same
+            // official, scoped 3C.3 fix reused unmodified - see
+            // docs/ble-onboarding.md's "Phase 3C.3" section for the full
+            // API reference and physical validation.
+            provisioning.notifyCredentialsRejected();
+            Serial.printf("[BLE+MQTT] failure: Wi-Fi credentials rejected (reason=%d)\n",
+                          static_cast<int>(event->event_info.prov_fail_reason));
+            if (wifi_prov_mgr_reset_sm_state_on_failure() == ESP_OK) {
+                Serial.println("[BLE+MQTT] provisioning state reset, awaiting new Wi-Fi configuration");
+            } else {
+                Serial.println("[BLE+MQTT] failure: could not reset provisioning state");
+            }
+            break;
+        case ARDUINO_EVENT_PROV_CRED_SUCCESS:
+            provisioning.notifyWifiConnected();
+            Serial.println("[BLE+MQTT] Wi-Fi credentials accepted");
+            break;
+        case ARDUINO_EVENT_PROV_END:
+            // The authoritative hand-off signal: whether this attempt ended
+            // in a successful credential application, a rejected/never-
+            // confirmed BLE session, or an already-provisioned device that
+            // reconnected directly without ever opening BLE, the official
+            // manager is done with Wi-Fi now - see BleMqttHandoffGate's doc
+            // comment for why the connectivity cascade only starts issuing
+            // its own WiFi.begin() calls after this.
+            provisioning.notifyDisconnected();
+            onboardingWindow.close();
+            handoff.markProvisioningEnded();
+            if (provisioning.wifiCredentialState() == WifiCredentialState::Connected) {
+                Serial.println("[BLE+MQTT] onboarding complete: Wi-Fi connected, provisioning service ended");
+            } else {
+                Serial.println("[BLE+MQTT] provisioning service ended; connectivity now manages Wi-Fi directly");
+            }
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+            const uint8_t reason = event->event_info.wifi_sta_disconnected.reason;
+            wifiDisconnectedEventPending = true;
+            const bool local = wifiLocalDisconnectExpected;
+            wifiLocalDisconnectExpected = false;
+            const char* name = wifiDisconnectReasonName(reason);
+            const char* origin = local ? "local_recovery" : "remote_or_unknown";
+            if (name) {
+                Serial.printf("[BLE+MQTT] wifi event=disconnected reason=%u (%s) origin=%s\n",
+                              static_cast<unsigned>(reason), name, origin);
+            } else {
+                Serial.printf("[BLE+MQTT] wifi event=disconnected reason=%u origin=%s\n",
+                              static_cast<unsigned>(reason), origin);
+            }
+            break;
+        }
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            // L2 association only - DHCP/IP has not completed yet. Must
+            // never be forwarded as success; only GOT_IP below does that -
+            // see mqtt_smoke_main.cpp's identical comment for the real-
+            // hardware hang this conflation once caused.
+            Serial.println("[BLE+MQTT] wifi event=associated awaiting_ip=true");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            wifiAssociatedEventPending = true;
+            Serial.println("[BLE+MQTT] wifi event=got_ip");
+            break;
+        default:
+            break;
+    }
+}
+
+// Drains whatever the event callback recorded above and forwards it as an
+// explicit, synchronous DevMqttSmokeState::wifiAssociationResult() call -
+// identical pattern to mqtt_smoke_main.cpp/dev_ring_simulator_main.cpp.
+void drainWifiEventSignals(uint32_t now) {
+    if (wifiAssociatedEventPending) {
+        wifiAssociatedEventPending = false;
+        connectivity.wifiAssociationResult(now, true);
+    }
+    if (wifiDisconnectedEventPending) {
+        wifiDisconnectedEventPending = false;
+        connectivity.wifiAssociationResult(now, false);
+    }
+}
+
+void onTimeSynchronized(struct timeval*) { clockSource.syncCompleted(millis()); }
+
+void safeStatus(const char* operation, bool ok) {
+    Serial.printf("[BLE+MQTT] %s: %s\n", operation, ok ? "ok" : "failed");
+}
+
+const char* stateName(DevSmokeState state) {
+    switch (state) {
+        case DevSmokeState::WaitingForWifi: return "wifi";
+        case DevSmokeState::WaitingForDns: return "dns";
+        case DevSmokeState::WaitingForTime: return "time";
+        case DevSmokeState::WaitingForMqtt: return "mqtt";
+        case DevSmokeState::Online: return "online";
+    }
+    return "unknown";
+}
+
+void heartbeat(uint32_t now) {
+    if (!DevMqttSmokeState::deadlineReached(now, heartbeatAt)) return;
+    heartbeatAt = now + kHeartbeatMs;
+    const bool wifiUp = WiFi.status() == WL_CONNECTED;
+    Serial.printf("[BLE+MQTT] local_status=%s wifi=%s rssi=%d time=%s mqtt=%s ble=%s outbox_size=%u uptime_s=%lu "
+                  "heap_free=%u\n",
+                  stateName(connectivity.state()), wifiUp ? "up" : "down", WiFi.RSSI(),
+                  clockSource.hasValidTime() ? "valid" : "pending", transport.isConnected() ? "up" : "down",
+                  handoff.bleOwnsWifi() ? "owns_wifi" : "released", static_cast<unsigned>(eventOutbox.size()),
+                  static_cast<unsigned long>(now / 1000), ESP.getFreeHeap());
+}
+
+void publishHealth(uint32_t now) {
+    if (!subscribed || WiFi.status() != WL_CONNECTED || !clockSource.hasValidTime() ||
+        !transport.isConnected() || !healthReporter.isDue(now)) return;
+    HealthReport health;
+    health.deviceId = INTERBRIDGE_DEV_DEVICE_ID;
+    health.firmwareVersion = FIRMWARE_VERSION;
+    health.intercomState = toString(ProtocolIntercomState::Idle);
+    health.uptimeMs = now;
+    health.wifiRssi = WiFi.RSSI();
+    health.freeHeapBytes = ESP.getFreeHeap();
+    safeStatus("health publish", transport.publish(topics.healthIngest(), health.toJson(),
+                                                    MqttQos::AtMostOnce));
+}
+} // namespace
+
+void setup() {
+    Serial.begin(115200);
+    // Deliberate pause so a bench USB-serial monitor has time to attach
+    // before the first boot line - see ble_provisioning_main.cpp's
+    // identical rationale; BLE timing is the more sensitive of the two
+    // phases this composition boots through.
+    delay(kSerialSettleDelayMs);
+    Serial.println();
+    Serial.println("[BLE+MQTT] InterBridge onboarding + connectivity (Phase 3C.4 DEV bench build) booting");
+    Serial.printf("[BLE+MQTT] previous_reset=%s\n", resetReasonName(esp_reset_reason()));
+
+    // Do NOT add CORE_DEBUG_LEVEL or any other verbose ESP-IDF/Arduino core
+    // debug flag to this environment - see docs/ble-onboarding.md's
+    // "Physical validation" section for the exact real bench incident (DEV
+    // PoP exposure via an upstream WiFiProv.cpp log line) this guards
+    // against. Only this file's own sanitized Serial.print* calls may reach
+    // the serial port here.
+    WiFi.onEvent(onSystemEvent);
+    // Disabled for the same reason as every other DEV bench entry point:
+    // the driver's own auto-reconnect would race this environment's
+    // explicit ConnectWifi/backoff cadence - see mqtt_smoke_main.cpp's
+    // identical call/rationale. This does not affect the official
+    // provisioning manager's own one-shot connect call, which is a direct
+    // esp_wifi_connect(), not the auto-reconnect path.
+    WiFi.setAutoReconnect(false);
+
+    credentials.saveCertificate(INTERBRIDGE_DEV_CERTIFICATE_PEM);
+    credentials.savePrivateKey(INTERBRIDGE_DEV_PRIVATE_KEY_PEM);
+    sntp_set_time_sync_notification_cb(onTimeSynchronized);
+    commandEnv.setDiagnosticCallback([](const CommandDiagnostic &event) {
+        logCommandDiagnostic("[BLE+MQTT]", event);
+    });
+
+    // No internal pull-up/pull-down - each external ~10 kOhm resistor to
+    // GND already defines the resting LOW level, exactly as in
+    // esp32-c3-dev-ring-simulator.
+    pinMode(kDevRingButtonPin, INPUT);
+    pinMode(kDevRingEndButtonPin, INPUT);
+    Serial.printf("[BLE+MQTT] ring simulator inputs initialized start_gpio=%u end_gpio=%u\n",
+                  static_cast<unsigned>(kDevRingButtonPin), static_cast<unsigned>(kDevRingEndButtonPin));
+
+    // The DEV device_id already used for MQTT topics/client-id/health is
+    // reused as the BLE advertisement's identity hint too (rather than a
+    // separate MAC-derived one, as the isolated 3C.1 target uses) so the
+    // advertised "InterBridge-XXXX" name a bench tester sees in nRF
+    // Connect/the app corresponds to the same device_id this firmware
+    // otherwise identifies itself by - see docs/dev-ble-mqtt.md.
+    currentAdvertisementInfo = buildBleAdvertisementInfo(INTERBRIDGE_DEV_DEVICE_ID);
+    Serial.println("[BLE+MQTT] onboarding service start requested");
+    Serial.println("[BLE+MQTT] security mode: Protocomm Security 1 with PoP");
+
+    // Arm the confirmation window BEFORE requesting start - see
+    // ble_provisioning_main.cpp's identical ordering/rationale.
+    onboardingWindow.requestStart(millis());
+    if (!provisioning.startAdvertising(currentAdvertisementInfo, INTERBRIDGE_DEV_BLE_POP)) {
+        // Local validation rejected the request before any real start was
+        // even attempted - nothing will ever confirm this window, and
+        // nothing will ever fire ARDUINO_EVENT_PROV_END for it either, so
+        // hand off to connectivity immediately rather than waiting out the
+        // confirmation timeout for an attempt that never began.
+        onboardingWindow.close();
+        handoff.markProvisioningEnded();
+        Serial.println("[BLE+MQTT] failure: onboarding service start request rejected; connectivity will manage "
+                        "Wi-Fi directly");
+    }
+}
+
+void loop() {
+    const uint32_t now = millis();
+
+    switch (onboardingWindow.update(now)) {
+        case BleOnboardingWindowEvent::StartNotConfirmed:
+            // Unlike the isolated esp32-c3-dev-ble-provisioning target, this
+            // is NOT necessarily a failure here: it is also exactly the
+            // observable signature of an already-provisioned device
+            // reconnecting directly without ever opening BLE (see
+            // docs/ble-onboarding.md's third bench observation) - a real
+            // ARDUINO_EVENT_PROV_START simply never fires in that case
+            // either. This composition therefore does not call
+            // provisioning.stopAdvertising() here (which would call
+            // wifi_prov_mgr_deinit() - safe for a genuinely failed BLE
+            // start, but not proven safe to call while a background
+            // reconnect using stored credentials might still be in
+            // progress). It only releases Wi-Fi ownership to the
+            // connectivity cascade, which will itself observe the real
+            // outcome (a Wi-Fi event, or nothing) and act accordingly. This
+            // exact fork is not yet physically re-validated together with
+            // the rest of this chain - see docs/dev-ble-mqtt.md's bench
+            // checklist.
+            Serial.println("[BLE+MQTT] onboarding start not confirmed within the window - expected if this device "
+                            "is already provisioned and reconnecting directly; otherwise check advertising");
+            handoff.markProvisioningEnded();
+            break;
+        case BleOnboardingWindowEvent::WindowTimedOut:
+            provisioning.stopAdvertising();
+            Serial.println("[BLE+MQTT] onboarding window closed: timeout");
+            handoff.markProvisioningEnded();
+            break;
+        case BleOnboardingWindowEvent::None:
+            break;
+    }
+
+    const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+    if ((!wifiConnected || !clockSource.hasValidTime()) && transport.isConnected()) {
+        transport.disconnect();
+        subscribed = false;
+    } else if (!transport.isConnected() && subscribed) {
+        // Wi-Fi/time are still fine, but a publish/subscribe/poll failure
+        // already invalidated the MQTT/TLS session - same defensive
+        // pattern as every other DEV bench entry point.
+        Serial.println("[BLE+MQTT] transport session invalidated; tearing down before reconnect");
+        transport.disconnect();
+        subscribed = false;
+    }
+    if (!transport.isConnected()) subscribed = false;
+
+    drainWifiEventSignals(now);
+    const DevSmokeAction action = connectivity.update(
+        now, wifiConnected, clockSource.hasValidTime(), transport.isConnected());
+    if (connectivity.state() != lastLoggedState) {
+        Serial.printf("[BLE+MQTT] state %s -> %s\n", stateName(lastLoggedState), stateName(connectivity.state()));
+        lastLoggedState = connectivity.state();
+    }
+    switch (action) {
+        case DevSmokeAction::ConnectWifi:
+            if (!handoff.shouldHandleConnectWifiAction()) {
+                // BLE onboarding still owns Wi-Fi for this attempt - see
+                // BleMqttHandoffGate's doc comment. DevMqttSmokeState will
+                // keep reissuing this harmlessly on its own backoff (its
+                // own provisional in-flight timeout simply lapses each
+                // time, with nothing actually attempted) until the hand-off
+                // happens; calling WiFi.begin() here in the meantime could
+                // race the official manager's own esp_wifi_connect().
+                Serial.println("[BLE+MQTT] Wi-Fi reconnect deferred; BLE onboarding still owns Wi-Fi association");
+                break;
+            }
+            // No-argument form: this environment has no compile-time
+            // Wi-Fi credentials of its own - it reconnects using whatever
+            // STA config the Wi-Fi driver already has stored (originally
+            // provided over BLE, or from an even earlier boot). See
+            // docs/dev-ble-mqtt.md.
+            WiFi.mode(WIFI_STA);
+            WiFi.begin();
+            connectivity.wifiAssociationStarted(millis());
+            Serial.printf("[BLE+MQTT] Wi-Fi reconnect requested (stored credentials); next_attempt_ms=%lu "
+                          "delay_ms=%lu\n",
+                          static_cast<unsigned long>(connectivity.retryAtMs()),
+                          static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
+            break;
+        case DevSmokeAction::ResolveDns: {
+            IPAddress resolved;
+            const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
+            const bool resolvedOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
+            connectivity.dnsResult(now, resolvedOk);
+            Serial.printf("[BLE+MQTT] DNS: %s\n", resolvedOk ? "ready" : "pending");
+            break;
+        }
+        case DevSmokeAction::ConfigureTime:
+            clockSource.syncStarted();
+            configTime(0, 0, "pool.ntp.org", "time.google.com");
+            Serial.println("[BLE+MQTT] time sync requested");
+            break;
+        case DevSmokeAction::ConnectMqtt: {
+            const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
+            IPAddress preflightResolved;
+            const bool dnsOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, preflightResolved) == 1;
+            Serial.printf("[BLE+MQTT] network preflight dns=%s\n", dnsOk ? "ok" : "failed");
+            if (!dnsOk) {
+                connectivity.networkPreflightFailed(now);
+                break;
+            }
+            const bool connected = clockSource.hasValidTime() &&
+                transport.connect(MqttTopics::clientId(INTERBRIDGE_DEV_DEVICE_ID));
+            if (connected) {
+                subscribed = commandEnv.subscribe();
+                safeStatus("command QoS1 subscription", subscribed);
+                if (!subscribed) {
+                    transport.disconnect();
+                } else {
+                    healthReporter.forceNextPublish();
+                }
+            }
+            connectivity.mqttResult(now, connected && subscribed);
+            safeStatus("MQTT connect", connected && subscribed);
+            break;
+        }
+        case DevSmokeAction::RecoverWifi:
+            // Intentionally ungated (unlike ConnectWifi above): this only
+            // ever fires after Wi-Fi is already associated and several
+            // consecutive DNS/TLS failures have accumulated, which can only
+            // happen well after BLE onboarding has already concluded (DNS/
+            // MQTT work never starts before a genuine wifiConnected==true).
+            // Gating this one too would risk DevMqttSmokeState's
+            // awaitingWifiRecoveryDisconnect_ latch waiting forever for a
+            // disconnect this file never actually issues - see
+            // docs/dev-ble-mqtt.md.
+            Serial.println("[BLE+MQTT] wifi recovery requested");
+            if (transport.isConnected()) transport.disconnect();
+            subscribed = false;
+            wifiLocalDisconnectExpected = true;
+            WiFi.disconnect(false, false);
+            Serial.println("[BLE+MQTT] wifi disconnect requested origin=local_recovery");
+            break;
+        case DevSmokeAction::None:
+            break;
+    }
+
+    // Button handling and event enqueueing happen every loop iteration,
+    // independent of BLE/connectivity state - identical to
+    // esp32-c3-dev-ring-simulator.
+    const DevCallSessionOutcome outcome =
+        ringCoordinator.update(now, clockSource.hasValidTime(), clockSource.unixTimeSeconds());
+    switch (outcome.kind) {
+        case DevCallSessionEventKind::RingDetected:
+            Serial.printf("[BLE+MQTT] valid start detected on GPIO%u; RING_DETECTED enqueued call_id=%s\n",
+                          static_cast<unsigned>(kDevRingButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::RingEndedByButton:
+            Serial.printf("[BLE+MQTT] valid end detected on GPIO%u; RING_ENDED enqueued call_id=%s\n",
+                          static_cast<unsigned>(kDevRingEndButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::RingEndedByTimeout:
+            Serial.printf("[BLE+MQTT] call timed out after %lums with no GPIO%u pulse; RING_ENDED enqueued "
+                          "call_id=%s reason=timeout(local-only)\n",
+                          static_cast<unsigned long>(kDevCallTimeoutMs), static_cast<unsigned>(kDevRingEndButtonPin),
+                          outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::StartIgnoredAlreadyRinging:
+            Serial.printf("[BLE+MQTT] GPIO%u press ignored; call_id=%s already active\n",
+                          static_cast<unsigned>(kDevRingButtonPin), outcome.callId.c_str());
+            break;
+        case DevCallSessionEventKind::EndIgnoredNoActiveCall:
+            Serial.printf("[BLE+MQTT] GPIO%u press ignored; no active call\n",
+                          static_cast<unsigned>(kDevRingEndButtonPin));
+            break;
+        case DevCallSessionEventKind::None:
+            break;
+    }
+
+    if (transport.isConnected()) {
+        transport.poll();
+        commandEnv.processPending();
+        if (eventOutbox.size() > 0) {
+            size_t publishedCount = publishPendingEvents(eventOutbox, transport, topics.eventsIngest());
+            if (publishedCount > 0) {
+                Serial.printf("[BLE+MQTT] publish confirmed count=%u remaining=%u\n",
+                              static_cast<unsigned>(publishedCount), static_cast<unsigned>(eventOutbox.size()));
+            }
+        }
+    }
+
+    publishHealth(now);
+    heartbeat(now);
+    delay(10);
+}
