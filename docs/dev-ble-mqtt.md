@@ -230,6 +230,38 @@ Reuse the same DEV device/credential material `esp32-c3-dev-mqtt`/
 bench convenience only, never a production identity or manufacturing
 flow (see "What this is not" above).
 
+## First physical attempt (2026-09-05): DNS precondition bug
+
+The first bench attempt of this composition reached BLE Security 1,
+received Wi-Fi credentials, and observed `wifi event=got_ip` - but then
+stayed at `DNS: pending`, triggered `wifi recovery requested`, and never
+reached NTP/MQTT. The configured AWS IoT endpoint was independently
+confirmed resolvable with `nslookup` from outside the ESP, ruling out the
+endpoint, certificate, PoP, and BLE stack.
+
+Root cause: both `DevSmokeAction::ResolveDns` and the network preflight
+immediately before `DevSmokeAction::ConnectMqtt` required
+`WiFi.dnsIP() != IPAddress()` before even attempting
+`WiFi.hostByName(...)`. `WiFi.dnsIP()` is a separate Arduino-ESP32 wrapper
+value that is not reliably populated even once the STA interface is fully
+associated with a valid local IP - gating the *attempt* on it (rather than
+just gating on it being informative) meant `hostByName()` was never
+called at all on this run, even though DNS itself worked.
+
+Fix: the precondition for attempting `hostByName()` is now a connected STA
+interface with a valid local IP only (`WiFi.status() == WL_CONNECTED &&
+WiFi.localIP() != IPAddress()`), extracted as the pure, natively-tested
+`isReadyToAttemptDnsResolution()` (`src/dev/dev_dns_readiness.h/.cpp`,
+`test/test_dev_dns_readiness`) and applied identically in both call sites.
+A genuine DNS failure (network ready but `hostByName()` itself returns
+failure) still reports `DNS: pending`/`network preflight dns=failed` and
+still drives `DevMqttSmokeState`'s existing recovery path unchanged - this
+fix only changes when the lookup is attempted, never whether a real
+failure is treated as one.
+
+**Not yet physically re-validated** - this fix has not yet been reflashed
+and confirmed on the bench. See the checklist below.
+
 ## Bench validation checklist
 
 Short by design - every individual capability below is already validated

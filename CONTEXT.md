@@ -394,6 +394,22 @@ exercised or validated here. See `docs/dev-ble-mqtt.md`'s "Bench
 validation checklist" for what a physical bench pass still needs to
 confirm.
 
+**First physical attempt (2026-09-05) found a DNS precondition bug, now
+fixed but not yet re-validated physically.** Wi-Fi connected
+(`wifi event=got_ip`) but `DNS: pending` never resolved, because
+`ResolveDns`/the `ConnectMqtt` preflight both required
+`WiFi.dnsIP() != IPAddress()` before even attempting
+`WiFi.hostByName(...)` - a value the Arduino-ESP32 wrapper does not
+reliably populate even with a valid local IP. The configured endpoint was
+independently confirmed resolvable (`nslookup`), ruling out endpoint/
+certificate/PoP/BLE. Fixed by requiring only `WiFi.status() ==
+WL_CONNECTED && WiFi.localIP() != IPAddress()` before attempting the
+lookup, extracted as `isReadyToAttemptDnsResolution()`
+(`src/dev/dev_dns_readiness.h/.cpp`, tested in
+`test/test_dev_dns_readiness`). See `docs/dev-ble-mqtt.md`'s "First
+physical attempt" section for the full account. Phase 3C.4 is still
+**not** physically validated end to end.
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for the full module

@@ -17,6 +17,7 @@
 
 #include "interbridge_dev_ble_mqtt_secrets.h"
 #include "ble_mqtt_handoff.h"
+#include "dev_dns_readiness.h"
 #include "dev_ring_simulator_config.h"
 #include "dev_ring_button.h"
 #include "dev_ring_event.h"
@@ -529,11 +530,21 @@ void loop() {
                           static_cast<unsigned long>(DevMqttSmokeState::millisUntil(connectivity.retryAtMs(), now)));
             break;
         case DevSmokeAction::ResolveDns: {
+            // See dev_dns_readiness.h: a connected STA interface with a
+            // valid local IP is the real precondition, never WiFi.dnsIP()
+            // (see the docs/dev-ble-mqtt.md "DNS precondition" note this
+            // guards against reintroducing).
+            const bool networkReady = isReadyToAttemptDnsResolution(WiFi.status() == WL_CONNECTED,
+                                                                     WiFi.localIP() != IPAddress());
+            if (!networkReady) {
+                connectivity.dnsResult(now, false);
+                Serial.println("[BLE+MQTT] DNS: pending (wifi not connected or local IP not yet assigned)");
+                break;
+            }
             IPAddress resolved;
-            const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
-            const bool resolvedOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
+            const bool resolvedOk = WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, resolved) == 1;
             connectivity.dnsResult(now, resolvedOk);
-            Serial.printf("[BLE+MQTT] DNS: %s\n", resolvedOk ? "ready" : "pending");
+            Serial.printf("[BLE+MQTT] DNS: %s\n", resolvedOk ? "ready" : "pending (hostByName lookup failed)");
             break;
         }
         case DevSmokeAction::ConfigureTime:
@@ -542,10 +553,20 @@ void loop() {
             Serial.println("[BLE+MQTT] time sync requested");
             break;
         case DevSmokeAction::ConnectMqtt: {
-            const bool networkReady = WiFi.dnsIP() != IPAddress() && WiFi.localIP() != IPAddress();
-            IPAddress preflightResolved;
-            const bool dnsOk = networkReady && WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, preflightResolved) == 1;
-            Serial.printf("[BLE+MQTT] network preflight dns=%s\n", dnsOk ? "ok" : "failed");
+            // Same precondition/logging split as ResolveDns above - kept
+            // deliberately identical rather than diverging.
+            const bool networkReady = isReadyToAttemptDnsResolution(WiFi.status() == WL_CONNECTED,
+                                                                     WiFi.localIP() != IPAddress());
+            bool dnsOk = false;
+            if (!networkReady) {
+                Serial.println("[BLE+MQTT] network preflight dns=failed (wifi not connected or local IP not yet "
+                                "assigned)");
+            } else {
+                IPAddress preflightResolved;
+                dnsOk = WiFi.hostByName(INTERBRIDGE_DEV_AWS_ENDPOINT, preflightResolved) == 1;
+                Serial.printf("[BLE+MQTT] network preflight dns=%s\n",
+                              dnsOk ? "ok" : "failed (hostByName lookup failed)");
+            }
             if (!dnsOk) {
                 connectivity.networkPreflightFailed(now);
                 break;
