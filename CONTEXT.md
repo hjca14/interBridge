@@ -72,8 +72,10 @@ reboot or reflash. Incorrect-PoP rejection and mid-window reconnect
 remain unvalidated. Phase 3C.4 adds a DEV composition
 (`esp32-c3-dev-ble-mqtt`) that chains this validated BLE onboarding into
 the also-separately-validated NTP/MQTT/health cascade and GPIO4/GPIO3
-call-session simulator on one bench image - implemented, not yet
-physically validated end to end - see "Phase 3C.4" below.**
+call-session simulator on one bench image - **now physically validated
+end to end** on a real ESP32-C3 (BLE onboarding through DNS/NTP/MQTT/
+health/online status and a GPIO4/GPIO3 call round-trip, all in one boot,
+no reflash) - see "Phase 3C.4" below.**
 See Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
@@ -303,8 +305,8 @@ sections for the complete contract and current status.
 
 ## Phase 3C.4: DEV BLE onboarding + connectivity composition
 
-**Implemented, not yet physically validated.** This pass adds
-`esp32-c3-dev-ble-mqtt`, the smallest DEV composition of everything
+**Physically validated end to end on real hardware (2026-09-05).** This
+pass adds `esp32-c3-dev-ble-mqtt`, the smallest DEV composition of everything
 already validated separately: the official BLE onboarding session
 (3C.1/3C.3 - Security 1, PoP, Wi-Fi credential receipt,
 invalid-credential recovery, all reused unmodified from
@@ -313,12 +315,17 @@ NTP → AWS IoT/MQTT → health-report cascade `esp32-c3-dev-mqtt`/
 `esp32-c3-dev-ring-simulator` already validate (`DevMqttSmokeState`,
 `Esp32AwsIotTransport`, `HealthReporter`, `DevCommandEnvironment`, all
 unmodified), plus the same GPIO4/GPIO3 call-session simulator
-(`DevRingButtonController`/`DevRingEventCoordinator`, unmodified). See
-`docs/dev-ble-mqtt.md` for the full contract, the exact assumption this
-composition makes about `WiFiProv`'s "already provisioned, reconnecting
-directly without opening BLE" behavior (not yet physically re-confirmed
-together with the rest of this chain), and the short bench validation
-checklist.
+(`DevRingButtonController`/`DevRingEventCoordinator`, unmodified). On an ESP32-C3 Super Mini, BLE advertised and accepted a Security 1
+session with the DEV PoP, Wi-Fi credentials were received and applied,
+and - in the same boot, no reflash - DNS, NTP, AWS IoT/MQTT (mTLS), and a
+QoS1 command subscription all connected, a health report published, and
+the device appeared online in the app; a GPIO4 pulse then produced
+`RING_DETECTED` and a GPIO3 pulse produced `RING_ENDED`, both received
+correctly by the app. See `docs/dev-ble-mqtt.md` for the full contract,
+this result, the DNS precondition bug this pass found and fixed first
+(below), and what remains open - `WiFiProv`'s "already provisioned,
+reconnecting directly without opening BLE" behavior is still not
+physically re-confirmed together with the rest of this chain.
 
 Nothing here is a new state machine, credential store, MQTT client, or
 provisioning implementation - `src/dev/ble_mqtt_main.cpp` is
@@ -391,24 +398,25 @@ bench environment, never presented as a production device identity.
 GPIO4/GPIO3 remain temporary DEV call-session substitutes only - neither
 the Si3050, the real Linker Button, nor the analog intercom line is
 exercised or validated here. See `docs/dev-ble-mqtt.md`'s "Bench
-validation checklist" for what a physical bench pass still needs to
-confirm.
+validation" section for the full result and what still remains open (the
+already-provisioned reboot fork above).
 
-**First physical attempt (2026-09-05) found a DNS precondition bug, now
-fixed but not yet re-validated physically.** Wi-Fi connected
-(`wifi event=got_ip`) but `DNS: pending` never resolved, because
-`ResolveDns`/the `ConnectMqtt` preflight both required
-`WiFi.dnsIP() != IPAddress()` before even attempting
-`WiFi.hostByName(...)` - a value the Arduino-ESP32 wrapper does not
-reliably populate even with a valid local IP. The configured endpoint was
-independently confirmed resolvable (`nslookup`), ruling out endpoint/
+**Before the passing run above, a first attempt (2026-09-05) found a DNS
+precondition bug.** Wi-Fi connected (`wifi event=got_ip`) but
+`DNS: pending` never resolved, because `ResolveDns`/the `ConnectMqtt`
+preflight both required `WiFi.dnsIP() != IPAddress()` before even
+attempting `WiFi.hostByName(...)` - a value the Arduino-ESP32 wrapper does
+not reliably populate even with a valid local IP. The configured endpoint
+was independently confirmed resolvable (`nslookup`), ruling out endpoint/
 certificate/PoP/BLE. Fixed by requiring only `WiFi.status() ==
 WL_CONNECTED && WiFi.localIP() != IPAddress()` before attempting the
 lookup, extracted as `isReadyToAttemptDnsResolution()`
 (`src/dev/dev_dns_readiness.h/.cpp`, tested in
-`test/test_dev_dns_readiness`). See `docs/dev-ble-mqtt.md`'s "First
-physical attempt" section for the full account. Phase 3C.4 is still
-**not** physically validated end to end.
+`test/test_dev_dns_readiness`). See `docs/dev-ble-mqtt.md`'s "DNS
+precondition bug" section for the full account. Invalid-credential
+recovery itself is Phase 3C.3's own already-validated behavior, reused
+unmodified here, not a fresh test matrix run against this composed
+environment.
 
 ## Architecture
 

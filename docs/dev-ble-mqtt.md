@@ -14,11 +14,16 @@ iPhone, the same ESP32-C3 DEV image should continue automatically into
 NTP, MQTT, and a health report, and appear online in the app - without a
 reflash between onboarding and connectivity.
 
-**Implemented, not yet physically validated.** Every individual piece
-this composition reuses is already validated on real hardware on its own
-(see `docs/ble-onboarding.md` and `docs/dev-ring-simulator.md`); the new,
-unvalidated thing here is the *hand-off* between them on one board in one
-boot. See "Bench validation checklist" below.
+**Physically validated end to end (2026-09-05).** On an ESP32-C3 Super
+Mini running `esp32-c3-dev-ble-mqtt`, BLE advertised and accepted an
+authenticated Security 1 session with the DEV PoP, Wi-Fi credentials were
+received and the device obtained an IP, and - in that same boot, with no
+reflash - the chain continued through DNS, NTP, AWS IoT/MQTT (mTLS), and a
+QoS1 command subscription, published a health report, and appeared online
+in the app. A GPIO4 pulse produced `RING_DETECTED` and a GPIO3 pulse
+produced `RING_ENDED`, both received correctly by the app. See "DNS
+precondition bug" below for the one issue this pass found and fixed
+first, and "Bench validation" for the full result and what remains open.
 
 ## What this is not
 
@@ -230,51 +235,56 @@ Reuse the same DEV device/credential material `esp32-c3-dev-mqtt`/
 bench convenience only, never a production identity or manufacturing
 flow (see "What this is not" above).
 
-## First physical attempt (2026-09-05): DNS precondition bug
+## DNS precondition bug (2026-09-05)
 
-The first bench attempt of this composition reached BLE Security 1,
-received Wi-Fi credentials, and observed `wifi event=got_ip` - but then
-stayed at `DNS: pending`, triggered `wifi recovery requested`, and never
-reached NTP/MQTT. The configured AWS IoT endpoint was independently
-confirmed resolvable with `nslookup` from outside the ESP, ruling out the
-endpoint, certificate, PoP, and BLE stack.
+Before the passing physical validation below, the first bench attempt of
+this composition reached BLE Security 1, received Wi-Fi credentials, and
+observed `wifi event=got_ip` - but then stayed at `DNS: pending`,
+triggered `wifi recovery requested`, and never reached NTP/MQTT. The
+configured AWS IoT endpoint was independently confirmed resolvable with
+`nslookup` from outside the ESP, ruling out the endpoint, certificate,
+PoP, and BLE stack.
 
 Root cause: both `DevSmokeAction::ResolveDns` and the network preflight
 immediately before `DevSmokeAction::ConnectMqtt` required
 `WiFi.dnsIP() != IPAddress()` before even attempting
-`WiFi.hostByName(...)`. `WiFi.dnsIP()` is a separate Arduino-ESP32 wrapper
-value that is not reliably populated even once the STA interface is fully
-associated with a valid local IP - gating the *attempt* on it (rather than
-just gating on it being informative) meant `hostByName()` was never
-called at all on this run, even though DNS itself worked.
+`WiFi.hostByName(...)`. That Arduino-ESP32 wrapper value is not reliably
+populated even once the STA interface is fully associated with a valid
+local IP, so `hostByName()` was never actually attempted on that run,
+even though DNS itself worked.
 
 Fix: the precondition for attempting `hostByName()` is now a connected STA
 interface with a valid local IP only (`WiFi.status() == WL_CONNECTED &&
 WiFi.localIP() != IPAddress()`), extracted as the pure, natively-tested
 `isReadyToAttemptDnsResolution()` (`src/dev/dev_dns_readiness.h/.cpp`,
-`test/test_dev_dns_readiness`) and applied identically in both call sites.
+`test/test_dev_dns_readiness`) and applied identically at both call sites.
 A genuine DNS failure (network ready but `hostByName()` itself returns
 failure) still reports `DNS: pending`/`network preflight dns=failed` and
 still drives `DevMqttSmokeState`'s existing recovery path unchanged - this
-fix only changes when the lookup is attempted, never whether a real
-failure is treated as one.
+fix only changed when the lookup is attempted, never whether a real
+failure is treated as one. The reflash that followed this fix is the pass
+recorded below.
 
-**Not yet physically re-validated** - this fix has not yet been reflashed
-and confirmed on the bench. See the checklist below.
+## Bench validation
 
-## Bench validation checklist
+Confirmed on real hardware (2026-09-05), the same boot, no reflash between
+onboarding and connectivity:
 
-Short by design - every individual capability below is already validated
-elsewhere; this list only covers the new hand-off.
+1. BLE advertised and accepted a Security 1 session with the DEV PoP;
+   Wi-Fi credentials were received and applied, and the device obtained an
+   IP.
+2. DNS resolved, NTP synchronized, MQTT connected over mTLS, and the QoS1
+   command subscription succeeded; a health report published and the
+   device showed online in the app.
+3. A GPIO4 pulse produced `RING_DETECTED` and a GPIO3 pulse produced
+   `RING_ENDED`, both received correctly by the app.
 
-1. Erase only this board's DEV Wi-Fi state when a scenario needs to be
-   repeated (a fresh BLE window on an already-provisioned board).
-2. Provision via the real Android or iPhone app.
-3. Confirm Wi-Fi connects, NTP synchronizes, MQTT connects, and a health
-   report publishes - all without a reboot or reflash after onboarding.
-4. Confirm the device shows online in the app.
-5. Trigger GPIO4 then GPIO3 and confirm `RING_DETECTED`/`RING_ENDED`
-   through the existing, already-validated chain.
-6. Reboot **without** erasing Wi-Fi state and confirm MQTT/health
-   reconnect on their own, with no BLE advertising reopening - this is
-   also the real-hardware answer to the "already provisioned" fork above.
+Invalid-credential recovery (a rejected Wi-Fi credential causing the
+official manager to reset its state and keep the same BLE window open) is
+Phase 3C.3's own already-validated behavior (`docs/ble-onboarding.md`),
+reused unmodified here - it was not re-run as a fresh test matrix against
+this composed environment.
+
+Still open: whether an already-provisioned reboot (no Wi-Fi state erased,
+no BLE reopened) reconnects on its own without `ARDUINO_EVENT_PROV_START`
+ever firing - see "The 'already provisioned' fork" above.
