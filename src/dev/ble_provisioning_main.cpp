@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_system.h>
+#include <wifi_provisioning/manager.h>
 
 #include "../../include/interbridge_ble_dev_secrets.h"
 #include "../provisioning/ble_provisioning.h"
@@ -73,6 +74,30 @@ void onWifiEvent(arduino_event_t* event) {
             provisioning.notifyCredentialsRejected();
             Serial.printf("[BLE] failure: Wi-Fi credentials rejected (reason=%d)\n",
                           static_cast<int>(event->event_info.prov_fail_reason));
+            // A real bench run showed the manager otherwise keeps retrying
+            // to connect with the just-rejected credentials indefinitely,
+            // never accepting a fresh wifi_config set request in the same
+            // window - the user would have needed a flash/NVS erase and a
+            // reflash to correct a typo'd Wi-Fi credential, defeating the
+            // whole point of an in-window retry. wifi_prov_mgr_reset_sm_
+            // state_on_failure() is the official, scoped API for exactly
+            // this ("restart provisioning in case invalid credentials are
+            // entered", per its own doc comment in
+            // wifi_provisioning/manager.h, part of the pinned ESP-IDF
+            // 4.4.7 Wi-Fi Provisioning Manager and confirmed present and
+            // linkable in the esp32c3 libwifi_provisioning.a this target
+            // actually links). It only resets this manager's own Wi-Fi
+            // connect/retry state machine for the credential that was just
+            // rejected - it never touches BleOnboardingWindow (the
+            // five-minute window/timeout are untouched), device_id,
+            // setup_code, or any other NVS namespace, and it is called
+            // only here, never from ARDUINO_EVENT_PROV_END/a plain BLE
+            // disconnect.
+            if (wifi_prov_mgr_reset_sm_state_on_failure() == ESP_OK) {
+                Serial.println("[BLE] provisioning state reset, awaiting new Wi-Fi configuration");
+            } else {
+                Serial.println("[BLE] failure: could not reset provisioning state");
+            }
             break;
         case ARDUINO_EVENT_PROV_CRED_SUCCESS:
             // Wi-Fi connectivity only - no AWS IoT/Fleet Provisioning/
