@@ -63,9 +63,13 @@ below. Phase 3C.3's happy path (receiving correct Wi-Fi credentials over
 that same session and connecting) is now also physically validated with
 the real InterApp - see "Phase 3C.3 Wi-Fi credential receipt" below. That
 same bench pass found invalid-credential recovery broken (the manager
-retried a rejected credential forever) and it has since been fixed, but
-that specific recovery path is not yet physically re-validated.
-Incorrect-PoP rejection and mid-window reconnect also remain unvalidated.**
+retried a rejected credential forever); it was fixed and has since been
+physically re-validated on real hardware - a wrong SSID and, separately,
+an invalid password each produced the expected failure, the firmware
+reset its provisioning state machine and stayed on the same BLE window,
+and a correct credential submitted afterward connected, all without a
+reboot or reflash. Incorrect-PoP rejection and mid-window reconnect
+remain unvalidated.**
 See Hardware Dependencies and Open Questions.
 
 **Protocol doc status:** as of pass 4, `docs/communication-protocol.md`
@@ -91,7 +95,7 @@ closing advertising** (see the third bench attempt below) - this is no
 longer merely a foundation for those specific behaviors. See "Phase 3C.3
 Wi-Fi credential receipt" below: its happy path (correct credentials) is
 now also physically validated; invalid-credential recovery was found
-broken on that same bench pass and is now fixed, but not yet physically
+broken on that same bench pass, was fixed, and has since been physically
 re-validated. Still unvalidated: incorrect-PoP rejection and mid-window
 disconnect/reconnect. Do not treat any of this as proof the device is
 claimed/registered/connected to AWS IoT once Wi-Fi connects, or that
@@ -274,12 +278,24 @@ native suites (361 assertions) via MSVC; real `pio run` succeeded for
 `esp32-c3-dev-ble-provisioning`, `esp32-c3`, `esp32-c3-dev-mqtt`, and
 `esp32-c3-dev-ring-simulator`.
 
-**Not yet physically re-validated:** the exact scenario still to confirm on
-real hardware is invalid SSID/password → app error → retry → correct Wi-Fi
-credentials → connected, all inside the *same* five-minute window, no
-reboot, no reflash. See `docs/ble-onboarding.md`'s "Phase 3C.3" and
-"Physical validation" sections for the complete contract and current
-status.
+**Fifth bench attempt: invalid-credential recovery physically re-validated,
+closing Phase 3C.3.** The exact scenario left open after the fourth attempt
+was confirmed on the same real ESP32-C3 with the real InterApp: a
+credential with a nonexistent SSID produced the expected AP-not-found
+failure, and, separately, a credential with an invalid password produced
+the expected authentication failure; in both cases the firmware reset the
+official provisioning state machine (`wifi_prov_mgr_reset_sm_state_on_
+failure()`), remained on the original BLE advertising window/session with
+no reboot or reflash, and accepted a new session/configuration. A correct
+credential submitted afterward connected the ESP to Wi-Fi. The full
+sequence - failure, in-window retry, successful correction - was observed
+in the same bench sitting, inside the original five-minute window. This
+closes the last open item from Phase 3C.3's happy-path work; incorrect-PoP
+rejection and mid-window BLE disconnect/reconnect remain unvalidated (see
+`docs/ble-onboarding.md`'s "Still unvalidated" list).
+
+See `docs/ble-onboarding.md`'s "Phase 3C.3" and "Physical validation"
+sections for the complete contract and current status.
 
 ## Architecture
 
