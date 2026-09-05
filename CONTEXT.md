@@ -350,6 +350,36 @@ same reason `esp32-c3-dev-ble-provisioning` already needs it (more code
 than the default partition table's per-slot ceiling comfortably fits, no
 OTA need on this bench-only image).
 
+**No static Wi-Fi credential exists anywhere in this environment.** Unlike
+`esp32-c3-dev-mqtt`/`esp32-c3-dev-ring-simulator`, `ble_mqtt_main.cpp`
+never defines or references `INTERBRIDGE_DEV_WIFI_SSID`/
+`INTERBRIDGE_DEV_WIFI_PASSWORD` - `scripts/check_repo_safety.py` now
+greps for that specifically so a future edit cannot silently reintroduce
+one. It depends on exactly one new ignored local header,
+`include/interbridge_dev_ble_mqtt_secrets.h` (public template:
+`include/interbridge_dev_ble_mqtt_secrets.example.h`), carrying only
+`INTERBRIDGE_DEV_AWS_ENDPOINT`/`_DEVICE_ID`/`_ROOT_CA_PEM`/
+`_CERTIFICATE_PEM`/`_PRIVATE_KEY_PEM`/`_BLE_POP` - never the two older,
+per-purpose headers the isolated BLE and MQTT environments use. A new
+generator, `scripts/generate_dev_ble_mqtt_secrets_header.ps1` (mirroring
+`generate_dev_secrets_header.ps1`'s safety pattern), reads exactly five
+fixed-name files - `endpoint.txt`, `AmazonRootCA1.pem`,
+`device-certificate.pem.crt`, `private.pem.key`, `pop.txt` - from an
+explicitly selected directory outside the repository; never accepts any
+of that material as a CLI argument; validates `pop.txt` as exactly 64
+lowercase hex characters (`openssl rand -hex 32`'s format) and every file
+as present/non-empty/non-placeholder; validates the destination is
+Git-ignored before writing; and never prints a value, length, hash, or
+prefix derived from the certificate, private key, or PoP.
+`check_repo_safety.py` gained matching checks: the new example header's
+six-placeholder shape and absence of any Wi-Fi macro, the new generator's
+required safety fragments and forbidden CLI parameters/output, that
+`ble_mqtt_main.cpp` includes only the new combined header, and that none
+of the five external credential filenames (case-insensitive) nor any of
+the three ignored DEV secrets headers are ever tracked. See
+`docs/dev-ble-mqtt.md`'s "Local credentials and build" for the Mac
+runbook.
+
 Out of scope, unchanged from every prior phase: AWS IoT Fleet
 Provisioning, certificates issued at runtime, claim/ownership, production
 `setup_code`, OTA, and the eventual production physical reset (5-second

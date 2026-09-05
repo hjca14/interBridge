@@ -76,7 +76,10 @@ composition/wiring only, in the same spirit as
   same shared `InMemoryDedupCache`/`DisabledHardware`/`Intercom`/
   `DisabledSystemControl`/`CommandHandler`/`RemoteCommandProcessor`
   composition `esp32-c3-dev-mqtt`/`esp32-c3-dev-ring-simulator` already
-  use) - all unmodified.
+  use) - all unmodified. The manually-provisioned DEV device/credential
+  material itself is the same one those two environments already use, now
+  read from this environment's own combined header - see "Local
+  credentials and build" below.
 - **Call-session simulator**: `DevRingButtonController`,
   `DevRingEventCoordinator`, `MemoryEventOutbox`, `publishPendingEvents()`
   (`src/dev/dev_ring_button.*`, `src/dev/dev_ring_event.*`) on the same
@@ -157,6 +160,60 @@ five-minute window) does that. `StartNotConfirmed` only releases the
 proceed (or safely retry `WiFi.begin()` later) regardless of which
 interpretation turns out to be correct on real hardware. This exact fork
 is item 6 of the checklist below.
+
+## Local credentials and build
+
+This environment has **no compile-time Wi-Fi credentials of any kind** -
+neither `INTERBRIDGE_DEV_WIFI_SSID` nor `INTERBRIDGE_DEV_WIFI_PASSWORD`
+may ever be defined or referenced here (`scripts/check_repo_safety.py`
+enforces this in CI); Wi-Fi comes exclusively from the BLE session and
+whatever the ESP-IDF Wi-Fi driver then persists in NVS - see "Wi-Fi
+hand-off" above. It depends on exactly one ignored local header,
+`include/interbridge_dev_ble_mqtt_secrets.h`, carrying only the AWS
+IoT/MQTT identity and the BLE DEV PoP - never the two older, per-purpose
+headers (`interbridge_dev_secrets.h`, `interbridge_ble_dev_secrets.h`)
+the isolated `esp32-c3-dev-mqtt`/`esp32-c3-dev-ble-provisioning`
+environments use.
+
+1. On the Mac, keep exactly five files in one directory **outside** this
+   repository, e.g. `~/interbridge-dev-credentials/`:
+   - `endpoint.txt` - the AWS IoT ATS endpoint, one line.
+   - `AmazonRootCA1.pem`
+   - `device-certificate.pem.crt`
+   - `private.pem.key`
+   - `pop.txt` - the local DEV PoP, one line, exactly 64 lowercase
+     hexadecimal characters. Generate one with
+     `openssl rand -hex 32 > ~/interbridge-dev-credentials/pop.txt`; treat
+     it exactly like a password (see `docs/ble-onboarding.md`'s DEV PoP
+     exposure incident for why).
+2. Run:
+
+   ```sh
+   pwsh ./scripts/generate_dev_ble_mqtt_secrets_header.ps1 \
+     -CredentialsDirectory ~/interbridge-dev-credentials \
+     -DeviceId ib-<32-lowercase-hex>
+   ```
+
+   It reads only those five files by fixed name, validates the endpoint
+   format, that `pop.txt` is exactly 64 lowercase hex characters, that
+   nothing is empty or still the example placeholder, that the
+   destination is Git-ignored, and that the credentials directory is
+   outside the repository - then writes the six escaped one-line C++
+   macros to `include/interbridge_dev_ble_mqtt_secrets.h` (generated fresh
+   each run; never edit it by hand). It never accepts certificate,
+   private key, PoP, SSID, or password material as a command-line
+   argument, and never prints a value, length, hash, or prefix derived
+   from the certificate, private key, or PoP - only confirms success and
+   echoes back the (non-secret) `device_id` you passed in.
+3. Run `pio run -e esp32-c3-dev-ble-mqtt` and flash that environment
+   explicitly. Selecting it without the generated header fails at
+   preprocessing with a clear error, exactly like the other DEV
+   environments' own local headers.
+
+Reuse the same DEV device/credential material `esp32-c3-dev-mqtt`/
+`esp32-c3-dev-ring-simulator` already use if you have it - this is a
+bench convenience only, never a production identity or manufacturing
+flow (see "What this is not" above).
 
 ## Bench validation checklist
 
